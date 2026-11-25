@@ -628,6 +628,12 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
 
     reward = None
     fee = 0.0
+    # Награда выплачивается только на адрес вида sha256-hex (64 символа).
+    # Иначе монеты уходят в никуда: такой выход нельзя потратить ни одним кошельком.
+    if worker_address and not re.fullmatch(r"[0-9a-f]{64}", str(worker_address)):
+        print(f"[Master] ! адрес воркера {worker_address!r} не похож на адрес — "
+              "награда не выплачивается")
+        worker_address = None
     utxo = chain_mod.utxo_set(CONFIG["output_dir"])
     if worker_address:
         reward = chain_mod.build_transfer(

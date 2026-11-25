@@ -87,6 +87,7 @@ exports.handle = function (app) {
     app.post('/api/wallet/info', onWalletInfo);
     app.post('/api/wallet/send', onWalletSend);
     app.post('/api/wallet/passwd', onWalletPasswd);
+    app.post('/api/wallet/tx', onWalletTx);
 
     // MACE
     app.post('/api/mace/run', onMaceRun);
@@ -357,6 +358,20 @@ async function onWalletPasswd(req, res) {
         if (body.role) args.push('--role', String(body.role));
         if (body.name) args.push('--name', String(body.name));
         const out = await runPython(args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
+        res.json(out);
+    } catch (e) {
+        bad(res, 500, String(e));
+    }
+}
+
+async function onWalletTx(req, res) {
+    try {
+        const body = req.body || {};
+        if (!body.txid) return bad(res, 400, 'нужен txid');
+        const root = walletRoot(body);
+        const out = await runPython(
+            ['src/webwallet.py', 'tx', '--results-root', root, '--txid', String(body.txid)],
+            {}, 20000);
         res.json(out);
     } catch (e) {
         bad(res, 500, String(e));

@@ -116,6 +116,8 @@
   .cfg-field .muted { margin-top: 2px; font-size: 11.5px; }
   .cfg-field.wide { grid-column: 1 / -1; }
   .cfg-bool { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+  tr.tx-row { cursor: pointer; }
+  tr.tx-row:hover { background: #f7fafc; }
   details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
 </style>
 </head>
@@ -843,6 +845,11 @@ function buildWalletTab(tab) {
           <h2>Содержимое</h2>
           <div id="${tab}-content" class="muted">нажмите «Открыть»</div>
         </div>
+
+        <div class="card" id="${tab}-tx-card" style="display:none">
+          <h2>Транзакция</h2>
+          <div id="${tab}-tx"></div>
+        </div>
       </div>
     </div>`;
 
@@ -868,6 +875,11 @@ function buildWalletTab(tab) {
         : '');
     document.getElementById(tab + '-send-card').style.display = 'block';
     renderWallet(tab, data);
+  });
+
+  document.getElementById(tab + '-content').addEventListener('click', (ev) => {
+    const row = ev.target.closest('tr[data-txid]');
+    if (row) showTxDetails(tab, row.dataset.txid);
   });
 
   document.getElementById(tab + '-chpass').addEventListener('click', async () => {
@@ -918,9 +930,13 @@ function renderWallet(tab, data) {
     const addrs = w.addresses.map((a) => `
       <div class="mono muted" style="font-size:11.5px">${esc(a.address)}</div>`).join('');
     const txs = (w.transactions || []).slice().reverse().map((t) => {
-      const amount = t.received ? '+' + t.received.toFixed(4) : '−' + t.sent.toFixed(4);
-      const cls = t.received ? 'ok' : '';
-      return `<tr>
+      const net = (t.received || 0) - (t.sent || 0);
+      const amount = (net >= 0 ? '+' : '−') + Math.abs(net).toFixed(4);
+      const cls = net > 0 ? 'ok' : (net < 0 ? 'err' : '');
+      const hint = (t.received && t.sent)
+        ? `приход ${t.received.toFixed(4)}, расход ${t.sent.toFixed(4)} — нажмите для деталей`
+        : 'нажмите, чтобы посмотреть входы и выходы';
+      return `<tr class="tx-row" data-txid="${esc(t.txid)}" title="${esc(hint)}">
         <td class="num">${t.block}</td>
         <td>${esc(t.type)}</td>
         <td class="num ${cls}">${amount}</td>
@@ -948,6 +964,63 @@ function renderWallet(tab, data) {
         : '<span class="muted">транзакций пока нет</span>'}
       </div>`;
   }).join('');
+}
+
+function shortAddr(a) {
+  if (!a) return '—';
+  return a.length > 20 ? a.slice(0, 10) + '…' + a.slice(-6) : a;
+}
+
+async function showTxDetails(tab, txid) {
+  const card = document.getElementById(tab + '-tx-card');
+  const box = document.getElementById(tab + '-tx');
+  card.style.display = 'block';
+  box.innerHTML = '<span class="muted">читаю блок…</span>';
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  const data = await api('/api/wallet/tx', {
+    txid, resultsRoot: document.getElementById(tab + '-root').value || null,
+  });
+  if (!data.ok) {
+    box.innerHTML = `<span class="err">${esc(data.error || 'не читается')}</span>`;
+    return;
+  }
+
+  const ins = (data.inputs || []).map((i) => i.coinbase
+    ? '<div class="mono">− coinbase: новых монет (без источника)</div>'
+    : `<div class="mono">− ${i.value == null ? '?' : i.value.toFixed(6)}
+        с ${esc(shortAddr(i.address))}
+        ${i.txid ? `<span class="muted">(${esc(String(i.txid).slice(0, 10))}…#${i.vout})</span>` : ''}</div>`)
+    .join('');
+
+  const outs = (data.outputs || []).map((o) =>
+    `<div class="mono">+ ${o.value.toFixed(6)} на ${esc(shortAddr(o.address))}</div>`).join('');
+
+  box.innerHTML = `
+    <div class="kv">
+      <span>блок <code>${data.block}</code></span>
+      <span>подтверждений <code>${data.confirmations}</code></span>
+      <span>тип <code>${esc(data.type)}</code></span>
+      ${data.fee != null ? `<span>комиссия <code>${data.fee}</code></span>` : ''}
+    </div>
+    <div class="mono muted" style="font-size:11px;margin:6px 0">${esc(data.txid)}</div>
+    <h3>Откуда — входы (${data.total_in})</h3>
+    ${ins || '<span class="muted">нет входов</span>'}
+    <h3>Куда — выходы (${data.total_out})</h3>
+    ${outs || '<span class="muted">нет выходов</span>'}
+    <div class="actions">
+      <button class="btn secondary" id="${tab}-raw-btn">Полная транзакция из блока</button>
+      <button class="btn secondary" id="${tab}-close">Закрыть</button>
+    </div>
+    <pre class="log short" id="${tab}-raw" style="display:none">${esc(JSON.stringify(data.raw, null, 2))}</pre>`;
+
+  const raw = document.getElementById(tab + '-raw');
+  document.getElementById(tab + '-raw-btn').addEventListener('click', () => {
+    raw.style.display = raw.style.display === 'none' ? 'block' : 'none';
+  });
+  document.getElementById(tab + '-close').addEventListener('click', () => {
+    card.style.display = 'none';
+  });
 }
 
 async function refreshWallet(tab) {

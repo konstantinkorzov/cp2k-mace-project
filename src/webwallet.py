@@ -112,6 +112,78 @@ def collect(root: str, password: str, confirmations: int,
             "role": role, "also_matched": others, "wallets": out}
 
 
+def _outputs_index(element_dir: str) -> dict:
+    """(txid, vout) -> (адрес, сумма) по всем блокам — чтобы показать, откуда пришли входы."""
+    index = {}
+    for b in chain.list_blocks(element_dir):
+        try:
+            txs = chain.read_block_txs(b["path"])
+        except Exception:  # noqa: BLE001
+            continue
+        for tx in txs:
+            tid = tx.get("txid") or chain.txid_of(tx)
+            for n, out in enumerate(tx.get("outputs", [])):
+                index[(tid, n)] = (out.get("address"), float(out.get("value") or 0.0))
+    return index
+
+
+def tx_details(root: str, txid: str) -> dict:
+    """Полная информация о транзакции из блока: входы с адресами, выходы, комиссия."""
+    root = _root(root)
+    element = _element()
+    element_dir = os.path.join(root, element)
+    if not os.path.isdir(element_dir):
+        return {"ok": False, "error": f"нет каталога {element_dir}"}
+
+    tip = chain.next_seq(element_dir) - 1
+    index = _outputs_index(element_dir)
+
+    for b in chain.list_blocks(element_dir):
+        try:
+            txs = chain.read_block_txs(b["path"])
+        except Exception:  # noqa: BLE001
+            continue
+        for tx in txs:
+            tid = tx.get("txid") or chain.txid_of(tx)
+            if tid != txid:
+                continue
+
+            inputs, total_in = [], 0.0
+            for i in tx.get("inputs", []):
+                if i.get("coinbase"):
+                    inputs.append({"coinbase": True, "address": None,
+                                   "value": None, "txid": None, "vout": None})
+                    continue
+                key = (i.get("txid"), int(i.get("vout", -1)))
+                address, value = index.get(key, (None, None))
+                if value:
+                    total_in += value
+                inputs.append({"coinbase": False, "address": address,
+                               "value": value, "txid": i.get("txid"),
+                               "vout": i.get("vout")})
+
+            outputs = [{"vout": n, "address": o.get("address"),
+                        "value": float(o.get("value") or 0.0)}
+                       for n, o in enumerate(tx.get("outputs", []))]
+            total_out = sum(o["value"] for o in outputs)
+
+            fee = None
+            if tx.get("type") != "coinbase" and total_in:
+                fee = round(total_in - total_out, 8)
+
+            return {
+                "ok": True, "element": element, "block": b["seq"],
+                "confirmations": max(0, tip - b["seq"] + 1),
+                "type": tx.get("type"), "txid": tid,
+                "fee": fee, "inputs": inputs, "outputs": outputs,
+                "total_in": round(total_in, 8), "total_out": round(total_out, 8),
+                "raw": {k: v for k, v in tx.items() if k != "_file"},
+            }
+
+    return {"ok": False,
+            "error": "транзакция не найдена в блоках (возможно, ещё в мемпуле)"}
+
+
 def send(root: str, password: str, to: str, amount: float, fee: float,
          masters: list[str], confirmations: int, role: str | None,
          name: str | None) -> dict:
@@ -173,7 +245,7 @@ def change_password(root: str, old: str, new: str,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="JSON-кошелёк для веб-панели")
-    ap.add_argument("action", choices=["info", "send", "passwd"])
+    ap.add_argument("action", choices=["info", "send", "passwd", "tx"])
     ap.add_argument("--password", default=None)
     ap.add_argument("--password-env", default="WEBUI_WALLET_PASSWORD")
     ap.add_argument("--results-root", default=DEFAULT_ROOT)
@@ -184,6 +256,7 @@ def main() -> int:
     ap.add_argument("--amount", type=float, default=0.0)
     ap.add_argument("--fee", type=float, default=chain.TX_FEE)
     ap.add_argument("--change-to", default=None)
+    ap.add_argument("--txid", default=None)
     ap.add_argument("--master", action="append", default=None)
     args = ap.parse_args()
 
@@ -194,6 +267,11 @@ def main() -> int:
     if args.action == "info":
         result = collect(args.results_root, password, confirmations,
                          role=args.role, name=args.name)
+    elif args.action == "tx":
+        if not args.txid:
+            print(json.dumps({"ok": False, "error": "нужен --txid"}, ensure_ascii=False))
+            return 2
+        result = tx_details(args.results_root, args.txid)
     elif args.action == "send":
         if not args.to or args.amount <= 0:
             print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},
