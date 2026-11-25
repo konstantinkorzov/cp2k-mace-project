@@ -223,6 +223,17 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     # подтверждения чтения restart — константы в cp2k_runner.py (RESTART_VERIFY_SCF).
     cfg.setdefault("restart_max_mb", 50)                  # лимит размера принятого wfn
 
+    # Необязательный шаблон геометрии (template_xyz). В отличие от первой
+    # версии (шаблон уезжал воркеру как подсказка) теперь по нему генерирует
+    # САМ МАСТЕР и выдаёт готовые координаты в задании — иначе близость
+    # к шаблону недоказуема: воркер мог бы его проигнорировать.
+    tpl = str(cfg.get("template_xyz") or "").strip()
+    cfg["template"] = None
+    cfg["template_path"] = None
+    if tpl:
+        cfg["template_path"] = (tpl if os.path.isabs(tpl)
+                                else os.path.join(PROJECT_ROOT, tpl))
+
     # Мастеру обязательно нужно описание системы
     _require(cfg, ["system"])
 
@@ -292,6 +303,58 @@ def load_config(path: str, results_root: str | None = None) -> Config:
 
 
 CONFIG = load_config(CONFIG_PATH)
+
+
+def _load_template(cfg) -> None:
+    """Читает template_xyz и проверяет совместимость с system.
+
+    Шаблон — сид геометрии на стороне МАСТЕРА: координаты по нему генерирует
+    мастер и отдаёт воркеру в задании. Поэтому близость к шаблону проверяется
+    не доверием, а равенством присланной геометрии выданной (см. _same_geometry),
+    и никакой DFT для этой проверки не нужен.
+    """
+    cfg["template"] = None
+    path = cfg.get("template_path")
+    if not path:
+        return
+
+    tpl = structure_generator.load_template_xyz(path)
+    frames = tpl["frames"]
+    first = frames[0]
+    counts: dict[str, int] = {}
+    for sym in first["symbols"]:
+        counts[sym] = counts.get(sym, 0) + 1
+
+    comp = cfg["composition"]
+    unknown = sorted(set(counts) - set(comp))
+    if unknown:
+        raise SystemExit(
+            f"[Master] ✗ template_xyz: элементы {unknown} отсутствуют в system.composition "
+            f"{comp}. Шаблон должен быть из той же системы.")
+
+    unit = sum(comp.values())
+    total = sum(counts.values())
+    expected = {sym: cnt / unit for sym, cnt in comp.items()}
+    actual = {sym: cnt / total for sym, cnt in counts.items()}
+    ratio_ok = all(abs(actual.get(sym, 0.0) - exp) <= 0.02 for sym, exp in expected.items())
+
+    d_min = structure_generator.min_dist(cfg)
+    d_tpl = structure_generator.template_min_distance(tpl)
+    if d_tpl < d_min * MIN_DIST_TOLERANCE:
+        raise SystemExit(
+            f"[Master] ✗ template_xyz: минимальное расстояние в шаблоне {d_tpl:.3f} Å "
+            f"меньше допустимого {d_min * MIN_DIST_TOLERANCE:.3f} Å "
+            f"(min_dist = {d_min:.3f} = system.atom_diameter × {structure_generator.MIN_DIST_FACTOR}). "
+            f"Уменьшите atom_diameter или возьмите другой шаблон.")
+
+    sizes = sorted({len(f["coords"]) for f in frames})
+    cfg["template"] = tpl
+    print(f"[Master] 🧩 шаблон геометрии: {tpl['source']} — кадров {len(frames)}, "
+          f"атомов {sizes}, min d = {d_tpl:.3f} Å; состав {counts}")
+    if not ratio_ok:
+        print(f"[Master] ⚠ состав шаблона {counts} не пропорционален system.composition "
+              f"{comp} — сорт атомов будет назначен по формуле, шаблон задаёт только геометрию")
+    print("[Master] 🧩 геометрию по шаблону генерирует мастер; воркер считает ровно выданное")
 
 
 # ---------- CLI / Порт ----------
@@ -398,6 +461,49 @@ def stage_for_height(height: int, cfg) -> dict:
         s += 1
 
 
+GEOMETRY_RETRIES = 5          # сколько разных seed-ов перебрать при неудаче генерации
+GEOMETRY_SHIFT = 7919         # сдвиг seed при повторной выдаче того же задания
+GEOMETRY_MATCH_TOL = 1e-6     # Å: допуск сравнения присланной и выданной геометрии
+
+
+def _issue_geometry(task: dict) -> dict:
+    """Геометрия задания — делает МАСТЕР и выдаёт готовой.
+
+    Воркер больше ничего не придумывает: он получает координаты и сорт атомов
+    в задании. Поэтому близость к шаблону/seed — не обещание, а проверяемое
+    свойство: мастер сравнивает присланное с тем, что выдал (_same_geometry),
+    и только потом запускает DFT.
+
+    :return: {"coords": [[x,y,z], ...], "species": [...], "seed": int}
+    """
+    n_atoms = int(task["n_atoms"])
+    dim = int(task["dim"])
+    base = int(task.get("seed") or 0)
+    attempts = int(task.get("attempts", 0))
+    last_error = None
+
+    for k in range(GEOMETRY_RETRIES):
+        seed = (base + GEOMETRY_SHIFT * attempts + k) % (2 ** 31)
+        try:
+            if CONFIG.get("template"):
+                coords = structure_generator.generate_from_template(
+                    n_atoms, dim, CONFIG, CONFIG["template"],
+                    seed=seed, max_attempts=3)
+            else:
+                coords = structure_generator.generate_random_cluster(
+                    n_atoms, dim, CONFIG, seed=seed, max_attempts=3)
+            species = structure_generator.assign_species(n_atoms, CONFIG, seed=seed)
+            return {
+                "coords": np.asarray(coords, dtype=float).tolist(),
+                "species": [str(s) for s in species],
+                "seed": seed,
+            }
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+
+    raise RuntimeError(f"не удалось построить геометрию n={n_atoms}, dim={dim}: {last_error}")
+
+
 def schedule_tasks_for_stage(stage: dict, cfg, start_index: int = 0,
                              count: int | None = None) -> list[dict]:
     """Задания этапа. Размерность чередуется: 3D, 2D, 3D, 2D…"""
@@ -408,7 +514,7 @@ def schedule_tasks_for_stage(stage: dict, cfg, start_index: int = 0,
         "task_index": start_index + i,
         "n_atoms": n_atoms,
         "dim": int(DIM_CYCLE[(start_index + i) % len(DIM_CYCLE)]),
-        # опорное число генератора: воркер не должен брать константу
+        # seed генерации: по нему мастер строит геометрию задания
         "seed": _task_seed(start_index + i),
         "attempts": 0,
     } for i in range(count)]
@@ -572,7 +678,26 @@ def _stale_reason(n_atoms: int) -> str | None:
     return None
 
 
-def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
+def _same_geometry(coords: np.ndarray, species, issued: dict) -> tuple[bool, str]:
+    """Сверка присланной геометрии с той, что выдал мастер (без CP2K).
+
+    Воркер не должен двигать атомы: он получает готовые координаты и обязан
+    вернуть их же. Допуск — только на округление JSON (~1e-6 Å).
+    """
+    ref = np.asarray(issued.get("coords") or issued.get("geometry") or [], dtype=np.float64)
+    if ref.shape != coords.shape:
+        return False, f"форма {coords.shape} != выданной {ref.shape}"
+    if not np.allclose(coords, ref, atol=GEOMETRY_MATCH_TOL, rtol=0.0):
+        shift = float(np.max(np.abs(coords - ref)))
+        return False, f"атомы смещены на {shift:.3g} Å"
+    want = issued.get("species")
+    if want and species is not None:
+        if [str(s) for s in species] != [str(s) for s in want]:
+            return False, "другой сорт или порядок атомов"
+    return True, ""
+
+
+def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = None) -> dict:
     """
     Приёмка по файлу состояния (архитектура A). Мастер НЕ верит числом воркера:
 
@@ -606,13 +731,26 @@ def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
     if not ok:
         return fail(f"geometry rejected: {reason}")
 
+    # 0. Геометрия должна быть ровно той, что выдал мастер (дёшево, без CP2K).
+    #    Если сверка прошла — дальше считаются последние шаги DFT для НЕЁ.
+    if issued:
+        same, why = _same_geometry(coords, payload.get("species"), issued)
+        if not same:
+            return fail(f"геометрия не та, что выдана в задании: {why}")
+
     stale = _stale_reason(n_atoms)
     if stale:
         return fail(stale)
 
-    # Состав: воркер раскладывает формулу по атомам сам, мастер проверяет количество.
+    # Состав. При обычной выдаче эталон — species от мастера; в ready-пути
+    # (результат принесён другому мастеру) проверяем только количество.
+    issued_species = (issued or {}).get("species")
     species = payload.get("species")
-    if species:
+    if issued_species:
+        if species is not None and [str(s) for s in species] != [str(s) for s in issued_species]:
+            return fail("состав/порядок атомов не совпадает с выданным заданием")
+        cfg_species = [str(s) for s in issued_species]
+    elif species:
         if not isinstance(species, list) or len(species) != n_atoms:
             return fail("species не соответствует числу атомов")
         mult = n_atoms // int(cfg.get("formula_size") or 1)
@@ -708,6 +846,8 @@ def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
             "valid": True,
             "reason": "",
             "elapsed": time.perf_counter() - t0,
+            # true — геометрия сверена с выданной мастером (не только состав/min_dist)
+            "geometry_verified": bool(issued),
             "energy_ev": float(res["energy_ev"]),
             "energy_hartree": float(res.get("energy_hartree", float("nan"))),
             "forces_ev_ang": res.get("forces_ev_ang"),
@@ -855,6 +995,10 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         "magnetic_moment": verdict.get("mag"),
         "e_isolated_atom_ev": verdict.get("e_isolated_atom"),
         "e_binding_per_atom_ev": verdict.get("e_binding_per_atom"),
+        # была ли геометрия сверена с выданной мастером (false — ready-путь,
+        # результат принесён другому мастеру, эталона у него нет)
+        "geometry_verified": bool(verdict.get("geometry_verified")),
+        "geometry_seed": payload.get("seed"),
         # фактическое электронное состояние: у одного элемента мультиплетность
         # зависит от n и геометрии, поэтому она обязана быть в датасете
         "charge": int(CONFIG.get("charge") or 0),
@@ -984,6 +1128,8 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
             "worker_wfn_size": payload.get("wfn_size"),
             # seed геометрии: тот же seed + та же версия генератора = тот же кадр
             "seed": payload.get("seed"),
+            # true — присланная геометрия совпала с выданной мастером
+            "geometry_verified": bool(verdict.get("geometry_verified")),
             "verified_at": time.time(),
         },
     }
@@ -1343,28 +1489,44 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
         task = pending_tasks.pop(0)
         struct_id = task["struct_id"]
 
-        # Воркер получает только «сколько атомов сгенерировать» и параметры;
-        # саму структуру он генерирует сам (src/structure_generator.py)
+        # Геометрию делает МАСТЕР: воркеру уезжают готовые координаты и сорт
+        # атомов. Так близость к шаблону/seed проверяема (см. verify_state_payload),
+        # а не держится на доверии к воркеру.
+        try:
+            issued = _issue_geometry(task)
+        except Exception as e:  # noqa: BLE001
+            pending_tasks.insert(0, task)
+            print(f"[Master] ✗ не удалось построить геометрию для {struct_id}: {e}")
+            raise HTTPException(status_code=503,
+                                detail=f"геометрия задания не построена: {e}")
+
         task_payload = {
             "struct_id": struct_id,
             "n_atoms": task["n_atoms"],
             "dim": task["dim"],
             "attempts": task.get("attempts", 0),
-            # опорное число генератора структуры (время запуска + номер задания)
-            "seed": task.get("seed"),
+            # seed, которым мастер построил геометрию (для воспроизводимости)
+            "seed": issued["seed"],
+            "geometry": issued["coords"],
+            "species": issued["species"],
             "cfg": task_cfg_payload(CONFIG),
         }
 
         active_tasks[struct_id] = {
             "task": task,
             "time_sent": now,
-            "worker_id": worker_id
+            "worker_id": worker_id,
+            # эталон для сверки: если вернут другое — это не наше задание
+            "geometry": issued["coords"],
+            "species": issued["species"],
+            "seed": issued["seed"],
         }
 
         print(f"Воркер [{worker_id}] получил задание {struct_id}: "
-              f"сгенерировать кластер n={task['n_atoms']}, dim={task['dim']}, "
-              f"элемент {CONFIG['element']} ({CONFIG['potential']}) "
-              f"| В очереди: {len(pending_tasks)} | У воркеров: {len(active_tasks)}")
+              f"n={task['n_atoms']}, dim={task['dim']}, seed={issued['seed']}, "
+              f"элемент {CONFIG['element']} ({CONFIG['potential']})"
+              + (f", шаблон {CONFIG['template']['source']}" if CONFIG.get("template") else "")
+              + f" | В очереди: {len(pending_tasks)} | У воркеров: {len(active_tasks)}")
         return {"status": "ok", "task": task_payload}
 
 @app.get("/heartbeat")
@@ -1487,7 +1649,9 @@ def submit_result(result: TaskResult):
         payload = dict(result.data or {})
         payload.setdefault("worker_id", w_id)
 
-        verdict = verify_state_payload(CONFIG, task_data, payload)
+        # Эталон — та геометрия, которую мастер выдал (info), а не присланная.
+        # Сверка дешёвая; только после неё запускаются последние шаги DFT.
+        verdict = verify_state_payload(CONFIG, task_data, payload, issued=info)
         persist = _persist_verified_state
 
         with task_queue_lock:
@@ -2280,6 +2444,7 @@ def _main_impl():
 
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
     _load_mempool()
+    _load_template(CONFIG)
 
     # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос
     conn = wallet_store.open_db(CONFIG["wallet_store_db"])

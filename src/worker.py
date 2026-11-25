@@ -2,15 +2,17 @@
 """
 Полноценный воркер для расчета DFT.
 
-Мастер присылает воркеру только «желаемое число атомов» (n_atoms) и размерность (dim).
+Мастер выдаёт готовую геометрию задания: координаты и сорт атомов приходят
+в задании. Воркер ничего не генерирует и не меняет (это важно: иначе близость
+к шаблону/seed была бы недоказуема).
 
 Воркер:
-  1. сам генерирует случайную структуру нужного размера (structure_generator);
-  2. делает DFT-расчёт в CP2K до сходимости SCF;
-  3. отправляет мастеру файл состояния (-RESTART.wfn), геометрию и телеметрию
+  1. считает ВЫДАННУЮ структуру в CP2K до сходимости SCF;
+  2. отправляет мастеру файл состояния (-RESTART.wfn), геометрию и телеметрию
      (E/gap/mag) — числа воркера мастер не использует в качестве истины.
 
-Мастер сам считает E/силы/gap/mag от присланной плотности (см. src/main.py,
+Мастер сверяет присланную геометрию с выданной (дёшево, без CP2K), затем сам
+считает E/силы/gap/mag от присланной плотности (см. src/main.py,
 verify_state_payload) и принимает результат, только если SCF сходится за
 RESTART_VERIFY_SCF шагов.
 """
@@ -20,21 +22,19 @@ import sys
 import time
 import json
 import base64
-import random
 import logging
 import argparse
 import threading
 
+import numpy as np
 import requests
 
 import cp2k_runner
 import identity
 import wallet_store
-import structure_generator
 
 
 RETRY_DELAY = 5          # секунд между попытками подключения к серверу
-LOCAL_RETRIES = 3        # сколько раз воркер локально повторяет задачу (новая структура)
 PEER_REFRESH_SEC = 60    # как часто спрашивать у мастеров адреса других мастеров
 MAX_MASTERS = 32         # сколько адресов мастеров воркер готов держать
 HEARTBEAT_SEC = 30       # как часто сообщать мастеру «я жив» (в т.ч. во время расчёта)
@@ -117,158 +117,122 @@ def _worker_password(arg: str | None) -> str | None:
     return None
 
 
-def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger,
-                       seed: int | None = None):
-    """
-    Генерирует ОДНУ случайную структуру нужного размера.
-
-    seed приходит от мастера В ЗАДАНИИ (не константа: время запуска + номер
-    задания), поэтому кадр воспроизводим и не повторяется между запусками.
-    Если seed не передан — берём системный энтропийный.
-
-    :return: (coords, фактический seed)
-    """
-    if seed is None:
-        seed = random.SystemRandom().randrange(10 ** 9)
-    seed = int(seed)
-    logger.info(f"Генерирую случайную структуру: n={n_atoms}, dim={dim}, seed={seed}, "
-                f"элемент {cfg['element']}, min_dist={structure_generator.min_dist(cfg):.2f}, "
-                f"max_dist={structure_generator.max_dist(cfg):.2f}")
-
-    coords = structure_generator.generate_random_cluster(
-        n_atoms=n_atoms,
-        dim=dim,
-        cfg=cfg,
-        seed=seed,
-        max_attempts=5,
-    )
-    logger.info(f"Структура готова: {coords.shape[0]} атомов (задание {struct_id})")
-    return coords, seed
-
-
 def run_task(task: dict, cfg: dict, logger):
     """
-    Выполняет задание: генерация структуры → DFT до сходимости → сборка payload'а.
-    Возвращает (success, data). При ошибке data содержит "message".
+    Считает ВЫДАННУЮ мастером геометрию и собирает payload.
 
-    Воркер всегда шлёт файл состояния (-RESTART.wfn): мастер сам считает из него.
+    Воркер не создаёт и не меняет структуру: координаты и сорт атомов приходят
+    в задании. Мастер сверит присланное с выданным (дёшево, без CP2K) и только
+    после этого запустит свои шаги DFT от присланного -RESTART.wfn.
+
+    Возвращает (success, data). При ошибке data содержит "message".
     """
-    struct_id = task["struct_id"]
-    n_atoms = int(task["n_atoms"])
+    struct_id = task.get("struct_id", "?")
+    geometry = task.get("geometry")
+    if not geometry:
+        return False, {"error": True,
+                       "message": "мастер не передал геометрию в задании"}
+
+    coords = np.asarray(geometry, dtype=np.float64)
+    n_atoms = int(task.get("n_atoms") or len(coords))
     dim = int(task.get("dim", 3))
-    # Прогресс CP2K (шаги SCF, сходимость) — в тот же лог, что и остальные сообщения
+    used_seed = task.get("seed")
+
+    species = [str(s) for s in (task.get("species") or [])]
+    if len(species) != n_atoms:
+        species = [cfg["element"]] * n_atoms
+
     cfg = dict(cfg)
     cfg["progress"] = logger.info
+    cfg["species"] = species
 
     # Энергию изолированного атома считает ТОЛЬКО мастер и передаёт её в задании.
-    # Воркер сам CP2K для E_iso не запускает (мастеру он доверяет).
     e_iso = cfg.get("e_isolated_atom")
     if e_iso is None:
         logger.warning("Мастер не передал E_iso — E_binding/atom в логе будет отсутствовать")
 
-    last_error = "неизвестная ошибка"
-    base_seed = task.get("seed")
+    logger.info(f"Считаю выданную мастером структуру {struct_id}: n={n_atoms}, "
+                f"dim={dim}, seed={used_seed}, элемент {cfg['element']}")
+    t0 = time.time()
+    try:
+        res = cp2k_runner.run_dft_for_single_structure(
+            coords=coords,
+            n_atoms=n_atoms,
+            dim=dim,
+            struct_id=struct_id,
+            cfg=cfg,
+            save_wfn=True,
+        )
+    except Exception as ex:  # noqa: BLE001
+        logger.exception(f"Ошибка при выполнении {struct_id}")
+        return False, {"error": True, "message": f"{type(ex).__name__}: {ex}"}
+    elapsed = time.time() - t0
 
-    for attempt in range(1, LOCAL_RETRIES + 1):
-        # Каждая попытка — своя структура (seed сдвигается), иначе повтор
-        # после несходимости SCF считал бы ту же самую геометрию.
-        attempt_seed = (int(base_seed) + 7919 * (attempt - 1)
-                        if base_seed is not None else None)
-        try:
-            coords, used_seed = generate_structure(
-                n_atoms, dim, cfg, struct_id, logger, seed=attempt_seed)
-            # Раскладываем формулу по атомам (Al2O3 → 2 Al + 3 O на каждую единицу)
-            species = structure_generator.assign_species(
-                n_atoms, cfg, seed=random.SystemRandom().randrange(10 ** 9))
-            cfg["species"] = species
+    if res.get("error"):
+        logger.error(f"Расчёт {struct_id} не удался: rc={res.get('rc')}")
+        return False, {"error": True,
+                       "message": f"CP2K error (rc={res.get('rc')})"}
 
-            t0 = time.time()
-            res = cp2k_runner.run_dft_for_single_structure(
-                coords=coords,
-                n_atoms=n_atoms,
-                dim=dim,
-                struct_id=f"{struct_id}_try{attempt}",
-                cfg=cfg,
-                save_wfn=True,
-            )
-            elapsed = time.time() - t0
+    if not res.get("scf_converged", False):
+        msg = (f"SCF не сошёлся ({res.get('scf_steps')} шагов)"
+               if res.get("scf_steps") else "SCF не сошёлся")
+        logger.warning(f"Расчёт {struct_id}: {msg} — мастер выдаст новую геометрию")
+        return False, {"error": True, "message": msg}
 
-            if res.get("error"):
-                last_error = f"CP2K error (rc={res.get('rc')})"
-                logger.error(f"Попытка {attempt}/{LOCAL_RETRIES}: расчёт {struct_id} не удался: {last_error}")
-                continue
+    wfn_path = res.get("wfn_path")
+    if not wfn_path or not os.path.exists(wfn_path):
+        logger.error("CP2K не создал файл состояния (-RESTART.wfn)")
+        return False, {"error": True,
+                       "message": "CP2K не создал файл состояния (-RESTART.wfn)"}
+    with open(wfn_path, "rb") as f:
+        wfn_bytes = f.read()
 
-            # Главное требование задания из README: структура должна СОЙТИСЬ.
-            # Не сошлось — генерируем новую структуру и считаем заново.
-            if not res.get("scf_converged", False):
-                last_error = (f"SCF не сошёлся ({res.get('scf_steps')} шагов)"
-                              if res.get("scf_steps") else "SCF не сошёлся")
-                logger.warning(f"Попытка {attempt}/{LOCAL_RETRIES}: {last_error} — беру новую структуру")
-                continue
+    data = {
+        "geometry": coords.tolist(),
+        "species": species,
+        "n_atoms": n_atoms,
+        "dim": dim,
+        "seed": used_seed,
+        "cell_size": cp2k_runner.resolve_cell_size(coords, cfg),
+        "element": cfg["element"],
+        "potential": cfg.get("potential"),
+        "scf_converged": True,
+        "scf_steps": res.get("scf_steps"),
+        "elapsed": res.get("elapsed", elapsed),
+        "hash": res.get("hash"),
+        "wfn_name": os.path.basename(wfn_path),
+        "wfn_b64": base64.b64encode(wfn_bytes).decode("ascii"),
+        "wfn_size": len(wfn_bytes),
+        # ниже — только телеметрия, мастер её перепроверит сам
+        "energy_ev": res["energy_ev"],
+        "gap": res.get("gap"),
+        "mag": res.get("mag"),
+        "e_isolated_atom_ev": e_iso,
+        "e_binding_per_atom": (
+            (e_iso * n_atoms - res["energy_ev"]) / n_atoms
+            if e_iso is not None else None
+        ),
+    }
 
-            data = {
-                "geometry": coords.tolist(),
-                "species": species,
-                "n_atoms": n_atoms,
-                "dim": dim,
-                "seed": used_seed,
-                "cell_size": cp2k_runner.resolve_cell_size(coords, cfg),
-                "element": cfg["element"],
-                "potential": cfg.get("potential"),
-                "scf_converged": True,
-                "scf_steps": res.get("scf_steps"),
-                "elapsed": res.get("elapsed", elapsed),
-                "hash": res.get("hash"),
-            }
-
-            wfn_path = res.get("wfn_path")
-            if not wfn_path or not os.path.exists(wfn_path):
-                last_error = "CP2K не создал файл состояния (-RESTART.wfn)"
-                logger.error(f"Попытка {attempt}/{LOCAL_RETRIES}: {last_error}")
-                continue
-            with open(wfn_path, "rb") as f:
-                wfn_bytes = f.read()
-            data.update({
-                "wfn_name": os.path.basename(wfn_path),
-                "wfn_b64": base64.b64encode(wfn_bytes).decode("ascii"),
-                "wfn_size": len(wfn_bytes),
-                # ниже — только телеметрия, мастер её перепроверит сам
-                "energy_ev": res["energy_ev"],
-                "gap": res.get("gap"),
-                "mag": res.get("mag"),
-                "e_isolated_atom_ev": e_iso,
-                "e_binding_per_atom": (
-                    (e_iso * n_atoms - res["energy_ev"]) / n_atoms
-                    if e_iso is not None else None
-                ),
-            })
-
-            e_bind = data["e_binding_per_atom"]
-            parts = [f"E = {res['energy_ev']:.6f} eV"]
-            if e_bind is not None:
-                parts.append(f"E_binding/atom = {e_bind:.6f} eV")
-            else:
-                parts.append(f"E/atom = {res['energy_ev'] / n_atoms:.6f} eV")
-            if res.get("gap") is not None:
-                parts.append(f"Gap = {res['gap']:.4f} eV")
-            if res.get("mag") is not None:
-                parts.append(f"MagMom = {res['mag']:.4f} μB")
-            # Физические наблюдаемые (телеметрия воркера; канон — числа мастера)
-            if res.get("ip_koopmans_ev") is not None:
-                parts.append(f"IP(Купманс) = {res['ip_koopmans_ev']:.3f} eV")
-            if res.get("dipole_total_debye") is not None:
-                parts.append(f"|μ| = {res['dipole_total_debye']:.2e} Д")
-            logger.info(
-                f"Расчёт {struct_id} СОШЁЛСЯ за {elapsed:.1f} с: " + ", ".join(parts)
-                + f", состояние {len(wfn_bytes)} байт — отправляю мастеру"
-            )
-            return True, data
-
-        except Exception as ex:
-            last_error = f"{type(ex).__name__}: {ex}"
-            logger.exception(f"Попытка {attempt}/{LOCAL_RETRIES}: ошибка при выполнении {struct_id}")
-
-    return False, {"error": True, "message": last_error}
+    e_bind = data["e_binding_per_atom"]
+    parts = [f"E = {res['energy_ev']:.6f} eV"]
+    if e_bind is not None:
+        parts.append(f"E_binding/atom = {e_bind:.6f} eV")
+    else:
+        parts.append(f"E/atom = {res['energy_ev'] / n_atoms:.6f} eV")
+    if res.get("gap") is not None:
+        parts.append(f"Gap = {res['gap']:.4f} eV")
+    if res.get("mag") is not None:
+        parts.append(f"MagMom = {res['mag']:.4f} μB")
+    if res.get("ip_koopmans_ev") is not None:
+        parts.append(f"IP(Купманс) = {res['ip_koopmans_ev']:.3f} eV")
+    if res.get("dipole_total_debye") is not None:
+        parts.append(f"|μ| = {res['dipole_total_debye']:.2e} Д")
+    logger.info(
+        f"Расчёт {struct_id} СОШЁЛСЯ за {elapsed:.1f} с: " + ", ".join(parts)
+        + f", состояние {len(wfn_bytes)} байт — отправляю мастеру"
+    )
+    return True, data
 
 
 def discover_peers(masters: list[str], logger) -> list[str]:

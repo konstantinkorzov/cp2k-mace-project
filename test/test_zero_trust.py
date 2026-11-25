@@ -147,7 +147,9 @@ def worker_tests():
     try:
         cfg = main.task_cfg_payload(main.CONFIG)
         cfg["output_dir"] = tempfile.mkdtemp(prefix="worker_scratch_")
-        task = {"struct_id": "n2_d3_0000", "n_atoms": 2, "dim": 3}
+        task = {"struct_id": "n2_d3_0000", "n_atoms": 2, "dim": 3, "seed": 12345,
+                "geometry": [[0.0, 0.0, 0.0], [0.0, 0.0, 2.7]],
+                "species": ["Cu", "Cu"]}
 
         ok, data = worker.run_task(task, cfg, logger)
         check("задача выполнена", ok, data.get("message", ""))
@@ -399,10 +401,24 @@ def restart_tests():
         got = main.get_task(wid)
         check("мастер не передаёт режим проверки (он всегда restart)",
               "verify_mode" not in got["task"]["cfg"])
-        good = {"geometry": [[0.0, 0.0, 0.0], [2.7, 0.0, 0.0]],
+        issued = got["task"]
+        wrong = {"geometry": [[0.0, 0.0, 0.0], [3.4, 0.0, 0.0]],
+                 "species": issued["species"],
+                 "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
+        bad = main.submit_result(main.TaskResult(
+            worker_id=wid, struct_id=issued["struct_id"], success=True, data=wrong))
+        check("подменённая геометрия отклоняется до CP2K",
+              bad.get("status") == "rejected" and "не та" in str(bad.get("reason")), str(bad))
+
+        # задание вернулось в очередь — выдаём снова (новый seed → новая геометрия)
+        got = main.get_task(wid)
+        issued = got["task"]
+        good = {"geometry": issued["geometry"],
+                "species": issued["species"],
                 "energy_ev": -2614.38,
                 "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
-        resp = main.submit_result(main.TaskResult(worker_id=wid, struct_id="n2_d3_0007",
+        resp = main.submit_result(main.TaskResult(worker_id=wid,
+                                                  struct_id=issued["struct_id"],
                                                   success=True, data=good))
         check("submit-result принял состояние", resp["status"] == "accepted", str(resp))
 
@@ -925,6 +941,63 @@ def lease_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def master_geometry_tests():
+    print("\n--- 27. Мастер — источник геометрии (и шаблон) ---")
+    import tempfile as _tempfile
+
+    tmp = _tempfile.mkdtemp(prefix="geom_")
+    saved = {k: main.CONFIG.get(k) for k in ("output_dir", "element", "template")}
+    try:
+        main.CONFIG.update({"output_dir": tmp, "element": "Cu", "template": None})
+        main.pending_tasks.clear()
+        main.active_tasks.clear()
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+        wid = main._register_worker("geom_t", "hash_geom", None)["worker_id"]
+
+        task = {"struct_id": "n2_g1", "task_index": 0, "n_atoms": 2, "dim": 3,
+                "seed": 777, "attempts": 0}
+        main.pending_tasks.append(dict(task))
+        got = main.get_task(wid)
+        payload = got.get("task") or {}
+        check("задание содержит готовую геометрию и сорт атомов",
+              len(payload.get("geometry") or []) == 2
+              and len(payload.get("species") or []) == 2, str(payload.get("struct_id")))
+        check("мастер хранит эталон выданной геометрии",
+              payload.get("struct_id") in main.active_tasks
+              and len(main.active_tasks[payload["struct_id"]]["geometry"]) == 2)
+
+        # детерминизм: тот же seed и attempt → те же координаты
+        a = main._issue_geometry(dict(task))
+        b = main._issue_geometry(dict(task))
+        check("геометрия детерминирована по seed",
+              a["coords"] == b["coords"] and a["species"] == b["species"])
+
+        # шаблон: геометрия строится вокруг него и воспроизводится по выданному seed
+        tpl_path = os.path.join(tmp, "dimer.xyz")
+        with open(tpl_path, "w", encoding="utf-8") as f:
+            f.write("2\nseed\nCu 0 0 0\nCu 2.5 0 0\n")
+        main.CONFIG["template"] = structure_generator.load_template_xyz(tpl_path)
+        tmpl_task = {"struct_id": "n2_g2", "n_atoms": 2, "dim": 3,
+                     "seed": 5, "attempts": 0}
+        g = main._issue_geometry(dict(tmpl_task))
+        pts = np.asarray(g["coords"])
+        d = float(np.linalg.norm(pts[0] - pts[1]))
+        check("шаблон: расстояние около исходного (2.5 Å)", 2.0 <= d <= 3.5, f"d={d:.2f}")
+
+        again = structure_generator.generate_from_template(
+            2, 3, main.CONFIG, main.CONFIG["template"], seed=g["seed"])
+        check("шаблон: геометрия воспроизводится по выданному seed",
+              np.allclose(np.asarray(again), pts, atol=1e-9))
+    finally:
+        main.pending_tasks.clear()
+        main.active_tasks.clear()
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+        main.CONFIG.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def peer_tests():
     print("\n--- 23. Самая длинная цепочка (catch-up перед майнингом) ---")
     import types
@@ -1064,6 +1137,7 @@ def _run_tests():
     peer_tests()
     busy_tests()
     lease_tests()
+    master_geometry_tests()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print("\n" + "=" * 60)
