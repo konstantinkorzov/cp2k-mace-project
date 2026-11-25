@@ -203,10 +203,24 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     # подтверждения чтения restart — константы в cp2k_runner.py (RESTART_VERIFY_SCF).
     cfg.setdefault("restart_max_mb", 50)                  # лимит размера принятого wfn
 
-    # Мастеру обязательно нужно знать: элемент, желаемое число атомов и размерности
-    _require(cfg, ["element", "structures_per_n", "dimensions_per_n"])
-    cfg["potential"] = cp2k_runner.get_potential(cfg["element"])
-    cfg["n_valence"] = cp2k_runner.valence_electrons(cfg["potential"])
+    # Мастеру обязательно нужно знать систему и (в ручном режиме) число атомов
+    _require(cfg, ["system"] if cfg.get("system") else ["element", "structures_per_n", "dimensions_per_n"])
+
+    system = cfg.get("system") or {}
+    name = str(system.get("name") or cfg.get("element") or "Cu")
+    comp = system.get("composition") or cfg.get("composition") or {}
+    comp = {str(k): int(v) for k, v in comp.items()} or {name: 1}
+    cfg["element"] = name                 # имя системы = имя каталога и поля header
+    cfg["composition"] = comp
+    cfg["formula_size"] = sum(comp.values())
+    cfg.setdefault("charge", 0)
+    cfg.setdefault("multiplicity", 0)
+    cfg["potential"] = (cp2k_runner.get_potential(next(iter(comp)))
+                        if len(comp) == 1 else
+                        ", ".join(f"{sym}:{cp2k_runner.get_potential(sym)}" for sym in comp))
+    cfg["n_valence"] = sum(
+        cp2k_runner.valence_electrons(cp2k_runner.get_potential(sym)) * cnt
+        for sym, cnt in comp.items())
 
     element_dir = os.path.join(RESULTS_ROOT, cfg["element"])
     cfg["output_dir"] = element_dir
@@ -235,6 +249,11 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     cfg["isolated_atom_energy_file"] = os.path.join(
         element_dir, f"{cfg['element']}_isolated_atom_energy.txt"
     )
+    # На каждый элемент — свой кэш E_iso (для соединений вроде Al2O3)
+    cfg["isolated_atom_energy_files"] = {
+        sym: os.path.join(element_dir, f"{sym}_isolated_atom_energy.txt")
+        for sym in comp
+    }
     cfg["lattice_str"] = (
         f"{cfg['cell_size']} 0.0 0.0 0.0 "
         f"{cfg['cell_size']} 0.0 0.0 0.0 "
@@ -284,6 +303,77 @@ def _master_password() -> str | None:
 
 
 # ---------- Очередь заданий: мастер раздаёт только число атомов ----------
+# ---------- Расписание размеров по высоте цепочки ----------
+def schedule_enabled(cfg) -> bool:
+    return isinstance(cfg.get("schedule"), dict) and bool(cfg["schedule"])
+
+
+def stage_for_height(height: int, cfg) -> dict:
+    """
+    Этап = размер кластера. Для этапа s:
+      n_atoms = start + (s-1)*formula_size
+      blocks  = base * s^exponent      (рекомендуется exponent ≈ 1.5)
+
+    Высота `height` — сколько блоков уже принято. Этап s покрывает
+    [C(s-1), C(s)), где C — сумма blocks по предыдущим этапам.
+    """
+    sch = cfg.get("schedule") or {}
+    base = max(1, int(sch.get("base_blocks", 10)))
+    power = float(sch.get("exponent", 1.5))
+    unit = max(1, int(cfg.get("formula_size") or 1))
+    start = int(sch.get("start_atoms", 2))
+    if start < unit:
+        start = unit
+    max_atoms = int(sch.get("max_atoms", 0) or 0)
+
+    acc, s = 0, 1
+    while True:
+        blocks = max(1, int(round(base * (s ** power))))
+        n_atoms = start + (s - 1) * unit
+        if max_atoms and n_atoms > max_atoms:
+            n_atoms = max_atoms
+        if height < acc + blocks:
+            return {"stage": s, "n_atoms": n_atoms, "blocks": blocks,
+                    "done": height - acc, "height": height}
+        acc += blocks
+        s += 1
+
+
+def schedule_tasks_for_stage(stage: dict, cfg, start_index: int = 0,
+                             count: int | None = None) -> list[dict]:
+    n_atoms = int(stage["n_atoms"])
+    dim = int((cfg.get("schedule") or {}).get("dim", 3))
+    count = int(count or stage["blocks"])
+    return [{
+        "struct_id": f"n{n_atoms}_t{start_index + i:05d}",
+        "task_index": start_index + i,
+        "n_atoms": n_atoms,
+        "dim": dim,
+        "attempts": 0,
+    } for i in range(count)]
+
+
+def _sync_stage(reason: str = ""):
+    """Пересобирает очередь, когда высота перешла на новый этап (размер)."""
+    if not schedule_enabled(CONFIG):
+        return
+    global pending_tasks
+    height = chain_mod.next_seq(CONFIG["output_dir"]) - 1
+    stage = stage_for_height(height, CONFIG)
+    if CONFIG.get("_stage") == stage["stage"]:
+        CONFIG["_stage_info"] = stage
+        return
+    CONFIG["_stage"] = stage["stage"]
+    CONFIG["_stage_info"] = stage
+    with task_queue_lock:
+        CONFIG["_task_counter"] = 0
+        pending_tasks = schedule_tasks_for_stage(stage, CONFIG)
+        CONFIG["_task_counter"] = stage["blocks"]
+    suffix = f" ({reason})" if reason else ""
+    print(f"[Master] 🧬 этап {stage['stage']}{suffix}: кластер n={stage['n_atoms']}, "
+          f"блоков на этап {stage['blocks']}; старые размеры больше не принимаются")
+
+
 def build_task_queue(cfg) -> list[dict]:
     """
     Строит задания «сгенерируй случайный кластер из n_atoms атомов размерности dim».
@@ -320,6 +410,11 @@ def task_cfg_payload(cfg) -> dict:
         # единственный параметр генерации: диаметр атома (min/max_dist — константы
         # structure_generator: min_dist = diameter, max_dist = 2*diameter)
         "atom_diameter": cfg["atom_diameter"],
+        # состав системы: воркер раскладывает формулу по атомам сам
+        "composition": cfg.get("composition") or {},
+        "formula_size": cfg.get("formula_size") or 1,
+        "charge": cfg.get("charge") or 0,
+        "multiplicity": cfg.get("multiplicity") or 0,
         # энергия изолированного атома считается ТОЛЬКО мастером (при старте)
         # и передаётся воркеру для лога E_binding/atom
         "e_isolated_atom": cfg.get("e_isolated_atom"),
@@ -367,7 +462,7 @@ def _check_geometry(coords: np.ndarray, n_atoms: int, cfg) -> tuple[bool, str]:
 # =====================================================================
 # ПРИЁМКА ПО ФАЙЛУ СОСТОЯНИЯ (-RESTART.wfn): мастер считает всё сам
 # =====================================================================
-_NAO_PER_ATOM: dict[str, int] = {}
+_NAO_TOTAL: dict[tuple[str, int], int] = {}
 
 
 def _decode_wfn_b64(payload: dict):
@@ -410,6 +505,17 @@ def _rebuild_aggregate_xyz() -> int:
     return len(files)
 
 
+def _stale_reason(n_atoms: int) -> str | None:
+    """В режиме расписания работа старого размера не принимается."""
+    if not schedule_enabled(CONFIG):
+        return None
+    stage = stage_for_height(chain_mod.next_seq(CONFIG["output_dir"]) - 1, CONFIG)
+    if int(n_atoms) != int(stage["n_atoms"]):
+        return (f"этап {stage['stage']}: n={stage['n_atoms']} — работа для n={n_atoms} "
+                f"больше не принимается")
+    return None
+
+
 def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
     """
     Приёмка по файлу состояния (архитектура A). Мастер НЕ верит числом воркера:
@@ -444,6 +550,28 @@ def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
     if not ok:
         return fail(f"geometry rejected: {reason}")
 
+    stale = _stale_reason(n_atoms)
+    if stale:
+        return fail(stale)
+
+    # Состав: воркер раскладывает формулу по атомам сам, мастер проверяет количество.
+    species = payload.get("species")
+    if species:
+        if not isinstance(species, list) or len(species) != n_atoms:
+            return fail("species не соответствует числу атомов")
+        mult = n_atoms // int(cfg.get("formula_size") or 1)
+        expected = {sym: cnt * mult for sym, cnt in cfg["composition"].items()}
+        got: dict[str, int] = {}
+        for sym in species:
+            got[str(sym)] = got.get(str(sym), 0) + 1
+        if got != expected:
+            return fail(f"состав {got} != ожидаемого {expected}")
+        cfg_species = [str(s) for s in species]
+    else:
+        cfg_species = [cfg["element"]] * n_atoms
+    run_cfg = dict(cfg)
+    run_cfg["species"] = cfg_species
+
     raw = _decode_wfn_b64(payload)
     if raw is None:
         return fail("нет файла состояния (wfn_b64)")
@@ -461,14 +589,14 @@ def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
         if not head["ok"]:
             return fail(f"синтаксис состояния: {head['reason']}")
 
-        # Обученное ожидание "nao на атом" — ловит другой элемент/базис до запуска CP2K
-        npa = _NAO_PER_ATOM.get(cfg["element"])
-        if npa and head["nao"] != npa * n_atoms:
+        # Обученное ожидание nao системы — ловит другой элемент/размер до запуска CP2K
+        expected_nao = _NAO_TOTAL.get((cfg["element"], n_atoms))
+        if expected_nao and head["nao"] != expected_nao:
             return fail(f"nao={head['nao']} не соответствует {cfg['element']}×{n_atoms}"
-                        f" (ожидалось {npa * n_atoms})")
+                        f" (ожидалось {expected_nao})")
 
         res = cp2k_runner.verify_state_from_wfn(
-            coords, wfn_path, cfg,
+            coords, wfn_path, run_cfg,
             project=f"verify_{struct_id}",
         )
         if not res.get("ok"):
@@ -489,8 +617,8 @@ def verify_state_payload(cfg, task: dict, payload: dict) -> dict:
             print(f"  [Master] ! размер канонического wfn мастера ({canon['size']}) "
                   f"!= присланного ({head['size']})")
 
-        if n_atoms and head["nao"] % n_atoms == 0:
-            _NAO_PER_ATOM[cfg["element"]] = head["nao"] // n_atoms
+        if n_atoms:
+            _NAO_TOTAL[(cfg["element"], n_atoms)] = head["nao"]
 
         first = res.get("first_step") or {}
         e_claim = payload.get("energy_ev")
@@ -690,6 +818,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
           f"coinbase {chain_mod.COINBASE_VALUE + fee + mem_fee:g} → {latest['address'][:12]}…")
     _announce_to_peers(seq)
+    _sync_stage("свой блок")
     if mem_txs:
         print(f"[Master] 📦 в блок включено транзакций из мемпула: {len(mem_txs)} "
               f"(комиссия {mem_fee:g})")
@@ -812,7 +941,7 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
 # =====================================================================
 app = FastAPI()
 
-task_queue_lock = threading.Lock()
+task_queue_lock = threading.RLock()   # RLock: блок пишется под этим же lock, а внутри зовётся _sync_stage()
 pending_tasks = []      # Список нерешенных структур
 active_tasks = {}       # struct_id -> {"task": dict, "time_sent": float, "worker_id": str}
 verifying_tasks = set() # struct_id, результаты которых проверяются прямо сейчас
@@ -934,6 +1063,7 @@ def queue_status():
             "completed": len(completed_tasks),
             "failed": len(failed_tasks),
             "paused": PAUSED,
+            "stage": CONFIG.get("_stage_info"),
             "workers": sorted(registered_workers.keys()),
             "active_details": {
                 sid: {
@@ -1082,6 +1212,15 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
                     "age_sec": age,
                     "retry_after_sec": max(0, int(TASK_TIMEOUT - age)),
                 }
+
+        if not pending_tasks and schedule_enabled(CONFIG):
+            # Этап ещё не закончен (были отказы/таймауты) — добираем задания того же размера
+            stage = stage_for_height(chain_mod.next_seq(CONFIG["output_dir"]) - 1, CONFIG)
+            if stage["done"] < stage["blocks"]:
+                start = int(CONFIG.get("_task_counter", 0))
+                pending_tasks.extend(
+                    schedule_tasks_for_stage(stage, CONFIG, start, count=stage["blocks"]))
+                CONFIG["_task_counter"] = start + stage["blocks"]
 
         if not pending_tasks:
             return {"status": "empty", "message": "Нет доступных задач"}
@@ -1423,6 +1562,7 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
             accepted += 1
         print(f"[Reorg] ✓ переключился на ветку {peer} (высота {remote})")
         _prune_mempool("reorg")
+        _sync_stage("reorg")
         return {"accepted": accepted, "errors": []}
     except Exception as e:  # noqa: BLE001
         # Откат: удалить новые блоки и вернуть старые из orphan
@@ -1482,6 +1622,7 @@ def sync_from_peer(peer: str) -> dict:
 
     if accepted:
         _prune_mempool("блок из сети")
+        _sync_stage("блок из сети")
     return {"ok": not errors, "accepted": accepted, "errors": errors}
 
 
@@ -2040,27 +2181,48 @@ def _main_impl():
     print("\n" + "=" * 60)
     print("ЭНЕРГИЯ ИЗОЛИРОВАННОГО АТОМА (для энергии связи)")
     print("=" * 60)
-    CONFIG["e_isolated_atom"] = cp2k_runner.calculate_isolated_atom_energy(CONFIG)
-    if CONFIG["e_isolated_atom"] is None:
+    CONFIG["e_isolated_atom"] = None
+    per_element = {}
+    for sym, cnt in CONFIG["composition"].items():
+        piece = dict(CONFIG)
+        piece["element"] = sym
+        piece["potential"] = cp2k_runner.get_potential(sym)
+        piece["isolated_atom_energy_file"] = CONFIG["isolated_atom_energy_files"][sym]
+        per_element[sym] = cp2k_runner.calculate_isolated_atom_energy(piece)
+    if all(v is not None for v in per_element.values()):
+        total = sum(per_element[s] * c for s, c in CONFIG["composition"].items())
+        CONFIG["e_isolated_atom"] = total / CONFIG["formula_size"]
+        print(f"[Master] E_iso по элементам: {per_element}")
+        print(f"[Master] Средняя E_iso на атом: {CONFIG['e_isolated_atom']:.6f} eV")
+    else:
         print("[Master] E_iso не посчитана — E_binding в кадрах будет отсутствовать")
 
     # 1) Постановка задач: мастер НЕ генерирует структуры, только число атомов
     print("\n" + "=" * 60)
     print("ПОСТАНОВКА ЗАДАЧ (без генерации структур мастером)")
     print("=" * 60)
-    tasks = build_task_queue(CONFIG)
 
-    done_ids = _load_id_set(CONFIG["verified_ids_file"])
     failed_ids = _load_id_set(CONFIG["failed_ids_file"])
-    tasks = [t for t in tasks if t["struct_id"] not in done_ids and t["struct_id"] not in failed_ids]
-    print(f"Заданий в очереди: {len(tasks)} (уже принято: {len(done_ids)}, "
-          f"ранее забраковано: {len(failed_ids)})")
-
     with task_queue_lock:
-        pending_tasks = tasks
         failed_tasks.update(failed_ids)
 
-    print(f"\n[Server] Очередь заполнена. Всего задач: {len(pending_tasks)}")
+    if schedule_enabled(CONFIG):
+        _sync_stage("старт")
+        stage = CONFIG["_stage_info"]
+        print(f"[Master] Расписание: этап {stage['stage']}, кластер n={stage['n_atoms']}, "
+              f"{stage['blocks']} блоков на этап (уже сделано {stage['done']})")
+        with task_queue_lock:
+            print(f"[Server] Очередь заполнена. Всего задач: {len(pending_tasks)}")
+    else:
+        tasks = build_task_queue(CONFIG)
+        done_ids = _load_id_set(CONFIG["verified_ids_file"])
+        tasks = [t for t in tasks
+                 if t["struct_id"] not in done_ids and t["struct_id"] not in failed_ids]
+        print(f"Заданий в очереди: {len(tasks)} (уже принято: {len(done_ids)}, "
+              f"ранее забраковано: {len(failed_ids)})")
+        with task_queue_lock:
+            pending_tasks = tasks
+        print(f"[Server] Очередь заполнена. Всего задач: {len(pending_tasks)}")
     print(f"[Server] Поднимаю FastAPI сервер на http://0.0.0.0:{port} ...")
 
     server_thread = threading.Thread(target=run_fastapi_server, args=(port,), daemon=True)

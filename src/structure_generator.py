@@ -38,6 +38,39 @@ def atom_diameter(cfg: dict) -> float:
     return float(cfg.get("atom_diameter") or 2.0)
 
 
+def composition(cfg: dict) -> dict:
+    """Формульная единица системы, например {'Al': 2, 'O': 3}."""
+    comp = cfg.get("composition") or {}
+    if comp:
+        return {str(k): int(v) for k, v in comp.items()}
+    return {str(cfg.get("element") or "X"): 1}
+
+
+def formula_size(cfg: dict) -> int:
+    """Сколько атомов в одной формульной единице."""
+    return sum(composition(cfg).values())
+
+
+def assign_species(n_atoms: int, cfg: dict, seed: int | None = None) -> list[str]:
+    """
+    Раскладывает формулу по `n_atoms` атомам и перемешивает.
+
+    Например, Al2O3 при n_atoms=10 — это 4 Al и 6 O в случайном порядке:
+    координаты генерируются без учёта сорта, поэтому любая перестановка
+    даёт новую валидную структуру того же состава.
+    """
+    comp = composition(cfg)
+    unit = sum(comp.values())
+    if n_atoms % unit != 0:
+        raise ValueError(f"n_atoms={n_atoms} не кратно формуле {comp} ({unit} атомов)")
+    mult = n_atoms // unit
+    species = []
+    for symbol, count in comp.items():
+        species.extend([symbol] * (count * mult))
+    random.Random(seed).shuffle(species)
+    return species
+
+
 def min_dist(cfg: dict) -> float:
     return atom_diameter(cfg) * MIN_DIST_FACTOR
 

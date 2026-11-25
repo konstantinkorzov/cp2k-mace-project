@@ -1,7 +1,30 @@
 {
-  "element": {
-    "value": "Cu",
-    "help": "Химический элемент кластеров."
+  "system": {
+    "value": {
+      "name": "Cu",
+      "composition": {
+        "Cu": 1
+      }
+    },
+    "help": "Что считаем: name — имя системы (каталог results/<name>, поле в header), composition — формульная единица. Примеры: {'name':'Cu','composition':{'Cu':1}}; {'name':'Al2O3','composition':{'Al':2,'O':3}}; {'name':'NaCl','composition':{'Na':1,'Cl':1}}. Элементы должны быть в PSEUDOPOTENTIALS (src/cp2k_runner.py)."
+  },
+  "schedule": {
+    "value": {
+      "start_atoms": 2,
+      "base_blocks": 10,
+      "exponent": 1.5,
+      "max_atoms": 30,
+      "dim": 3
+    },
+    "help": "Рост кластера по высоте цепочки: этап s → n = start_atoms + (s-1)*formula_size, блоков на этап = base_blocks * s^exponent. exponent=1 — линейно (как в ТЗ), 1.5 — рекомендовано (локальных минимумов больше). max_atoms — потолок роста."
+  },
+  "charge": {
+    "value": 0,
+    "help": "Заряд системы (0 — нейтральная)."
+  },
+  "multiplicity": {
+    "value": 0,
+    "help": "Мультиплетность (2S+1); 0 — не задавать, CP2K выберет по чётности электронов."
   },
   "port": {
     "value": 8000,
@@ -26,7 +49,7 @@
       "4": 10,
       "5": 10
     },
-    "help": "Сколько структур генерировать для каждого n_atoms (ключи — строки)."
+    "help": "Только для ручного режима (если удалить schedule): сколько структур генерировать для каждого n_atoms."
   },
   "dimensions_per_n": {
     "value": {
@@ -45,7 +68,7 @@
         3
       ]
     },
-    "help": "Какие размерности генерировать для каждого n_atoms."
+    "help": "Только для ручного режима (если удалить schedule): какие размерности генерировать для каждого n_atoms."
   },
   "verbose_cp2k": {
     "value": true,

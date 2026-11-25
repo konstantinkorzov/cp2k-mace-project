@@ -203,20 +203,24 @@ def step_project_modules():
         worker_mod = None
         step("импорт worker", "WARN", f"{e} (нужен пакет requests)")
 
-    el = cfg.get("element")
+    system = cfg.get("system") or {}
+    comp = system.get("composition") or cfg.get("composition") or {}
+    el = system.get("name") or cfg.get("element") or next(iter(comp), "Cu")
+    probe = next(iter(comp), el)
     try:
-        pot = cp2k_runner.get_potential(el)
+        pot = cp2k_runner.get_potential(probe)
         q = cp2k_runner.valence_electrons(pot)
-        step("элемент/псевдопотенциал из config.json", "PASS", f"{el} -> {pot} (q={q})")
+        note = f"{el}: {comp or {probe: 1}} -> {probe} {pot} (q={q})"
+        step("система/псевдопотенциал из config.json", "PASS", note)
     except Exception as e:
         pot, q = None, None
-        step("элемент/псевдопотенциал из config.json", "FAIL", f"{e}")
+        step("система/псевдопотенциал из config.json", "FAIL", f"{e}")
 
-    for key in ("structures_per_n", "dimensions_per_n", "atom_diameter"):
+    for key in ("schedule", "atom_diameter", "structures_per_n", "dimensions_per_n"):
         if key in cfg and cfg[key] is not None:
             print(f"  {key} = {cfg[key]!r}")
         else:
-            step(f"параметр config.json: {key}", "WARN", "отсутствует")
+            print(f"  {key} = <нет>")
 
     print(f"  генерация: BOX_MARGIN {structure_generator.BOX_MARGIN}, "
           f"SEED {structure_generator.RANDOM_SEED}, "
@@ -508,9 +512,17 @@ def main():
             if args.elements:
                 elements = [e.strip() for e in args.elements.split(",") if e.strip()]
             else:
-                # По умолчанию — только элемент из config.json: Fe2 считается долго
+                # По умолчанию — только система из config.json: Fe2 считается долго
                 # (почти вырожденные d-состояния), его включает флаг --elements Cu,Fe.
-                elements = [cfg.get("element", "Cu")]
+                system = cfg.get("system") or {}
+                comp = system.get("composition") or {}
+                name = system.get("name") or cfg.get("element", "Cu")
+                if len(comp) > 1:
+                    step("реальные мини-расчёты", "SKIP",
+                         f"система {name} из нескольких элементов — только оффлайн-проверки")
+                    elements = []
+                else:
+                    elements = [name]
             for el in elements:
                 try:
                     step_element_chain(cp2k_runner, structure_generator, cfg, el, cp2k_cmd,

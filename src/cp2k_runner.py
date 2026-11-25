@@ -35,10 +35,23 @@ import numpy as np
 
 
 # Словарь псевдопотенциалов для элементов (qN = число валентных электронов)
+# Словарь псевдопотенциалов (GTH-PBE-qN = N валентных электронов).
+# Добавить элемент — одна строка; база DZVP-MOLOPT-SR-GTH есть для H–Kr и части тяжёлых.
 PSEUDOPOTENTIALS = {
-    "Cu": "GTH-PBE-q11",
-    "Fe": "GTH-PBE-q16",
-    "Ar": "GTH-PBE-q8",
+    "H": "GTH-PBE-q1", "He": "GTH-PBE-q2",
+    "Li": "GTH-PBE-q3", "Be": "GTH-PBE-q4", "B": "GTH-PBE-q3",
+    "C": "GTH-PBE-q4", "N": "GTH-PBE-q5", "O": "GTH-PBE-q6",
+    "F": "GTH-PBE-q7", "Ne": "GTH-PBE-q8",
+    "Na": "GTH-PBE-q9", "Mg": "GTH-PBE-q10", "Al": "GTH-PBE-q3",
+    "Si": "GTH-PBE-q4", "P": "GTH-PBE-q5", "S": "GTH-PBE-q6",
+    "Cl": "GTH-PBE-q7", "Ar": "GTH-PBE-q8",
+    "K": "GTH-PBE-q9", "Ca": "GTH-PBE-q10",
+    "Ti": "GTH-PBE-q12", "V": "GTH-PBE-q13", "Cr": "GTH-PBE-q14",
+    "Mn": "GTH-PBE-q15", "Fe": "GTH-PBE-q16", "Co": "GTH-PBE-q17",
+    "Ni": "GTH-PBE-q18", "Cu": "GTH-PBE-q11", "Zn": "GTH-PBE-q12",
+    "Br": "GTH-PBE-q7", "Kr": "GTH-PBE-q8",
+    "Ag": "GTH-PBE-q11", "Cd": "GTH-PBE-q12", "I": "GTH-PBE-q7",
+    "Au": "GTH-PBE-q11",
 }
 
 
@@ -55,6 +68,7 @@ TEMPLATE = """&GLOBAL
     BASIS_SET_FILE_NAME BASIS_MOLOPT
     POTENTIAL_FILE_NAME GTH_POTENTIALS
 {wfn_restart_line}    LSD
+{charge_line}{multiplicity_line}
     &MGRID
       CUTOFF {cutoff}
       REL_CUTOFF {rel_cutoff}
@@ -92,12 +106,8 @@ TEMPLATE = """&GLOBAL
     &COORD
 {coords_block}
     &END COORD
-    &KIND {element}
-      BASIS_SET DZVP-MOLOPT-SR-GTH
-      POTENTIAL {potential}
-    &END KIND
+{kinds_block}
   &END SUBSYS
-
 {force_print_block}&END FORCE_EVAL
 """
 
@@ -249,6 +259,30 @@ def resolve_cell_size(coords, cfg: dict) -> float:
     return float(np.ceil(size * 2.0) / 2.0)   # шаг 0.5 Å
 
 
+def _species_list(n_atoms, cfg) -> list[str]:
+    """Список символов по атомам: cfg['species'] или один элемент на всех."""
+    species = cfg.get("species")
+    if species and len(species) == n_atoms:
+        return list(species)
+    return [cfg["element"]] * n_atoms
+
+
+def build_kinds_block(species: list[str]) -> str:
+    """По одному &KIND на каждый химический элемент в системе."""
+    seen, blocks = [], []
+    for sym in species:
+        if sym in seen:
+            continue
+        seen.append(sym)
+        blocks.append(
+            f"    &KIND {sym}\n"
+            f"      BASIS_SET DZVP-MOLOPT-SR-GTH\n"
+            f"      POTENTIAL {get_potential(sym)}\n"
+            f"    &END KIND"
+        )
+    return "\n".join(blocks)
+
+
 def _coords_block(coords, cfg, cell_size: float | None = None) -> str:
     """Текстовый блок &COORD с центрированием координат в ячейке."""
     element = cfg["element"]
@@ -257,8 +291,10 @@ def _coords_block(coords, cfg, cell_size: float | None = None) -> str:
     center_of_mass = coords_arr.mean(axis=0)
     cell_center = np.array([cell_size / 2.0] * 3)
     coords_arr = coords_arr - center_of_mass + cell_center
+    species = _species_list(len(coords_arr), cfg)
     return "\n".join(
-        f"      {element}  {x:.8f}  {y:.8f}  {z:.8f}" for x, y, z in coords_arr
+        f"      {symbol}  {x:.8f}  {y:.8f}  {z:.8f}"
+        for symbol, (x, y, z) in zip(species, coords_arr)
     )
 
 
@@ -281,6 +317,13 @@ def render_cp2k_input(
     """
     element = cfg["element"]
     potential = cfg.get("potential") or get_potential(element)
+    species = _species_list(len(coords), cfg)
+    kinds_block = build_kinds_block(species)
+
+    charge = int(cfg.get("charge") or 0)
+    multiplicity = int(cfg.get("multiplicity") or 0)
+    charge_line = f"    CHARGE {charge}\n" if charge else ""
+    multiplicity_line = (f"    MULTIPLICITY {multiplicity}\n" if multiplicity > 0 else "")
 
     if print_blocks is None:
         print_blocks = build_print_blocks(cfg)
@@ -323,6 +366,9 @@ def render_cp2k_input(
         force_print_block=force_print_block(project),
         cell_size=cell_size,
         coords_block=_coords_block(coords, cfg, cell_size),
+        kinds_block=kinds_block,
+        charge_line=charge_line,
+        multiplicity_line=multiplicity_line,
         element=element,
         potential=potential,
     )
@@ -1377,9 +1423,10 @@ def build_xyz_record(coords, energy_ev, forces_ev_ang, n_atoms, dim, struct_id,
         f'pbc="F F F"'
     )
     lines = [str(n_atoms), comment]
-    for (x, y, z), (fx, fy, fz) in zip(coords, forces_ev_ang):
+    species = cfg.get("species") or [cfg["element"]] * n_atoms
+    for (x, y, z), (fx, fy, fz), symbol in zip(coords, forces_ev_ang, species):
         lines.append(
-            f"{cfg['element']} {x:.8f} {y:.8f} {z:.8f} "
+            f"{symbol} {x:.8f} {y:.8f} {z:.8f} "
             f"{fx:.8f} {fy:.8f} {fz:.8f}"
         )
     return "\n".join(lines) + "\n"

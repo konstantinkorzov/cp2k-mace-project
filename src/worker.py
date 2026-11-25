@@ -161,6 +161,10 @@ def run_task(task: dict, cfg: dict, logger):
     for attempt in range(1, LOCAL_RETRIES + 1):
         try:
             coords = generate_structure(n_atoms, dim, cfg, struct_id, logger)
+            # Раскладываем формулу по атомам (Al2O3 → 2 Al + 3 O на каждую единицу)
+            species = structure_generator.assign_species(
+                n_atoms, cfg, seed=random.SystemRandom().randrange(10 ** 9))
+            cfg["species"] = species
 
             t0 = time.time()
             res = cp2k_runner.run_dft_for_single_structure(
@@ -188,11 +192,12 @@ def run_task(task: dict, cfg: dict, logger):
 
             data = {
                 "geometry": coords.tolist(),
+                "species": species,
                 "n_atoms": n_atoms,
                 "dim": dim,
                 "cell_size": cp2k_runner.resolve_cell_size(coords, cfg),
                 "element": cfg["element"],
-                "potential": cfg.get("potential") or cp2k_runner.PSEUDOPOTENTIALS.get(cfg["element"]),
+                "potential": cfg.get("potential"),
                 "scf_converged": True,
                 "scf_steps": res.get("scf_steps"),
                 "elapsed": res.get("elapsed", elapsed),

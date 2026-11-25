@@ -317,7 +317,7 @@ def restart_tests():
         original_verify = cp2k_runner.verify_state_from_wfn
         cp2k_runner.verify_state_from_wfn = fake_verify_state
         cfg = main.CONFIG
-        main._NAO_PER_ATOM.clear()
+        main._NAO_TOTAL.clear()
         task = {"struct_id": "n2_d3_0000", "task_index": 0, "n_atoms": 2, "dim": 3, "attempts": 0}
         A = [[0.0, 0.0, 0.0], [2.4, 0.0, 0.0]]
         payload = {"geometry": A, "energy_ev": -2614.38,
@@ -325,8 +325,8 @@ def restart_tests():
         v = main.verify_state_payload(cfg, task, payload)
         check("честное состояние принято", v["valid"], v.get("reason", ""))
         check("энергия/силы от мастера", v.get("energy_ev") == -2614.38 and v.get("forces_ev_ang"))
-        check("обучен nao на атом (25 для Cu)", main._NAO_PER_ATOM.get("Cu") == 25,
-              str(main._NAO_PER_ATOM))
+        check("обучен nao системы (50 для Cu₂)", main._NAO_TOTAL.get(("Cu", 2)) == 50,
+              str(main._NAO_TOTAL))
 
         # 5) состояние «другого элемента» ловится ещё до CP2K (по обученному nao)
         payload_other = {"geometry": A, "wfn_b64": base64.b64encode(open(p_other, "rb").read()).decode("ascii")}
