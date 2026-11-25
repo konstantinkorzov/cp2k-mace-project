@@ -99,7 +99,7 @@ sequenceDiagram
     M->>W: геометрия задания (seed/шаблон)
     W->>W: SCF до EPS_SCF (сотни секунд)
     W->>M: POST /submit-result {geometry, wfn_b64}
-    M->>M: сверить геометрию с выданной (без DFT)
+    M->>M: сверить геометрию с выданной (если шаблон задан)
     M->>M: проверить формат wfn (nao, nspin, столбцы)
     M->>C: SCF_GUESS RESTART, MAX_SCF=3
     C-->>M: сошлось за 1–3 шага?

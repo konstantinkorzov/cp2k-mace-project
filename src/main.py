@@ -731,9 +731,11 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
     if not ok:
         return fail(f"geometry rejected: {reason}")
 
-    # 0. Геометрия должна быть ровно той, что выдал мастер (дёшево, без CP2K).
-    #    Если сверка прошла — дальше считаются последние шаги DFT для НЕЁ.
-    if issued:
+    # 0. Геометрия сверяется с выданной ТОЛЬКО в шаблонном режиме: там близость
+    #    к шаблону — часть задания. Без шаблона задание обещает лишь «валидный
+    #    кластер из n атомов того же состава», поэтому любая такая структура
+    #    принимается (как раньше), а E/силы мастер считает для присланной.
+    if issued and issued.get("check_geometry"):
         same, why = _same_geometry(coords, payload.get("species"), issued)
         if not same:
             return fail(f"геометрия не та, что выдана в задании: {why}")
@@ -846,8 +848,11 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
             "valid": True,
             "reason": "",
             "elapsed": time.perf_counter() - t0,
-            # true — геометрия сверена с выданной мастером (не только состав/min_dist)
-            "geometry_verified": bool(issued),
+            # true — геометрия сверена с выданной (только шаблонный режим);
+            # geometry_policy: template | random | worker (ready-путь)
+            "geometry_verified": bool(issued and issued.get("check_geometry")),
+            "geometry_policy": ("worker" if not issued else
+                                ("template" if issued.get("check_geometry") else "random")),
             "energy_ev": float(res["energy_ev"]),
             "energy_hartree": float(res.get("energy_hartree", float("nan"))),
             "forces_ev_ang": res.get("forces_ev_ang"),
@@ -995,9 +1000,9 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         "magnetic_moment": verdict.get("mag"),
         "e_isolated_atom_ev": verdict.get("e_isolated_atom"),
         "e_binding_per_atom_ev": verdict.get("e_binding_per_atom"),
-        # была ли геометрия сверена с выданной мастером (false — ready-путь,
-        # результат принесён другому мастеру, эталона у него нет)
+        # была ли геометрия сверена с выданной мастером (только шаблонный режим)
         "geometry_verified": bool(verdict.get("geometry_verified")),
+        "geometry_policy": verdict.get("geometry_policy"),
         "geometry_seed": payload.get("seed"),
         # фактическое электронное состояние: у одного элемента мультиплетность
         # зависит от n и геометрии, поэтому она обязана быть в датасете
@@ -1128,8 +1133,9 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
             "worker_wfn_size": payload.get("wfn_size"),
             # seed геометрии: тот же seed + та же версия генератора = тот же кадр
             "seed": payload.get("seed"),
-            # true — присланная геометрия совпала с выданной мастером
+            # true — присланная геометрия совпала с выданной (шаблонный режим)
             "geometry_verified": bool(verdict.get("geometry_verified")),
+            "geometry_policy": verdict.get("geometry_policy"),
             "verified_at": time.time(),
         },
     }
@@ -1520,6 +1526,9 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             "geometry": issued["coords"],
             "species": issued["species"],
             "seed": issued["seed"],
+            # сверка геометрии включена только в шаблонном режиме: без шаблона
+            # задание обещает лишь «валидный кластер из n атомов»
+            "check_geometry": bool(CONFIG.get("template")),
         }
 
         print(f"Воркер [{worker_id}] получил задание {struct_id}: "

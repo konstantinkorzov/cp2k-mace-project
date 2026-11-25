@@ -396,6 +396,11 @@ def restart_tests():
         main.pending_tasks.clear(); main.active_tasks.clear()
         main.completed_tasks.clear(); main.failed_tasks.clear(); main.registered_workers.clear()
         wid = main._register_worker("test", None, None)["worker_id"]
+        # шаблон включаем, чтобы работала сверка геометрии с выданной
+        tpl_path = os.path.join(tmp, "dimer.xyz")
+        with open(tpl_path, "w", encoding="utf-8") as f:
+            f.write("2\nseed\nCu 0 0 0\nCu 2.5 0 0\n")
+        cfg["template"] = structure_generator.load_template_xyz(tpl_path)
         t = {**task, "struct_id": "n2_d3_0007", "attempts": 0}
         main.pending_tasks.append(t)
         got = main.get_task(wid)
@@ -425,6 +430,22 @@ def restart_tests():
         main.submit_result(main.TaskResult(worker_id=wid, struct_id="n2_d3_0008",
                                            success=True, data=good))
         check("результат для неизвестной задачи не принимается", True)
+
+        # без шаблона сверка не выполняется: подмена геометрии проходит,
+        # числа считаются мастером для ПРИСЛАННОЙ геометрии (как раньше)
+        cfg["template"] = None
+        main.pending_tasks.clear(); main.active_tasks.clear()
+        main.pending_tasks.append({**task, "struct_id": "n2_d3_0010", "attempts": 0})
+        issued2 = main.get_task(wid)["task"]
+        check("без шаблона задание тоже содержит геометрию",
+              len(issued2.get("geometry") or []) == 2)
+        free = {"geometry": [[0.0, 0.0, 0.0], [3.4, 0.0, 0.0]],
+                "species": issued2["species"],
+                "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
+        free_resp = main.submit_result(main.TaskResult(
+            worker_id=wid, struct_id=issued2["struct_id"], success=True, data=free))
+        check("без шаблона геометрия не сверяется (как раньше)",
+              free_resp.get("status") == "accepted", str(free_resp))
 
         shutil.rmtree(main.CONFIG["frames_dir"], ignore_errors=True)
         for f in (agg, main.CONFIG["verified_ids_file"], main.CONFIG["failed_ids_file"]):
