@@ -68,14 +68,22 @@ from config_loader import Config
 
 
 # ---------- КОНСТАНТЫ ----------
-TASK_TIMEOUT = 3600        # секунды ожидания ответа от воркера (по умолчанию)
+TASK_TIMEOUT = 3600        # резервный предел удержания задачи, секунды
+
+# Живость воркера. Воркер шлёт heartbeat раз в 30 с (src/worker.py), в том числе
+# пока считает CP2K. Если признаков жизни нет дольше WORKER_LEASE_SEC, его
+# задача возвращается в очередь сразу — ждать task_timeout_sec (часы/сутки) не надо.
+WORKER_LEASE_SEC = 180
+# Через сколько забываем мёртвого воркера целиком (освобождает worker_id и pubkey)
+WORKER_FORGET_SEC = 1800
 
 
 def _task_timeout() -> int:
-    """Таймаут задачи: config.json → task_timeout_sec.
+    """Жёсткий предел удержания задачи: config.json → task_timeout_sec.
 
-    Для больших систем (55+ атомов) один расчёт идёт часы-дни, поэтому
-    значение в config.json переопределяет константу.
+    Это резервный предохранитель на случай, если сам мастер не заметил пропажу
+    воркера (например, завис поток watchdog). Обычный путь — WORKER_LEASE_SEC:
+    задача возвращается через 3 минуты молчания воркера.
     """
     try:
         return int(CONFIG.get("task_timeout_sec") or TASK_TIMEOUT)
@@ -215,6 +223,17 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     # подтверждения чтения restart — константы в cp2k_runner.py (RESTART_VERIFY_SCF).
     cfg.setdefault("restart_max_mb", 50)                  # лимит размера принятого wfn
 
+    # Необязательный шаблон геометрии (template_xyz): путь к XYZ с образцовой
+    # структурой. Файл читает мастер при старте (_load_template) и передаёт
+    # координаты воркеру в задании — воркер деформирует шаблон, а не генерирует
+    # случайный клубок. Сам по себе шаблон не меняет правила приёмки.
+    tpl = str(cfg.get("template_xyz") or "").strip()
+    cfg["template"] = None
+    cfg["template_path"] = None
+    if tpl:
+        cfg["template_path"] = (tpl if os.path.isabs(tpl)
+                                else os.path.join(PROJECT_ROOT, tpl))
+
     # Мастеру обязательно нужно описание системы
     _require(cfg, ["system"])
 
@@ -284,6 +303,59 @@ def load_config(path: str, results_root: str | None = None) -> Config:
 
 
 CONFIG = load_config(CONFIG_PATH)
+
+
+def _load_template(cfg) -> None:
+    """Читает template_xyz и проверяет совместимость с system.
+
+    Шаблон — это сид геометрии, а не часть консенсуса: правила приёмки
+    (состав, min_dist, сходимость SCF) остаются прежними. Поэтому сюда не
+    встраивается никакая магия — только проверки, что из шаблона вообще
+    можно получить допустимую структуру.
+    """
+    cfg["template"] = None
+    path = cfg.get("template_path")
+    if not path:
+        return
+
+    tpl = structure_generator.load_template_xyz(path)
+    frames = tpl["frames"]
+    first = frames[0]
+    counts: dict[str, int] = {}
+    for sym in first["symbols"]:
+        counts[sym] = counts.get(sym, 0) + 1
+
+    comp = cfg["composition"]
+    unknown = sorted(set(counts) - set(comp))
+    if unknown:
+        raise SystemExit(
+            f"[Master] ✗ template_xyz: элементы {unknown} отсутствуют в system.composition "
+            f"{comp}. Шаблон должен быть из той же системы.")
+
+    unit = sum(comp.values())
+    total = sum(counts.values())
+    expected = {sym: cnt / unit for sym, cnt in comp.items()}
+    actual = {sym: cnt / total for sym, cnt in counts.items()}
+    ratio_ok = all(abs(actual.get(sym, 0.0) - exp) <= 0.02 for sym, exp in expected.items())
+
+    d_min = structure_generator.min_dist(cfg)
+    d_tpl = structure_generator.template_min_distance(tpl)
+    if d_tpl < d_min * MIN_DIST_TOLERANCE:
+        raise SystemExit(
+            f"[Master] ✗ template_xyz: минимальное расстояние в шаблоне {d_tpl:.3f} Å "
+            f"меньше допустимого {d_min * MIN_DIST_TOLERANCE:.3f} Å "
+            f"(min_dist = {d_min:.3f} = system.atom_diameter × {structure_generator.MIN_DIST_FACTOR}). "
+            f"Уменьшите atom_diameter или возьмите другой шаблон.")
+
+    sizes = sorted({len(f["coords"]) for f in frames})
+    cfg["template"] = tpl
+    print(f"[Master] 🧩 шаблон геометрии: {tpl['source']} — кадров {len(frames)}, "
+          f"атомов {sizes}, min d = {d_tpl:.3f} Å; состав {counts}")
+    if not ratio_ok:
+        print(f"[Master] ⚠ состав шаблона {counts} не пропорционален system.composition "
+              f"{comp} — сорт атомов будет назначен по формуле, шаблон задаёт только геометрию")
+    print("[Master] 🧩 воркер будет не генерировать случайный кластер, а деформировать шаблон "
+          "(шум + поворот), размер подгоняется под n этапа")
 
 
 # ---------- CLI / Порт ----------
@@ -410,6 +482,7 @@ def task_cfg_payload(cfg) -> dict:
         "element": cfg["element"],
         "potential": cfg["potential"],
         "cp2k_cmd": cfg["cp2k_cmd"],
+        "cp2k_timeout_sec": int(cfg.get("cp2k_timeout_sec") or 3600),
         "verbose_cp2k": cfg["verbose_cp2k"],
         "hartree_to_ev": cfg["hartree_to_ev"],
         "hartree_bohr_to_ev_ang": cfg["hartree_bohr_to_ev_ang"],
@@ -423,6 +496,9 @@ def task_cfg_payload(cfg) -> dict:
         "formula_size": cfg.get("formula_size") or 1,
         "charge": cfg.get("charge") or 0,
         "multiplicity": cfg.get("multiplicity") or 0,
+        # шаблон геометрии (если задан template_xyz): воркер деформирует его,
+        # а не генерирует случайный клубок
+        "template": cfg.get("template"),
         # энергия изолированного атома считается ТОЛЬКО мастером (при старте)
         # и передаётся воркеру для лога E_binding/atom
         "e_isolated_atom": cfg.get("e_isolated_atom"),
@@ -511,6 +587,22 @@ def _rebuild_aggregate_xyz() -> int:
                 out.write(src.read())
     os.replace(tmp, aggregate)
     return len(files)
+
+
+def _effective_multiplicity(n_atoms: int, cfg) -> int:
+    """Мультиплетность, которая реально ушла в CP2K.
+
+    Если в конфиге 0 — CP2K берёт её по чётности числа электронов (1 или 2).
+    В блок пишется фактическое значение, чтобы по датасету было видно, какое
+    спиновое состояние посчитано: у одного и того же элемента оно зависит от n.
+    """
+    mult = int(cfg.get("multiplicity") or 0)
+    if mult > 0:
+        return mult
+    unit = max(1, int(cfg.get("formula_size") or 1))
+    electrons = (int(cfg.get("n_valence") or 0) * int(n_atoms) // unit
+                 - int(cfg.get("charge") or 0))
+    return 1 if electrons % 2 == 0 else 2
 
 
 def _stale_reason(n_atoms: int) -> str | None:
@@ -807,6 +899,10 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         "magnetic_moment": verdict.get("mag"),
         "e_isolated_atom_ev": verdict.get("e_isolated_atom"),
         "e_binding_per_atom_ev": verdict.get("e_binding_per_atom"),
+        # фактическое электронное состояние: у одного элемента мультиплетность
+        # зависит от n и геометрии, поэтому она обязана быть в датасете
+        "charge": int(CONFIG.get("charge") or 0),
+        "multiplicity": _effective_multiplicity(n_atoms, CONFIG),
         "scf": (verdict.get("state") or {}).get("scf"),
     }
     # Физические наблюдаемые (мастер посчитал в том же прогоне, что и E):
@@ -909,6 +1005,8 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
         "magnetic_moment": mag,
         "e_isolated_atom_ev": e_iso,
         "e_binding_per_atom_ev": e_bind,
+        "charge": int(CONFIG.get("charge") or 0),
+        "multiplicity": _effective_multiplicity(n_atoms, CONFIG),
         "physical": props,
         "checks": {
             "verified_by": "master_one_step_from_restart",
@@ -1073,15 +1171,34 @@ def queue_status():
             "paused": PAUSED,
             "stage": CONFIG.get("_stage_info"),
             "workers": sorted(registered_workers.keys()),
+            # Задача возвращается в очередь, если воркер молчит дольше этого
+            "worker_lease_sec": WORKER_LEASE_SEC,
             "active_details": {
                 sid: {
                     "worker_id": info["worker_id"],
                     "age_sec": round(time.time() - info["time_sent"], 1),
+                    "worker_silent_sec": round(time.time() - _worker_last_seen(info), 1),
                     "attempts": info["task"].get("attempts", 0),
                 }
                 for sid, info in active_tasks.items()
             },
         }
+
+
+def _worker_last_seen(info: dict) -> float:
+    """Когда воркер, держащий задачу, последний раз подавал признаки жизни."""
+    rec = registered_workers.get(info["worker_id"]) or {}
+    return max(float(rec.get("last_seen") or 0.0), float(info["time_sent"]))
+
+
+def _requeue_worker_tasks(worker_id: str, reason: str) -> list[str]:
+    """Снимает все задачи воркера и возвращает их в очередь (под task_queue_lock)."""
+    moved = [sid for sid, info in active_tasks.items() if info["worker_id"] == worker_id]
+    for sid in moved:
+        info = active_tasks.pop(sid)
+        print(f"[Master] ↺ {sid} снята с {worker_id}: {reason}")
+        _requeue_or_fail(info["task"], reason)
+    return moved
 
 
 def _requeue_or_fail(task_data: dict, reason: str, *, requeue_always: bool = False):
@@ -1124,7 +1241,10 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
             worker_id = worker_by_pubkey[pubkey_hash]
             registered_workers[worker_id].update({"last_seen": now, "name": name or registered_workers[worker_id].get("name")})
             print(f"[Master] Воркер {worker_id} переподключился (pubkey {pubkey_hash[:12]}…)")
-            return {"status": "ok", "worker_id": worker_id, "known": True}
+            # Воркер перезапустился: задачу, которую он держал, он уже не посчитает
+            moved = _requeue_worker_tasks(worker_id, "воркер перезапустился")
+            return {"status": "ok", "worker_id": worker_id, "known": True,
+                    "requeued": moved}
 
         worker_id = f"worker_{next_worker_id}"
         next_worker_id += 1
@@ -1149,28 +1269,59 @@ def register_worker(reg: WorkerRegistration):
 
 
 def _expire_tasks(now: float | None = None) -> list[str]:
-    """Возвращает в очередь задачи, которые воркеры не сдали за _task_timeout()."""
-    expired = []
+    """
+    Возвращает в очередь задачи, за которые больше некому отвечать:
+
+      * воркер молчит дольше WORKER_LEASE_SEC (нет heartbeat) — обычный путь;
+        задача возвращается через ~3 минуты, а не через сутки;
+      * задача висит дольше _task_timeout() — резервный предохранитель.
+
+    Заодно забывает мёртвых воркеров, чтобы не копились worker_1…worker_N.
+    """
+    expired: list[str] = []
+    now = now if now is not None else time.time()
     limit = _task_timeout()
     with task_queue_lock:
-        now = now if now is not None else time.time()
-        for sid in [s for s, info in active_tasks.items()
-                    if now - info["time_sent"] > limit]:
-            info = active_tasks.pop(sid)
-            print(f"[Master Watchdog] Задача {sid} (воркер {info['worker_id']}) просрочена "
-                  f"(таймаут {limit} с), возвращаем в очередь.")
-            _requeue_or_fail(info["task"], "timeout", requeue_always=True)
+        for sid, info in list(active_tasks.items()):
+            silent = now - _worker_last_seen(info)
+            hard = now - info["time_sent"] > limit
+            if not hard and silent <= WORKER_LEASE_SEC:
+                continue
+            active_tasks.pop(sid, None)
+            reason = (f"таймаут {limit} с" if hard
+                      else f"воркер {info['worker_id']} молчит {int(silent)} с")
+            print(f"[Master Watchdog] Задача {sid} (воркер {info['worker_id']}): "
+                  f"{reason} — возвращаю в очередь")
+            _requeue_or_fail(info["task"], reason, requeue_always=hard)
             expired.append(sid)
     return expired
 
 
-def _watchdog_loop(interval: int = 60):
-    """Фоновый watchdog: даже если воркер больше не опрашивает мастера,
-    просроченные задачи возвращаются в очередь."""
+def _forget_dead_workers(now: float | None = None) -> list[str]:
+    """Забывает воркеров, молчащих дольше WORKER_FORGET_SEC (список освобождается)."""
+    now = now if now is not None else time.time()
+    forgotten: list[str] = []
+    with task_queue_lock:
+        for wid, rec in list(registered_workers.items()):
+            last_seen = float(rec.get("last_seen") or 0.0)
+            if now - last_seen <= WORKER_FORGET_SEC:
+                continue
+            registered_workers.pop(wid, None)
+            for pk, mapped in list(worker_by_pubkey.items()):
+                if mapped == wid:
+                    worker_by_pubkey.pop(pk, None)
+            forgotten.append(wid)
+            print(f"[Master] Воркер {wid} забыт: нет связи {int(now - last_seen)} с")
+    return forgotten
+
+
+def _watchdog_loop(interval: int = 30):
+    """Фоновый watchdog: снимает задачи с пропавших воркеров каждые 30 с."""
     while True:
         time.sleep(interval)
         try:
             _expire_tasks()
+            _forget_dead_workers()
         except Exception as e:  # noqa: BLE001
             print(f"[Master Watchdog] ошибка: {e}")
 
@@ -1199,18 +1350,10 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             return {"status": "busy", "retry_after_sec": 5,
                     "message": "Мастер собирает цепочку — задачи не выдаются"}
 
-        # Проверка таймаута зависших задач (Watchdog)
+        # Проверка зависших задач (Watchdog): пропавшие воркеры и жёсткий таймаут
         now = time.time()
+        _expire_tasks(now)
         limit = _task_timeout()
-        expired_ids = [
-            sid for sid, info in active_tasks.items()
-            if now - info["time_sent"] > limit
-        ]
-        for sid in expired_ids:
-            info = active_tasks.pop(sid)
-            print(f"[Master Watchdog] Задача {sid} (воркер {info['worker_id']}) просрочена "
-                  f"(таймаут {limit} с), возвращаем в очередь.")
-            _requeue_or_fail(info["task"], "timeout", requeue_always=True)
 
         # Одна задача на воркера: пока не сдал/не истёк таймаут — новую не даём
         for sid, info in active_tasks.items():
@@ -1259,6 +1402,26 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
               f"элемент {CONFIG['element']} ({CONFIG['potential']}) "
               f"| В очереди: {len(pending_tasks)} | У воркеров: {len(active_tasks)}")
         return {"status": "ok", "task": task_payload}
+
+@app.get("/heartbeat")
+def heartbeat(worker_id: str):
+    """Признак жизни воркера (раз в 30 с, в том числе во время расчёта CP2K).
+
+    Без heartbeat мастер считает воркера пропавшим через WORKER_LEASE_SEC и
+    возвращает его задачу в очередь.
+    """
+    with task_queue_lock:
+        rec = registered_workers.get(worker_id)
+        if not rec:
+            return {"status": "unknown", "message": "воркер не зарегистрирован"}
+        rec["last_seen"] = time.time()
+        return {
+            "status": "ok",
+            "lease_sec": WORKER_LEASE_SEC,
+            "active": [sid for sid, info in active_tasks.items()
+                       if info["worker_id"] == worker_id],
+        }
+
 
 class TaskResult(BaseModel):
     worker_id: str
@@ -1906,6 +2069,8 @@ def admin_status(token: str | None = None):
                 "active_task": sid,
                 "age_sec": (round(time.time() - active_tasks[sid]["time_sent"], 1)
                             if sid else None),
+                "last_seen_sec": (round(time.time() - rec["last_seen"], 1)
+                                  if rec.get("last_seen") else None),
             })
         return {
             "paused": PAUSED,
@@ -2151,6 +2316,7 @@ def _main_impl():
 
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
     _load_mempool()
+    _load_template(CONFIG)
 
     # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос
     conn = wallet_store.open_db(CONFIG["wallet_store_db"])

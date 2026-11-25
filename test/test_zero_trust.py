@@ -23,6 +23,7 @@ ase, find_minimum, xyz_to_html). Матрица S_master эмулируется 
 import os
 import sys
 import json
+import time
 import types
 import base64
 import shutil
@@ -859,6 +860,71 @@ def busy_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def lease_tests():
+    print("\n--- 26. Lease: пропавший воркер не держит задачу ---")
+    tmp = tempfile.mkdtemp(prefix="lease_")
+    saved = {k: main.CONFIG.get(k)
+             for k in ("output_dir", "element", "failed_ids_file")}
+    try:
+        main.CONFIG.update({"output_dir": tmp, "element": "Cu",
+                            "failed_ids_file": os.path.join(tmp, "failed.txt")})
+        main.pending_tasks.clear()
+        main.active_tasks.clear()
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+        wid = main._register_worker("lease_t", "hash_lease", None)["worker_id"]
+
+        main.pending_tasks.append({"struct_id": "L1", "task_index": 0,
+                                   "n_atoms": 2, "dim": 3, "attempts": 0})
+        main.get_task(wid)
+        t0 = main.active_tasks["L1"]["time_sent"]
+
+        # воркер шлёт heartbeat → задача не снимается
+        main.registered_workers[wid]["last_seen"] = t0 + 100
+        main._expire_tasks(now=t0 + 100 + main.WORKER_LEASE_SEC - 1)
+        check("lease: живой воркер держит задачу", "L1" in main.active_tasks)
+
+        # воркер замолчал → задача вернулась в очередь через 3 минуты, а не через task_timeout
+        main._expire_tasks(now=t0 + 100 + main.WORKER_LEASE_SEC + 1)
+        check("lease: задача пропавшего воркера вернулась в очередь",
+              "L1" not in main.active_tasks
+              and any(t["struct_id"] == "L1" for t in main.pending_tasks))
+
+        # жёсткий таймаут срабатывает даже при свежем heartbeat
+        main.pending_tasks.clear()
+        main.pending_tasks.append({"struct_id": "L2", "task_index": 0,
+                                   "n_atoms": 2, "dim": 3, "attempts": 0})
+        main.get_task(wid)
+        t1 = main.active_tasks["L2"]["time_sent"]
+        late = t1 + main._task_timeout() + 1
+        main.registered_workers[wid]["last_seen"] = late
+        main._expire_tasks(now=late)
+        check("lease: жёсткий таймаут тоже возвращает задачу", "L2" not in main.active_tasks)
+
+        # перезапуск воркера (тот же pubkey) возвращает его текущую задачу
+        main.pending_tasks.clear()
+        main.pending_tasks.append({"struct_id": "L3", "task_index": 0,
+                                   "n_atoms": 2, "dim": 3, "attempts": 0})
+        main.get_task(wid)
+        main._register_worker("lease_t", "hash_lease", None)
+        check("lease: перерегистрация воркера возвращает его задачу",
+              "L3" not in main.active_tasks
+              and any(t["struct_id"] == "L3" for t in main.pending_tasks))
+
+        # забывание мёртвого воркера не трогает живого
+        main.registered_workers[wid]["last_seen"] = time.time() - main.WORKER_FORGET_SEC - 1
+        forgotten = main._forget_dead_workers()
+        check("lease: мёртвый воркер забыт", wid in forgotten
+              and wid not in main.registered_workers)
+    finally:
+        main.pending_tasks.clear()
+        main.active_tasks.clear()
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+        main.CONFIG.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def peer_tests():
     print("\n--- 23. Самая длинная цепочка (catch-up перед майнингом) ---")
     import types
@@ -997,6 +1063,7 @@ def _run_tests():
     worker_registry_tests()
     peer_tests()
     busy_tests()
+    lease_tests()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print("\n" + "=" * 60)

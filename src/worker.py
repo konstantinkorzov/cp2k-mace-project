@@ -23,6 +23,7 @@ import base64
 import random
 import logging
 import argparse
+import threading
 
 import requests
 
@@ -36,6 +37,7 @@ RETRY_DELAY = 5          # секунд между попытками подкл
 LOCAL_RETRIES = 3        # сколько раз воркер локально повторяет задачу (новая структура)
 PEER_REFRESH_SEC = 60    # как часто спрашивать у мастеров адреса других мастеров
 MAX_MASTERS = 32         # сколько адресов мастеров воркер готов держать
+HEARTBEAT_SEC = 30       # как часто сообщать мастеру «я жив» (в т.ч. во время расчёта)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -122,9 +124,26 @@ def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger
     выдавать одинаковые кластеры.
     """
     seed = random.SystemRandom().randrange(10 ** 9)
-    logger.info(f"Генерирую случайную структуру: n={n_atoms}, dim={dim}, seed={seed}, "
+    template = cfg.get("template")
+    logger.info(f"Генерирую структуру: n={n_atoms}, dim={dim}, seed={seed}, "
                 f"элемент {cfg['element']}, min_dist={structure_generator.min_dist(cfg):.2f}, "
-                f"max_dist={structure_generator.max_dist(cfg):.2f}")
+                f"max_dist={structure_generator.max_dist(cfg):.2f}"
+                + (f", шаблон {template.get('source')}" if template else ", случайная"))
+
+    if template:
+        # Мастер задал template_xyz: структура должна быть РЯДОМ с образцом,
+        # а не случайным клубком. Размер подгоняется под n этапа.
+        try:
+            coords = structure_generator.generate_from_template(
+                n_atoms=n_atoms, dim=dim, cfg=cfg, template=template,
+                seed=seed, max_attempts=5)
+            logger.info(f"Структура из шаблона готова: {coords.shape[0]} атомов "
+                        f"(задание {struct_id})")
+            return coords
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Шаблон не дал валидную структуру ({e}) — "
+                           f"генерирую случайную")
+
     coords = structure_generator.generate_random_cluster(
         n_atoms=n_atoms,
         dim=dim,
@@ -338,6 +357,34 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
     return None, None
 
 
+def start_heartbeat(base_url: str, holder: dict, logger,
+                    interval: int = HEARTBEAT_SEC) -> threading.Thread:
+    """Фоновый heartbeat: мастер должен знать, что воркер жив, пока считает CP2K.
+
+    Без этого мастер не отличает «воркер упал» от «воркер считает 40 минут»,
+    и задача висит за мёртвым воркером до task_timeout_sec (часы/сутки).
+    """
+    def loop():
+        while not holder.get("stop"):
+            wid = holder.get("worker_id")
+            if wid:
+                try:
+                    r = requests.get(base_url + "/heartbeat",
+                                     params={"worker_id": wid}, timeout=5)
+                    if r.status_code == 200 and r.json().get("status") == "unknown":
+                        # Перерегистрацию делает основной цикл (400 от /get-task) —
+                        # heartbeat не должен гонки ради сам создавать воркера
+                        logger.warning("Мастер не знает этот worker_id (перезапуск мастера?)")
+                except Exception:  # noqa: BLE001
+                    pass          # сеть пропала — молчим, задача не должна умереть из-за этого
+            holder["stop_event"].wait(interval)
+
+    holder.setdefault("stop_event", threading.Event())
+    th = threading.Thread(target=loop, daemon=True, name="heartbeat")
+    th.start()
+    return th
+
+
 def main():
     # Автоматически считываем переменные окружения, переданные через Docker (или fallback на дефолты)
     cfg_defaults = _config_defaults()
@@ -396,6 +443,14 @@ def main():
 
     task_url = f"{base_url}/get-task"
     submit_url = f"{base_url}/submit-result"
+
+    # heartbeat стартует ДО цикла задач: пока идёт CP2K (минуты-часы),
+    # мастер видит, что воркер жив, и не отбирает у него задачу
+    holder = {"worker_id": worker_id, "stop": False,
+              "stop_event": threading.Event()}
+    start_heartbeat(base_url, holder, logger)
+    logger.info(f"Heartbeat каждые {HEARTBEAT_SEC} с — мастер увидит пропажу воркера "
+                f"за несколько минут, а не за task_timeout_sec")
 
     logger.info("Начинаем опрос очереди задач...")
     last_peer_refresh = 0.0
@@ -480,6 +535,19 @@ def main():
                                 + (f" (причина: {sub_data.get('reason')})"
                                    if sub_data.get("reason") else ""))
 
+            except requests.exceptions.HTTPError as http_err:
+                # 400 от /get-task — мастер перезапустился и не знает наш worker_id
+                if http_err.response is not None and http_err.response.status_code == 400:
+                    logger.warning("Мастер не знает воркера — прохожу регистрацию заново")
+                    worker_id = register_with_retry(reg_url, worker_name, pubkey_hash,
+                                                    public_key,
+                                                    retry_delay=args.retry_delay)
+                    holder["worker_id"] = worker_id
+                    logger.info(f"Новый worker_id: {worker_id}")
+                else:
+                    logger.warning(f"HTTP-ошибка связи с сервером: {http_err}. "
+                                   f"Повтор через {args.retry_delay} сек...")
+                    time.sleep(args.retry_delay)
             except requests.exceptions.RequestException as re_err:
                 logger.warning(f"Сетевая ошибка связи с сервером: {re_err}. Повтор через {args.retry_delay} сек...")
                 time.sleep(args.retry_delay)
