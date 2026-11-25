@@ -578,6 +578,7 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
         with MEMPOOL_LOCK:
             for tid in drop:
                 MEMPOOL.pop(tid, None)
+        _save_mempool()
     return included, round(fee_total, 8)
 
 
@@ -830,6 +831,46 @@ BUSY = threading.Event()
 # Мемпул: txid -> транзакция, ожидающая включения в блок
 MEMPOOL: dict[str, dict] = {}
 MEMPOOL_LOCK = threading.Lock()
+
+
+def _mempool_path() -> str:
+    return os.path.join(CONFIG["output_dir"], "mempool.json")
+
+
+def _save_mempool():
+    """Персист мемпула: перезапуск мастера не должен терять неподтверждённые tx."""
+    try:
+        with MEMPOOL_LOCK:
+            data = list(MEMPOOL.values())
+        tmp = _mempool_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _mempool_path())
+    except Exception as e:  # noqa: BLE001
+        print(f"[Master] ! не удалось сохранить мемпул: {e}")
+
+
+def _load_mempool():
+    """Читает мемпул с диска; уже устаревшие tx отсеются при сборке блока."""
+    path = _mempool_path()
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"[Master] ! мемпул не прочитан ({e}) — начинаю с пустого")
+        return 0
+    loaded = 0
+    with MEMPOOL_LOCK:
+        for tx in data if isinstance(data, list) else []:
+            tid = tx.get("txid") or chain_mod.txid_of(tx)
+            tx["txid"] = tid
+            MEMPOOL[tid] = tx
+            loaded += 1
+    if loaded:
+        print(f"[Master] Мемпул восстановлен: {loaded} tx")
+    return loaded
 
 @app.get("/queue-status")
 def queue_status():
@@ -1154,6 +1195,8 @@ def submit_result(result: TaskResult):
 # =====================================================================
 PEER_TIMEOUT = 10
 PEER_TOL_ENERGY_EV = 0.02
+MAX_PEERS = 64                 # сколько адресов мастер готов держать в списке пиров
+PEER_GOSSIP_INTERVAL = 120     # как часто обмениваться адресами с пирами
 # Наблюдаемые в dft.json должны воспроизводиться пиром: пересчёт идёт от ТОЙ ЖЕ
 # плотности тем же CP2K, поэтому допуски на порядок жёстче, чем для энергии.
 PEER_TOL_GAP_EV = 0.01
@@ -1387,6 +1430,45 @@ def sync_from_peer(peer: str) -> dict:
     return {"ok": not errors, "accepted": accepted, "errors": errors}
 
 
+def _gossip_peers() -> list[str]:
+    """
+    Обмен адресами с пирами (как в p2p): спрашиваем у каждого известного мастера
+    его список пиров и добавляем неизвестные адреса к себе.
+    """
+    known = [p.rstrip("/") for p in (CONFIG.get("peers") or [])]
+    added = []
+    for peer in list(known):
+        if len(known) >= MAX_PEERS:
+            break
+        try:
+            r = requests.get(f"{peer}/admin/peers", timeout=PEER_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            remote = r.json().get("peers") or []
+        except Exception:  # noqa: BLE001
+            continue
+        for url in remote:
+            normalized = _normalize_peer(url)
+            if not normalized or normalized in known or len(known) >= MAX_PEERS:
+                continue
+            known.append(normalized)
+            added.append(normalized)
+    if added:
+        CONFIG["peers"] = known
+        _persist_peers(known)
+        print(f"[Peer] узнал новые адреса мастеров: {', '.join(added)}")
+    return added
+
+
+def _gossip_loop(interval: int = PEER_GOSSIP_INTERVAL):
+    while True:
+        time.sleep(interval)
+        try:
+            _gossip_peers()
+        except Exception as e:  # noqa: BLE001
+            print(f"[Peer] gossip ошибка: {e}")
+
+
 def sync_all_peers() -> list[dict]:
     out = []
     for peer in list(CONFIG.get("peers") or []):
@@ -1484,14 +1566,18 @@ def tx_submit(req: TxSubmit):
     tx["txid"] = tid
     with MEMPOOL_LOCK:
         MEMPOOL[tid] = tx
+    _save_mempool()
     print(f"[Master] 📥 tx {tid[:12]}… принята в мемпул")
     return {"status": "accepted", "txid": tid}
 
 
 @app.get("/tx/mempool")
 def tx_mempool():
+    """Транзакции в мемпуле. `txs` — полные тела, чтобы кошелёк мог их показать."""
     with MEMPOOL_LOCK:
-        return {"count": len(MEMPOOL), "txids": sorted(MEMPOOL)}
+        txs = [dict(tx) for tx in MEMPOOL.values()]
+    txs.sort(key=lambda t: t.get("txid") or "")
+    return {"count": len(txs), "txids": [t.get("txid") for t in txs], "txs": txs}
 
 
 @app.get("/work/height")
@@ -1846,6 +1932,7 @@ def _main_impl():
     print("=" * 60)
 
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    _load_mempool()
 
     # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос
     conn = wallet_store.open_db(CONFIG["wallet_store_db"])
@@ -1880,6 +1967,7 @@ def _main_impl():
         threading.Thread(target=catch_up_chain, daemon=True).start()
 
     threading.Thread(target=_watchdog_loop, daemon=True).start()
+    threading.Thread(target=_gossip_loop, daemon=True).start()
 
     # Энергия изолированного атома — один раз, для энергии связи в кадрах
     print("\n" + "=" * 60)

@@ -18,6 +18,8 @@ import json
 import os
 import sys
 
+import requests
+
 import chain
 import wallet_store
 from wallet import _element, _transactions
@@ -49,8 +51,75 @@ def _password(args) -> str:
     return os.environ.get(env_name, "")
 
 
+def _mempool(masters: list[str] | None) -> dict:
+    """Объединённый мемпул всех известных мастеров: txid -> tx."""
+    out = {}
+    for url in masters or []:
+        url = str(url).rstrip("/")
+        if not url:
+            continue
+        try:
+            r = requests.get(url + "/tx/mempool", timeout=5)
+            if r.status_code != 200:
+                continue
+            for tx in (r.json().get("txs") or []):
+                tid = tx.get("txid") or chain.txid_of(tx)
+                out[tid] = tx
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _mempool_rows(txs: dict, index: dict, addresses: set[str]) -> list[dict]:
+    """Неподтверждённые транзакции, затрагивающие адреса кошелька."""
+    rows = []
+    for tid, tx in txs.items():
+        received = sum(float(o.get("value") or 0.0)
+                       for o in tx.get("outputs", [])
+                       if o.get("address") in addresses)
+        sent = 0.0
+        total_in = 0.0
+        for i in tx.get("inputs", []):
+            if i.get("coinbase"):
+                continue
+            key = (i.get("txid"), int(i.get("vout", -1)))
+            addr, value = index.get(key, (None, None))
+            if value:
+                total_in += value
+            if addr in addresses and value:
+                sent += value
+        if not received and not sent:
+            continue
+        total_out = sum(float(o.get("value") or 0.0) for o in tx.get("outputs", []))
+        rows.append({
+            "block": None, "type": tx.get("type"), "txid": tid,
+            "received": round(received, 8), "sent": round(sent, 8),
+            "fee": round(max(0.0, total_in - total_out), 8),
+            "confirmations": 0, "mempool": True,
+        })
+    rows.sort(key=lambda r: r["txid"])
+    return rows
+
+
+def _masters_info(masters: list[str] | None) -> list[dict]:
+    out = []
+    for url in masters or []:
+        url = str(url).rstrip("/")
+        if not url:
+            continue
+        try:
+            r = requests.get(url + "/chain/height", timeout=3)
+            h = r.json() if r.status_code == 200 else None
+            out.append({"url": url, "ok": bool(h),
+                        "height": (h or {}).get("height")})
+        except Exception:  # noqa: BLE001
+            out.append({"url": url, "ok": False, "height": None})
+    return out
+
+
 def collect(root: str, password: str, confirmations: int,
-            role: str | None = None, name: str | None = None) -> dict:
+            role: str | None = None, name: str | None = None,
+            masters: list[str] | None = None) -> dict:
     root = _root(root)
     db_path = os.path.join(root, "keys.db")
     if not os.path.exists(db_path):
@@ -81,6 +150,8 @@ def collect(root: str, password: str, confirmations: int,
                 "also_matched": others}
 
     out = []
+    mempool = _mempool(masters)
+    index = _outputs_index(element_dir) if mempool else {}
     for w in wallets:
         addresses = w.addresses()
         balances = {}
@@ -95,9 +166,19 @@ def collect(root: str, password: str, confirmations: int,
                 txs = _transactions(element_dir, addresses)
             except Exception:  # noqa: BLE001
                 txs = []
+            # неподтверждённые — сверху
+            txs = _mempool_rows(mempool, index, addresses) + txs
         for b in balances.values():
             for key in totals:
                 totals[key] += float(b.get(key) or 0.0)
+
+        # Мемпул блокирует потраченные выходы и добавляет будущие поступления.
+        locked = sum(t["sent"] for t in txs if t.get("mempool"))
+        incoming = sum(t["received"] for t in txs if t.get("mempool"))
+        if locked or incoming:
+            totals["available"] = max(0.0, totals["available"] - locked)
+            totals["pending"] += incoming
+            totals["total"] = totals["available"] + totals["pending"]
         out.append({
             "role": w.role,
             "name": w.name,
@@ -109,7 +190,9 @@ def collect(root: str, password: str, confirmations: int,
         })
 
     return {"ok": True, "root": root, "element": element, "height": tip,
-            "role": role, "also_matched": others, "wallets": out}
+            "role": role, "also_matched": others, "wallets": out,
+            "masters": _masters_info(masters),
+            "mempool_count": len(mempool)}
 
 
 def _outputs_index(element_dir: str) -> dict:
@@ -127,7 +210,43 @@ def _outputs_index(element_dir: str) -> dict:
     return index
 
 
-def tx_details(root: str, txid: str) -> dict:
+def _tx_payload(tx: dict, index: dict, block: int | None,
+                confirmations: int) -> dict:
+    inputs, total_in = [], 0.0
+    for i in tx.get("inputs", []):
+        if i.get("coinbase"):
+            inputs.append({"coinbase": True, "address": None,
+                           "value": None, "txid": None, "vout": None})
+            continue
+        key = (i.get("txid"), int(i.get("vout", -1)))
+        address, value = index.get(key, (None, None))
+        if value:
+            total_in += value
+        inputs.append({"coinbase": False, "address": address,
+                       "value": value, "txid": i.get("txid"),
+                       "vout": i.get("vout")})
+
+    outputs = [{"vout": n, "address": o.get("address"),
+                "value": float(o.get("value") or 0.0)}
+               for n, o in enumerate(tx.get("outputs", []))]
+    total_out = sum(o["value"] for o in outputs)
+
+    fee = None
+    if tx.get("type") != "coinbase" and total_in:
+        fee = round(total_in - total_out, 8)
+
+    return {
+        "ok": True, "block": block, "confirmations": confirmations,
+        "mempool": block is None,
+        "type": tx.get("type"),
+        "txid": tx.get("txid") or chain.txid_of(tx),
+        "fee": fee, "inputs": inputs, "outputs": outputs,
+        "total_in": round(total_in, 8), "total_out": round(total_out, 8),
+        "raw": {k: v for k, v in tx.items() if k != "_file"},
+    }
+
+
+def tx_details(root: str, txid: str, masters: list[str] | None = None) -> dict:
     """Полная информация о транзакции из блока: входы с адресами, выходы, комиссия."""
     root = _root(root)
     element = _element()
@@ -171,17 +290,17 @@ def tx_details(root: str, txid: str) -> dict:
             if tx.get("type") != "coinbase" and total_in:
                 fee = round(total_in - total_out, 8)
 
-            return {
-                "ok": True, "element": element, "block": b["seq"],
-                "confirmations": max(0, tip - b["seq"] + 1),
-                "type": tx.get("type"), "txid": tid,
-                "fee": fee, "inputs": inputs, "outputs": outputs,
-                "total_in": round(total_in, 8), "total_out": round(total_out, 8),
-                "raw": {k: v for k, v in tx.items() if k != "_file"},
-            }
+            return _tx_payload(tx, index, b["seq"], max(0, tip - b["seq"] + 1))
+
+    # не нашли в блоках — ищем в мемпулах известных мастеров
+    for tid, tx in _mempool(masters).items():
+        if tid == txid:
+            payload = _tx_payload(tx, index, None, 0)
+            payload["element"] = element
+            return payload
 
     return {"ok": False,
-            "error": "транзакция не найдена в блоках (возможно, ещё в мемпуле)"}
+            "error": "транзакция не найдена ни в блоках, ни в мемпуле известных мастеров"}
 
 
 def send(root: str, password: str, to: str, amount: float, fee: float,
@@ -265,13 +384,15 @@ def main() -> int:
         else _confirmations(args.results_root)
 
     if args.action == "info":
+        masters = [m for m in (args.master or []) if m]
         result = collect(args.results_root, password, confirmations,
-                         role=args.role, name=args.name)
+                         role=args.role, name=args.name, masters=masters)
     elif args.action == "tx":
         if not args.txid:
             print(json.dumps({"ok": False, "error": "нужен --txid"}, ensure_ascii=False))
             return 2
-        result = tx_details(args.results_root, args.txid)
+        result = tx_details(args.results_root, args.txid,
+                            masters=[m for m in (args.master or []) if m])
     elif args.action == "send":
         if not args.to or args.amount <= 0:
             print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},

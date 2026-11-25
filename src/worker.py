@@ -33,6 +33,8 @@ import structure_generator
 
 RETRY_DELAY = 5          # секунд между попытками подключения к серверу
 LOCAL_RETRIES = 3        # сколько раз воркер локально повторяет задачу (новая структура)
+PEER_REFRESH_SEC = 60    # как часто спрашивать у мастеров адреса других мастеров
+MAX_MASTERS = 32         # сколько адресов мастеров воркер готов держать
 
 
 def setup_logger(worker_id: str, log_dir: str):
@@ -233,6 +235,30 @@ def run_task(task: dict, cfg: dict, logger):
     return False, {"error": True, "message": last_error}
 
 
+def discover_peers(masters: list[str], logger) -> list[str]:
+    """
+    Обмен адресами с мастерами (как в p2p): спрашиваем у каждого известного
+    мастера его список пиров и добавляем неизвестные адреса — чтобы уметь
+    переключиться, если основной мастер занят или недоступен.
+    """
+    added = []
+    for url in list(masters):
+        try:
+            r = requests.get(url.rstrip("/") + "/admin/peers", timeout=5)
+            if r.status_code != 200:
+                continue
+            for peer in (r.json().get("peers") or []):
+                u = str(peer).strip().rstrip("/")
+                if u and u not in masters and len(masters) < MAX_MASTERS:
+                    masters.append(u)
+                    added.append(u)
+        except Exception:  # noqa: BLE001
+            continue
+    if added:
+        logger.info(f"Узнал новые адреса мастеров: {', '.join(added)}")
+    return added
+
+
 def _masters_list(base_url: str, extra: list[str] | None) -> list[str]:
     """Список мастеров: WORKER_MASTERS + --master, иначе основной."""
     raw = []
@@ -351,10 +377,15 @@ def main():
     submit_url = f"{base_url}/submit-result"
 
     logger.info("Начинаем опрос очереди задач...")
+    last_peer_refresh = 0.0
 
     try:
         while True:
             try:
+                if time.time() - last_peer_refresh > PEER_REFRESH_SEC:
+                    last_peer_refresh = time.time()
+                    discover_peers(masters, logger)
+
                 response = requests.get(
                     task_url,
                     params={"worker_id": worker_id, "pubkey_hash": pubkey_hash},

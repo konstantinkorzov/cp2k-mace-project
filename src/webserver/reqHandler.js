@@ -52,6 +52,28 @@ function isInsideRoot(p) {
     return abs === procs.ROOT || abs.startsWith(procs.ROOT + path.sep);
 }
 
+function postJson(url, payload, method = 'POST', timeoutMs = 4000) {
+    return new Promise((resolve) => {
+        const body = JSON.stringify(payload);
+        const req2 = http.request(url, {
+            method,
+            headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+            timeout: timeoutMs,
+        }, (r) => {
+            let data = '';
+            r.on('data', (c) => { data += c; });
+            r.on('end', () => resolve({ status: r.statusCode, body: data }));
+        });
+        req2.on('timeout', () => { req2.destroy(); resolve({ status: 0, body: '' }); });
+        req2.on('error', () => resolve({ status: 0, body: '' }));
+        req2.write(body);
+        req2.end();
+    });
+}
+
+const normaliseUrl = (u) => String(u || '').trim().replace(/\/+$/, '');
+let _lastGossip = 0;
+
 function bad(res, code, message) {
     return res.status(code).json({ ok: false, error: message });
 }
@@ -215,6 +237,7 @@ function onCp2kLog(req, res) {
 async function onNetwork(req, res) {
     try {
         const found = new Map(); // url -> entry
+        const peerLists = new Map(); // url мастера -> его список пиров
 
         for (const rec of procs.list().filter((r) => r.kind === 'master' && r.alive)) {
             const url = `http://127.0.0.1:${rec.port}`;
@@ -224,6 +247,7 @@ async function onNetwork(req, res) {
                 height: info.height, peers: info.peers | 0,
                 pid: rec.pid, dir: rec.dir,
             });
+            peerLists.set(url, (info.peers || []).map(normaliseUrl));
         }
 
         // мастера, запущенные вне панели (из терминала)
@@ -233,27 +257,46 @@ async function onNetwork(req, res) {
                     url: ext.url, source: 'вне панели', ok: true,
                     height: ext.height, peers: (ext.peers || []).length,
                 });
+                peerLists.set(ext.url, (ext.peers || []).map(normaliseUrl));
             }
         }
 
         // адреса, которые мастер сообщает воркеру (его список пиров)
-        const seeds = [...found.values()].map((e) => e.url);
+        const seeds = [...found.keys()];
         for (const url of seeds) {
             const peers = await fetchJson(url + '/admin/peers');
+            if (!peerLists.has(url)) peerLists.set(url, []);
             for (const peer of (peers && peers.peers) || []) {
-                if (found.has(peer)) {
-                    found.get(peer).source = found.get(peer).source + ', пир';
+                const clean = normaliseUrl(peer);
+                peerLists.get(url).push(clean);
+                if (found.has(clean)) {
+                    found.get(clean).source = found.get(clean).source + ', пир';
                     continue;
                 }
-                const h = await fetchJson(peer + '/chain/height');
-                found.set(peer, {
-                    url: peer, source: 'пир мастера', ok: Boolean(h),
+                const h = await fetchJson(clean + '/chain/height');
+                found.set(clean, {
+                    url: clean, source: 'пир мастера', ok: Boolean(h),
                     height: h ? h.height : null, peers: 0,
                 });
             }
         }
 
-        res.json({ ok: true, nodes: [...found.values()] });
+        // Обмен адресами (как в p2p): сообщаем каждому мастеру об известных
+        // нам узлах, которых у него нет. Не чаще раза в 30 с, по одному адресу.
+        const gossip = [];
+        if (Date.now() - _lastGossip > 30000) {
+            _lastGossip = Date.now();
+            const all = [...found.keys()];
+            for (const [masterUrl, known] of peerLists) {
+                const knownSet = new Set(known);
+                const candidate = all.find((u) => u !== masterUrl && !knownSet.has(u));
+                if (!candidate) continue;
+                const r = await postJson(masterUrl + '/admin/peers', { url: candidate });
+                if (r.status === 200) gossip.push({ master: masterUrl, peer: candidate });
+            }
+        }
+
+        res.json({ ok: true, nodes: [...found.values()], gossip });
     } catch (e) {
         bad(res, 500, String(e));
     }
@@ -267,22 +310,8 @@ async function onMasterPeers(req, res) {
         if (!body.url) return bad(res, 400, 'нужен url пира');
 
         const url = `http://127.0.0.1:${port}/admin/peers`;
-        const payload = JSON.stringify({ url: String(body.url).trim() });
-        const text = await new Promise((resolve) => {
-            const req2 = http.request(url, {
-                method: body.action === 'del' ? 'DELETE' : 'POST',
-                headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) },
-                timeout: 4000,
-            }, (r) => {
-                let data = '';
-                r.on('data', (c) => { data += c; });
-                r.on('end', () => resolve({ status: r.statusCode, body: data }));
-            });
-            req2.on('timeout', () => { req2.destroy(); resolve({ status: 0, body: '' }); });
-            req2.on('error', () => resolve({ status: 0, body: '' }));
-            req2.write(payload);
-            req2.end();
-        });
+        const text = await postJson(url, { url: String(body.url).trim() },
+            body.action === 'del' ? 'DELETE' : 'POST');
         let body2 = null;
         try { body2 = JSON.parse(text.body); } catch (e) { body2 = null; }
         if (text.status === 200 && body2) return res.json({ ok: true, peers: body2.peers });
@@ -312,6 +341,9 @@ async function onWalletInfo(req, res) {
         const args = ['src/webwallet.py', 'info', '--results-root', root];
         if (body.role) args.push('--role', String(body.role));
         if (body.name) args.push('--name', String(body.name));
+        for (const url of (body.masters || [])) {
+            if (url) args.push('--master', String(url));
+        }
         const out = await runPython(
             args,
             { WEBUI_WALLET_PASSWORD: String(body.password) }, 20000);
@@ -369,9 +401,12 @@ async function onWalletTx(req, res) {
         const body = req.body || {};
         if (!body.txid) return bad(res, 400, 'нужен txid');
         const root = walletRoot(body);
-        const out = await runPython(
-            ['src/webwallet.py', 'tx', '--results-root', root, '--txid', String(body.txid)],
-            {}, 20000);
+        const args = ['src/webwallet.py', 'tx', '--results-root', root,
+            '--txid', String(body.txid)];
+        for (const url of (body.masters || [])) {
+            if (url) args.push('--master', String(url));
+        }
+        const out = await runPython(args, {}, 20000);
         res.json(out);
     } catch (e) {
         bad(res, 500, String(e));

@@ -831,10 +831,13 @@ function buildWalletTab(tab) {
             <div><label>Адрес получателя</label><input type="text" id="${tab}-to" /></div>
             <div><label>Сумма</label><input type="number" id="${tab}-amount" step="0.1" min="0" /></div>
             <div><label>Комиссия</label><input type="number" id="${tab}-fee" step="0.01" value="0.1" /></div>
-            <div><label>Мастер</label><select id="${tab}-master"></select></div>
+          </div>
+          <div style="margin-top:10px">
+            <label>Мастера (транзакция уйдёт всем известным)</label>
+            <div id="${tab}-masters" class="chips"></div>
           </div>
           <div class="actions">
-            <button class="btn" id="${tab}-send">Отправить</button>
+            <button class="btn" id="${tab}-send">Отправить всем</button>
             <span class="muted" id="${tab}-send-msg"></span>
           </div>
         </div>
@@ -861,6 +864,7 @@ function buildWalletTab(tab) {
     msg.textContent = 'читаю…';
     const data = await api('/api/wallet/info', {
       password, resultsRoot: root || null, role: isMaster ? 'master' : 'worker',
+      masters: walletMasters(),
     });
     if (!data.ok) {
       msg.innerHTML = `<span class="err">${esc(data.error || 'ошибка')}</span>`;
@@ -869,6 +873,7 @@ function buildWalletTab(tab) {
       return;
     }
     msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
+      + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0}</span>`
       + ((data.also_matched || []).length
         ? ` <span class="muted">(этот же пароль есть у: ${esc(data.also_matched.join(', '))} —
            они показаны в своей вкладке)</span>`
@@ -899,10 +904,9 @@ function buildWalletTab(tab) {
     const btn = document.getElementById(tab + '-send');
     const msg = document.getElementById(tab + '-send-msg');
     const password = document.getElementById(tab + '-password').value;
-    const sel = document.getElementById(tab + '-master');
-    const masters = sel.value ? [sel.value] : [];
+    const masters = walletMasters();
     btn.disabled = true;
-    msg.textContent = 'отправляю…';
+    msg.textContent = 'отправляю всем мастерам…';
     const r = await api('/api/wallet/send', {
       password,
       resultsRoot: document.getElementById(tab + '-root').value || null,
@@ -929,7 +933,13 @@ function renderWallet(tab, data) {
   box.innerHTML = data.wallets.map((w) => {
     const addrs = w.addresses.map((a) => `
       <div class="mono muted" style="font-size:11.5px">${esc(a.address)}</div>`).join('');
-    const txs = (w.transactions || []).slice().reverse().map((t) => {
+    const txs = (w.transactions || []).slice()
+      .sort((a, b) => {
+        if (Boolean(a.mempool) !== Boolean(b.mempool)) return a.mempool ? -1 : 1;
+        return (b.block || 0) - (a.block || 0);
+      })
+      .map((t) => {
+      const pending = Boolean(t.mempool);
       const net = (t.received || 0) - (t.sent || 0);
       const amount = (net >= 0 ? '+' : '−') + Math.abs(net).toFixed(4);
       const cls = net > 0 ? 'ok' : (net < 0 ? 'err' : '');
@@ -937,11 +947,11 @@ function renderWallet(tab, data) {
         ? `приход ${t.received.toFixed(4)}, расход ${t.sent.toFixed(4)} — нажмите для деталей`
         : 'нажмите, чтобы посмотреть входы и выходы';
       return `<tr class="tx-row" data-txid="${esc(t.txid)}" title="${esc(hint)}">
-        <td class="num">${t.block}</td>
+        <td class="num">${pending ? '<span class="pill warn">мемпул</span>' : t.block}</td>
         <td>${esc(t.type)}</td>
         <td class="num ${cls}">${amount}</td>
         <td class="num">${t.fee ? t.fee.toFixed(6) : '—'}</td>
-        <td class="num">${t.confirmations}</td>
+        <td class="num">${pending ? 0 : t.confirmations}</td>
         <td class="mono" title="${esc(t.txid)}">${esc(t.txid.slice(0, 12))}…</td>
       </tr>`;
     }).join('');
@@ -980,6 +990,7 @@ async function showTxDetails(tab, txid) {
 
   const data = await api('/api/wallet/tx', {
     txid, resultsRoot: document.getElementById(tab + '-root').value || null,
+    masters: walletMasters(),
   });
   if (!data.ok) {
     box.innerHTML = `<span class="err">${esc(data.error || 'не читается')}</span>`;
@@ -998,7 +1009,8 @@ async function showTxDetails(tab, txid) {
 
   box.innerHTML = `
     <div class="kv">
-      <span>блок <code>${data.block}</code></span>
+      ${data.block != null ? `<span>блок <code>${data.block}</code></span>`
+        : '<span class="pill warn">в мемпуле</span>'}
       <span>подтверждений <code>${data.confirmations}</code></span>
       <span>тип <code>${esc(data.type)}</code></span>
       ${data.fee != null ? `<span>комиссия <code>${data.fee}</code></span>` : ''}
@@ -1034,6 +1046,15 @@ async function refreshWallet(tab) {
   if (data.ok) { st.state = data; renderWallet(tab, data); }
 }
 
+function walletMasters() {
+  const urls = [
+    ...overview.masters.map((m) => `http://127.0.0.1:${m.port}`),
+    ...(overview.external || []).map((e) => e.url),
+    ...network.map((n) => n.url),
+  ];
+  return [...new Set(urls.map((u) => String(u).replace(/\/+$/, '')).filter(Boolean))];
+}
+
 function fillWalletRoots(dirs) {
   for (const tab of ['wallet1', 'wallet2']) {
     const sel = document.getElementById(tab + '-root');
@@ -1045,17 +1066,12 @@ function fillWalletRoots(dirs) {
   }
   // список мастеров для отправки tx: свои + обнаруженные вне панели
   for (const tab of ['wallet1', 'wallet2']) {
-    const sel = document.getElementById(tab + '-master');
-    if (!sel) continue;
-    const nodes = [
-      ...overview.masters.map((m) => `http://127.0.0.1:${m.port}`),
-      ...(overview.external || []).map((e) => e.url),
-    ];
-    const uniq = [...new Set(nodes)];
-    if (!uniq.length) uniq.push('http://127.0.0.1:8000');
-    const cur = sel.value;
-    sel.innerHTML = uniq.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join('');
-    if (cur && uniq.includes(cur)) sel.value = cur;
+    const box = document.getElementById(tab + '-masters');
+    if (!box) continue;
+    const urls = walletMasters();
+    box.innerHTML = urls.length
+      ? urls.map((u) => `<span class="chip">${esc(u)}</span>`).join('')
+      : '<span class="muted">мастера не найдены — запустите мастера на вкладке «Мастер»</span>';
   }
 }
 
@@ -1170,6 +1186,18 @@ refreshOverview().then(() => {
   $('#wallet2-root').value = overview.dirs[0] || '';
 });
 refreshNetwork();
+
+// Кошелёк — независимый клиент: пока вкладка открыта, он сам периодически
+// опрашивает известных мастеров (балансы, подтверждения, мемпул).
+setInterval(() => {
+  const tab = activeTab === 'wallet1' ? 'wallet1' : (activeTab === 'wallet2' ? 'wallet2' : null);
+  if (tab && wallets[tab].state) refreshWallet(tab);
+}, 6000);
+
+// список мастеров тоже обновляем — адреса могут появиться через gossip
+setInterval(() => {
+  if (activeTab === 'worker' || activeTab.startsWith('wallet')) refreshNetwork();
+}, 15000);
 </script>
 </body>
 </html>
