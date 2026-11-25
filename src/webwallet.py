@@ -49,7 +49,8 @@ def _password(args) -> str:
     return os.environ.get(env_name, "")
 
 
-def collect(root: str, password: str, confirmations: int) -> dict:
+def collect(root: str, password: str, confirmations: int,
+            role: str | None = None, name: str | None = None) -> dict:
     root = _root(root)
     db_path = os.path.join(root, "keys.db")
     if not os.path.exists(db_path):
@@ -62,10 +63,22 @@ def collect(root: str, password: str, confirmations: int) -> dict:
     tip = (chain.next_seq(element_dir) - 1) if os.path.isdir(element_dir) else 0
     tip = max(0, tip)
 
-    wallets = wallet_store.find_by_password(conn, password)
+    # Пароль может подходить сразу к нескольким кошелькам (у мастера и воркера
+    # разные соли и ключи, но пароль один). Поэтому фильтруем по роли/имени:
+    # без этого вкладка «мастер» показывала бы и балансы воркеров.
+    matched = wallet_store.find_by_password(conn, password)
+    wallets = [w for w in matched
+               if (role is None or w.role == role)
+               and (name is None or w.name == name)]
+    others = [f"{w.role}/{w.name}" for w in matched if w not in wallets]
+
     if not wallets:
+        hint = ("пароль не подходит ни к одному кошельку" if not matched
+                else f"для роли {role or 'любой'} кошельков нет; пароль подходит к: "
+                     + ", ".join(others))
         return {"ok": False, "root": root, "element": element, "height": tip,
-                "error": "пароль не подходит ни к одному кошельку", "wallets": []}
+                "error": hint, "wallets": [], "role": role,
+                "also_matched": others}
 
     out = []
     for w in wallets:
@@ -96,7 +109,7 @@ def collect(root: str, password: str, confirmations: int) -> dict:
         })
 
     return {"ok": True, "root": root, "element": element, "height": tip,
-            "wallets": out}
+            "role": role, "also_matched": others, "wallets": out}
 
 
 def send(root: str, password: str, to: str, amount: float, fee: float,
@@ -179,7 +192,8 @@ def main() -> int:
         else _confirmations(args.results_root)
 
     if args.action == "info":
-        result = collect(args.results_root, password, confirmations)
+        result = collect(args.results_root, password, confirmations,
+                         role=args.role, name=args.name)
     elif args.action == "send":
         if not args.to or args.amount <= 0:
             print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},

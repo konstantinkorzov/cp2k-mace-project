@@ -308,8 +308,11 @@ async function onWalletInfo(req, res) {
         const body = req.body || {};
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
         const root = walletRoot(body);
+        const args = ['src/webwallet.py', 'info', '--results-root', root];
+        if (body.role) args.push('--role', String(body.role));
+        if (body.name) args.push('--name', String(body.name));
         const out = await runPython(
-            ['src/webwallet.py', 'info', '--results-root', root],
+            args,
             { WEBUI_WALLET_PASSWORD: String(body.password) }, 20000);
         res.json(out);
     } catch (e) {

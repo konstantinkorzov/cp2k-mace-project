@@ -103,6 +103,19 @@
   .ok { color: var(--green); font-size: 12.5px; }
   .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 1000px) { .split { grid-template-columns: 1fr; } }
+  details.card > summary {
+    cursor: pointer; font-size: 15px; font-weight: 600; list-style: none;
+  }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary::before { content: '▸ '; color: var(--accent); }
+  details.card[open] > summary::before { content: '▾ '; }
+  details.card > summary .muted { font-weight: 400; font-size: 12px; }
+  .cfg-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+  @media (max-width: 900px) { .cfg-form { grid-template-columns: 1fr; } }
+  .cfg-field label { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--ink); }
+  .cfg-field .muted { margin-top: 2px; font-size: 11.5px; }
+  .cfg-field.wide { grid-column: 1 / -1; }
+  .cfg-bool { display: flex; gap: 8px; align-items: center; font-size: 13px; }
   details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
 </style>
 </head>
@@ -161,6 +174,20 @@
           <span id="m-msg" class="muted"></span>
         </div>
       </div>
+
+      <details class="card" id="cfg-master-box">
+        <summary><b>Настройки</b> <span class="muted">src/config.json — параметры мастера</span></summary>
+        <p class="muted" style="margin:8px 0 10px">
+          Файл общий для мастера и воркера. Изменения применяются к <b>следующему</b>
+          запуску; у уже работающего мастера — через <code>master-cli.py config set</code>.
+        </p>
+        <div id="cfg-master" class="cfg-form"><span class="muted">откройте блок, чтобы прочитать</span></div>
+        <div class="actions">
+          <button class="btn" id="cfg-master-save">Сохранить</button>
+          <button class="btn secondary" id="cfg-master-reload">Перечитать</button>
+          <span class="muted" id="cfg-master-msg"></span>
+        </div>
+      </details>
 
       <div class="card">
         <h2>Мастера</h2>
@@ -221,6 +248,20 @@
           <span id="w-msg" class="muted"></span>
         </div>
       </div>
+
+      <details class="card" id="cfg-worker-box">
+        <summary><b>Настройки</b> <span class="muted">что воркер получает от мастера</span></summary>
+        <p class="muted" style="margin:8px 0 10px">
+          Воркер не читает файлы сам: мастер передаёт ему эти значения в задании.
+          Остальные параметры (очередь, кошелёк, блокчейн) — во вкладке «Мастер».
+        </p>
+        <div id="cfg-worker" class="cfg-form"><span class="muted">откройте блок, чтобы прочитать</span></div>
+        <div class="actions">
+          <button class="btn" id="cfg-worker-save">Сохранить</button>
+          <button class="btn secondary" id="cfg-worker-reload">Перечитать</button>
+          <span class="muted" id="cfg-worker-msg"></span>
+        </div>
+      </details>
 
       <div class="card">
         <h2>Воркеры</h2>
@@ -750,7 +791,8 @@ function buildWalletTab(tab) {
     <div class="grid">
       <div>
         <div class="card">
-          <h2>${isMaster ? 'Кошелёк мастера' : 'Кошелёк воркера'}</h2>
+          <h2>${isMaster ? 'Кошелёк мастера' : 'Кошелёк воркера'}
+            <span class="muted" style="font-weight:400;font-size:12px">роль: ${isMaster ? 'master' : 'worker'}</span></h2>
           <p class="muted" style="margin-top:-4px">
             Пароль определяет, чей кошелёк открыть: <code>master</code> — мастер,
             <code>worker</code> — воркеры. Кошельки лежат в общей базе выбранного
@@ -810,14 +852,20 @@ function buildWalletTab(tab) {
     wallets[tab].password = password;
     const msg = document.getElementById(tab + '-msg');
     msg.textContent = 'читаю…';
-    const data = await api('/api/wallet/info', { password, resultsRoot: root || null });
+    const data = await api('/api/wallet/info', {
+      password, resultsRoot: root || null, role: isMaster ? 'master' : 'worker',
+    });
     if (!data.ok) {
       msg.innerHTML = `<span class="err">${esc(data.error || 'ошибка')}</span>`;
       document.getElementById(tab + '-content').innerHTML =
         '<span class="muted">кошелёк не открыт</span>';
       return;
     }
-    msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`;
+    msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
+      + ((data.also_matched || []).length
+        ? ` <span class="muted">(этот же пароль есть у: ${esc(data.also_matched.join(', '))} —
+           они показаны в своей вкладке)</span>`
+        : '');
     document.getElementById(tab + '-send-card').style.display = 'block';
     renderWallet(tab, data);
   });
@@ -908,6 +956,7 @@ async function refreshWallet(tab) {
   const data = await api('/api/wallet/info', {
     password: document.getElementById(tab + '-password').value,
     resultsRoot: document.getElementById(tab + '-root').value || null,
+    role: tab === 'wallet1' ? 'master' : 'worker',
   });
   if (data.ok) { st.state = data; renderWallet(tab, data); }
 }
@@ -921,16 +970,114 @@ function fillWalletRoots(dirs) {
       `<option value="${esc(d)}">${esc(d.replace(overview.root + '/', ''))}</option>`).join('');
     if (cur) sel.value = cur;
   }
-  // список мастеров для отправки tx
+  // список мастеров для отправки tx: свои + обнаруженные вне панели
   for (const tab of ['wallet1', 'wallet2']) {
     const sel = document.getElementById(tab + '-master');
     if (!sel) continue;
-    const nodes = overview.masters.map((m) => `http://127.0.0.1:${m.port}`);
+    const nodes = [
+      ...overview.masters.map((m) => `http://127.0.0.1:${m.port}`),
+      ...(overview.external || []).map((e) => e.url),
+    ];
+    const uniq = [...new Set(nodes)];
+    if (!uniq.length) uniq.push('http://127.0.0.1:8000');
     const cur = sel.value;
-    sel.innerHTML = nodes.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join('');
-    if (cur) sel.value = cur;
+    sel.innerHTML = uniq.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join('');
+    if (cur && uniq.includes(cur)) sel.value = cur;
   }
 }
+
+/* ==================== настройки (src/config.json) ==================== */
+
+// Мастер передаёт воркеру только эти ключи (см. task_cfg_payload в src/main.py)
+const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k'];
+
+function configField(key, entry) {
+  const wrapped = entry && typeof entry === 'object' && 'value' in entry;
+  const value = wrapped ? entry.value : entry;
+  const help = wrapped ? (entry.help || '') : '';
+  const wide = (value !== null && typeof value === 'object') ? ' wide' : '';
+  let control;
+  if (typeof value === 'boolean') {
+    control = `<label class="cfg-bool"><input type="checkbox" data-key="${esc(key)}" data-type="bool" ${value ? 'checked' : ''}/></label>`;
+  } else if (typeof value === 'number') {
+    control = `<input type="number" step="any" data-key="${esc(key)}" data-type="number" value="${value}" />`;
+  } else if (typeof value === 'string') {
+    control = `<input type="text" data-key="${esc(key)}" data-type="string" value="${esc(value)}" />`;
+  } else {
+    control = `<textarea data-key="${esc(key)}" data-type="json">${esc(JSON.stringify(value, null, 2))}</textarea>`;
+  }
+  return `<div class="cfg-field${wide}"><label>${esc(key)}</label>${control}`
+    + (help ? `<div class="muted">${esc(help)}</div>` : '') + '</div>';
+}
+
+async function loadConfigForm(which) {
+  const box = document.getElementById('cfg-' + which);
+  const msg = document.getElementById('cfg-' + which + '-msg');
+  if (!box) return;
+  box.innerHTML = '<span class="muted">читаю…</span>';
+  const data = await api('/api/config');
+  if (!data.ok) {
+    box.innerHTML = `<span class="err">${esc(data.error || 'config.json не читается')}</span>`;
+    return;
+  }
+  const cfg = data.config || {};
+  box.dataset.json = JSON.stringify(cfg);
+  const keys = Object.keys(cfg).filter((k) =>
+    which === 'master' || WORKER_CONFIG_KEYS.includes(k));
+  box.innerHTML = keys.map((k) => configField(k, cfg[k])).join('')
+    || '<span class="muted">нет полей</span>';
+  if (msg) msg.textContent = '';
+}
+
+async function saveConfigForm(which) {
+  const box = document.getElementById('cfg-' + which);
+  const msg = document.getElementById('cfg-' + which + '-msg');
+  const outgoing = {};
+  for (const el of box.querySelectorAll('[data-key]')) {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+    let value;
+    if (type === 'bool') {
+      value = el.checked;
+    } else if (type === 'number') {
+      value = Number(el.value);
+      if (!Number.isFinite(value)) {
+        msg.innerHTML = `<span class="err">${esc(key)}: нужно число</span>`;
+        return;
+      }
+    } else if (type === 'json') {
+      try {
+        value = JSON.parse(el.value);
+      } catch (e) {
+        msg.innerHTML = `<span class="err">${esc(key)}: некорректный JSON</span>`;
+        return;
+      }
+    } else {
+      value = el.value;
+    }
+    outgoing[key] = { value };
+  }
+  msg.textContent = 'сохраняю…';
+  const r = await api('/api/config', { config: outgoing });
+  if (r.ok) {
+    msg.innerHTML = '<span class="ok">сохранено — применится при следующем запуске</span>';
+    if (box.dataset.json) box.dataset.json = JSON.stringify(r.config || {});
+  } else {
+    msg.innerHTML = `<span class="err">${esc(r.error || 'не сохранилось')}</span>`;
+  }
+}
+
+['master', 'worker'].forEach((which) => {
+  const details = document.getElementById('cfg-' + which + '-box');
+  if (!details) return;
+  details.addEventListener('toggle', () => {
+    if (details.open) loadConfigForm(which);
+  });
+  document.getElementById('cfg-' + which + '-reload')
+    .addEventListener('click', () => loadConfigForm(which));
+  document.getElementById('cfg-' + which + '-save')
+    .addEventListener('click', () => saveConfigForm(which));
+});
 
 /* ==================== инициализация ==================== */
 
