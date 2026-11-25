@@ -890,3 +890,107 @@ docker pull ghcr.io/konstantinkorzov/cp2k-mace:latest-gpu
 
 * **Ошибка `port is already allocated` при запуске воркера**  
   Указанный порт хоста (например, `8001`) уже занят другим контейнером. Передайте другой порт в параметре `--port2`, например: `--port2 8002`.
+
+---
+
+## 📦 Публикация в новом репозитории GitHub
+
+Проект уже подготовлен к публикации: репозиторий инициализирован (`git init`, ветка `main`),
+`.gitignore`/`.dockerignore` исключают данные расчётов, кошельки и логи, а логин
+**konstantinkorzov** проставлен в `Makefile`, `run.sh`, `package.json` и README.
+
+### Что не попадёт в репозиторий (и правильно)
+
+| Путь | Почему |
+|---|---|
+| `results/`, `results2/`, `results-*/` | результаты расчётов, блоки, `keys.db` с (шифрованными) ключами |
+| `.webui/` | логи процессов веб-панели |
+| `node_modules/`, `__pycache__/` | зависимости и кэш |
+| `*.wfn`, `*.out`, `*.xyz`, `*.zip` | артефакты CP2K и данные |
+| `src/webserver/*.pem` | приватный ключ TLS; сертификат генерируется при первом запуске |
+
+### Шаг 1. Создать репозиторий
+
+Вариант А — GitHub CLI (проще):
+
+```bash
+# установка: https://cli.github.com/  (или apt install gh)
+gh auth login                                  # один раз на машине
+cd ~/cp2k-mace-project-zerotrust
+gh repo create konstantinkorzov/cp2k-mace-project --public --source=. --remote=origin --push
+```
+
+Вариант Б — через сайт:
+
+1. https://github.com/new → имя `cp2k-mace-project`, **Public**, без README/.gitignore (они уже есть).
+2. В терминале:
+
+```bash
+cd ~/cp2k-mace-project-zerotrust
+git remote add origin https://github.com/konstantinkorzov/cp2k-mace-project.git
+git push -u origin main
+```
+
+При `push` в качестве пароля нужен **Personal Access Token** (Settings → Developer settings →
+Tokens (classic) → Generate new token, scope `repo`), обычный пароль GitHub не подойдёт.
+
+### Шаг 2. Собрать и опубликовать Docker-образ
+
+GHCR — отдельный реестр, туда нужен токен с правом `write:packages`:
+
+```bash
+# 1) токен: тот же PAT, но с галочкой write:packages
+# 2) вход в реестр
+echo "$GHCR_TOKEN" | docker login ghcr.io -u konstantinkorzov --password-stdin
+
+# 3) сборка и отправка (Makefile уже знает логин konstantinkorzov)
+make release-cpu        # CPU-образ  ghcr.io/konstantinkorzov/cp2k-mace:latest-cpu
+make release-gpu        # GPU-образ  ghcr.io/konstantinkorzov/cp2k-mace:latest-gpu
+```
+
+Если `buildx` ещё не настроен:
+
+```bash
+docker buildx create --name cp2k-builder --use
+docker buildx inspect --bootstrap
+```
+
+### Шаг 3. Сделать образ публичным
+
+По умолчанию пакет в GHCR приватный, и `docker pull` без логина не сработает:
+
+1. https://github.com/users/konstantinkorzov/packages/container/cp2k-mace/settings
+2. **Danger Zone** → **Change visibility** → **Public** → подтвердить имя пакета.
+
+Проверка (на любой машине, без авторизации):
+
+```bash
+docker pull ghcr.io/konstantinkorzov/cp2k-mace:latest-cpu
+./run.sh            # скачает образ и запустит контейнер
+```
+
+### Шаг 4. Если логин или имя репозитория изменятся
+
+| Где | Что править |
+|---|---|
+| `Makefile` | `GITHUB_USER`, `IMAGE_NAME` |
+| `run.sh` | `IMAGE_CPU`, `IMAGE_GPU` |
+| `package.json` | `repository`, `bugs`, `homepage` |
+| `README.md` | ссылки `git clone` и `docker pull` |
+
+Быстрая замена по всему проекту:
+
+```bash
+grep -rl 'konstantinkorzov' --exclude-dir=node_modules --exclude-dir=.git . \
+  | xargs sed -i 's/konstantinkorzov/НОВЫЙ_ЛОГИН/g'
+```
+
+### Мелочи, которые стоит сделать сразу
+
+* **Автор коммитов.** Сейчас в первом коммите `Konstantin Korzov <konstantinkorzov@users.noreply.github.com>`.
+  Поменять: `git config user.email ...` и затем `git commit --amend --reset-author`.
+* **Лицензия.** Добавьте `LICENSE` (например, MIT) — без неё формально нельзя использовать код.
+* **Сертификат для HTTPS.** В репозитории его нет; панель создаёт самоподписанный
+  `src/webserver/*.pem` при первом запуске (`openssl` есть в образе). Для «настоящего»
+  HTTPS положите свои `privkey.pem`/`fullchain.pem` в `src/webserver/`.
+* **Теги версий.** `make release-cpu TAG=v1.0.0` — получатся образы `:v1.0.0-cpu`.

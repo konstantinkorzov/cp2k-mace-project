@@ -31,3 +31,10 @@ RUN apt-get update && apt-get install -y mc git ca-certificates curl \
 
 # Создаем рабочую директорию
 WORKDIR /workspace
+
+# Метки OCI: связывают пакет в GHCR с репозиторием GitHub.
+# LABEL стоит в конце, чтобы не сбрасывать кэш тяжёлых слоёв выше.
+LABEL org.opencontainers.image.source="https://github.com/konstantinkorzov/cp2k-mace-project" \
+      org.opencontainers.image.title="cp2k-mace" \
+      org.opencontainers.image.description="CP2K + MACE pipeline: zero-trust master-worker DFT, blockchain ledger, web panel" \
+      org.opencontainers.image.licenses="MIT"
