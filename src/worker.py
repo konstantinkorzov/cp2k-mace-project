@@ -117,13 +117,20 @@ def _worker_password(arg: str | None) -> str | None:
     return None
 
 
-def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger):
+def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger,
+                       seed: int | None = None):
     """
     Генерирует ОДНУ случайную структуру нужного размера.
-    Seed случайный на каждую задачу: разные воркеры (и разные попытки) не должны
-    выдавать одинаковые кластеры.
+
+    seed приходит от мастера В ЗАДАНИИ (не константа: время запуска + номер
+    задания), поэтому кадр воспроизводим и не повторяется между запусками.
+    Если seed не передан — берём системный энтропийный.
+
+    :return: (coords, фактический seed)
     """
-    seed = random.SystemRandom().randrange(10 ** 9)
+    if seed is None:
+        seed = random.SystemRandom().randrange(10 ** 9)
+    seed = int(seed)
     template = cfg.get("template")
     logger.info(f"Генерирую структуру: n={n_atoms}, dim={dim}, seed={seed}, "
                 f"элемент {cfg['element']}, min_dist={structure_generator.min_dist(cfg):.2f}, "
@@ -139,7 +146,7 @@ def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger
                 seed=seed, max_attempts=5)
             logger.info(f"Структура из шаблона готова: {coords.shape[0]} атомов "
                         f"(задание {struct_id})")
-            return coords
+            return coords, seed
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Шаблон не дал валидную структуру ({e}) — "
                            f"генерирую случайную")
@@ -152,7 +159,7 @@ def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger
         max_attempts=5,
     )
     logger.info(f"Структура готова: {coords.shape[0]} атомов (задание {struct_id})")
-    return coords
+    return coords, seed
 
 
 def run_task(task: dict, cfg: dict, logger):
@@ -176,10 +183,16 @@ def run_task(task: dict, cfg: dict, logger):
         logger.warning("Мастер не передал E_iso — E_binding/atom в логе будет отсутствовать")
 
     last_error = "неизвестная ошибка"
+    base_seed = task.get("seed")
 
     for attempt in range(1, LOCAL_RETRIES + 1):
+        # Каждая попытка — своя структура (seed сдвигается), иначе повтор
+        # после несходимости SCF считал бы ту же самую геометрию.
+        attempt_seed = (int(base_seed) + 7919 * (attempt - 1)
+                        if base_seed is not None else None)
         try:
-            coords = generate_structure(n_atoms, dim, cfg, struct_id, logger)
+            coords, used_seed = generate_structure(
+                n_atoms, dim, cfg, struct_id, logger, seed=attempt_seed)
             # Раскладываем формулу по атомам (Al2O3 → 2 Al + 3 O на каждую единицу)
             species = structure_generator.assign_species(
                 n_atoms, cfg, seed=random.SystemRandom().randrange(10 ** 9))
@@ -214,6 +227,7 @@ def run_task(task: dict, cfg: dict, logger):
                 "species": species,
                 "n_atoms": n_atoms,
                 "dim": dim,
+                "seed": used_seed,
                 "cell_size": cp2k_runner.resolve_cell_size(coords, cfg),
                 "element": cfg["element"],
                 "potential": cfg.get("potential"),

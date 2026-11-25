@@ -406,6 +406,27 @@ ATOM_SCHEDULE = {
 # Размерности чередуются: объёмная (3) и плоская (2) структуры через одну.
 DIM_CYCLE = (3, 2)
 
+# Тег запуска мастера. Без него после перезапуска снова выдавался n2_t00000,
+# и в цепочке могли оказаться два блока с ОДИНАКОВЫМ struct_id (структуры
+# при этом разные — воркер генерирует их сам, — но идентификатор задания
+# должен быть уникален, иначе датасет и логи нельзя однозначно разобрать).
+_RUN_TAG = f"{int(time.time()):x}{os.urandom(2).hex()}"
+
+# Сколько заданий добавлять, когда очередь опустела (этап ещё не закрыт).
+# Небольшой избыток нужен, чтобы воркеры не простаивали на пересборке; держать
+# в памяти весь этап (тысячи заданий) смысла нет — при смене этапа они снимаются.
+TASK_REFILL_MIN = 8
+
+
+def _task_seed(task_index: int) -> int:
+    """Опорное число генератора структуры: время запуска + номер задания.
+
+    Не константа: структуры одного размера не должны повторяться между
+    запусками мастера. Значение уходит воркеру в задании и пишется в блок,
+    поэтому кадр воспроизводим: тот же seed даёт ту же геометрию.
+    """
+    return int((time.time_ns() ^ (task_index * 0x9E3779B1)) % (2 ** 31))
+
 
 def schedule_enabled(cfg=None) -> bool:
     """Расписание — единственный режим, поэтому всегда True (оставлено для совместимости)."""
@@ -447,10 +468,12 @@ def schedule_tasks_for_stage(stage: dict, cfg, start_index: int = 0,
     n_atoms = int(stage["n_atoms"])
     count = int(count or stage["blocks"])
     return [{
-        "struct_id": f"n{n_atoms}_t{start_index + i:05d}",
+        "struct_id": f"n{n_atoms}_t{start_index + i:05d}_{_RUN_TAG}",
         "task_index": start_index + i,
         "n_atoms": n_atoms,
         "dim": int(DIM_CYCLE[(start_index + i) % len(DIM_CYCLE)]),
+        # опорное число генератора: воркер не должен брать константу
+        "seed": _task_seed(start_index + i),
         "attempts": 0,
     } for i in range(count)]
 
@@ -1026,6 +1049,8 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
             "worker_elapsed_sec": payload.get("elapsed"),
             "worker_energy_claim_ev": payload.get("energy_ev"),
             "worker_wfn_size": payload.get("wfn_size"),
+            # seed геометрии: тот же seed + та же версия генератора = тот же кадр
+            "seed": payload.get("seed"),
             "verified_at": time.time(),
         },
     }
@@ -1371,9 +1396,13 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             stage = stage_for_height(chain_mod.next_seq(CONFIG["output_dir"]) - 1, CONFIG)
             if stage["done"] < stage["blocks"]:
                 start = int(CONFIG.get("_task_counter", 0))
+                # Избыток задач — буфер против отвалов воркеров, но не весь этап:
+                # на этапе n=55 это 3968 заданий, которые всё равно снимутся
+                # при смене размера.
+                buffer = max(TASK_REFILL_MIN, 2 * len(registered_workers))
                 pending_tasks.extend(
-                    schedule_tasks_for_stage(stage, CONFIG, start, count=stage["blocks"]))
-                CONFIG["_task_counter"] = start + stage["blocks"]
+                    schedule_tasks_for_stage(stage, CONFIG, start, count=buffer))
+                CONFIG["_task_counter"] = start + buffer
 
         if not pending_tasks:
             return {"status": "empty", "message": "Нет доступных задач"}
@@ -1388,6 +1417,8 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             "n_atoms": task["n_atoms"],
             "dim": task["dim"],
             "attempts": task.get("attempts", 0),
+            # опорное число генератора структуры (время запуска + номер задания)
+            "seed": task.get("seed"),
             "cfg": task_cfg_payload(CONFIG),
         }
 
