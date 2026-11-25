@@ -772,6 +772,10 @@ python3 mace_pipeline/run_mace.py --skip-train --model path/to.model
 
 ### Как проверить работоспособность
 
+Все команды — **внутри контейнера** (там есть CP2K, numpy, fastapi и остальное).
+На хосте достаточно только `numpy` для `test_zero_trust.py`; `check_project.py` нужны также
+CP2K, `requests`, `fastapi` и `uvicorn`.
+
 ```bash
 # Оффлайн-тесты (CP2K НЕ нужен): разбор wfn, keep-best, цикл мастер–воркер
 python3 test/test_zero_trust.py        # 118/118 проверок
