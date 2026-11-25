@@ -14,6 +14,9 @@ src/webserver/fullchain.pem
 __pycache__/
 *.pyc
 
+# генерируется тестами заново при каждом запуске
+test/_test_env/
+
 # --- Node ---
 node_modules/
 

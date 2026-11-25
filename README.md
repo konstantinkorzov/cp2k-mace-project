@@ -700,7 +700,7 @@ python3 mace_pipeline/run_mace.py --skip-train --model path/to.model
 
 ```bash
 # Оффлайн-тесты (CP2K НЕ нужен): разбор wfn, keep-best, цикл мастер–воркер
-python3 test/test_zero_trust.py        # 93/93 проверок
+python3 test/test_zero_trust.py        # 118/118 проверок
 
 # В контейнере, где есть CP2K: зафиксировать формат файла состояния
 python3 test/probe_wfn.py /workspace/results/Cu/<PROJECT>-RESTART.wfn --log /workspace/results/Cu/<PROJECT>.out
@@ -710,6 +710,8 @@ python3 test/probe_wfn.py /workspace/results/Cu/<PROJECT>-RESTART.wfn --log /wor
 Тесты подкладывают заглушки тяжёлых зависимостей в `test/_test_env/` и проверяют:
 разбор файла состояния и его заголовка, генерацию структуры и сборку payload'а воркером,
 приёмку состояния мастером (сходимость/отказ/несовместимый restart), цикл мастер–воркер.
+Каталог `test/_test_env/` создаётся заново при каждом запуске (копия `src/` + заглушки)
+и в git не хранится.
 
 Дальше всё как обычно: `./run.sh --cpu --name master --port 8443 --port2 8000 -d`,
 веб-панель → «Запустить main.py», затем воркеры (`./run.sh ... --worker`).

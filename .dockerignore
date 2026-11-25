@@ -9,6 +9,7 @@ mace_output/
 node_modules/
 __pycache__/
 *.pyc
+test/_test_env/
 .venv/
 *.tar
 *.tar.gz
