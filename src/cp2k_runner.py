@@ -128,7 +128,12 @@ CP2K_PARAMS = {
     # 20 Å для Cu2 даёт dE = 0; 14 Å — уже +8.6 мэВ (периодические образы), поэтому не меньше 20.
     "box_padding": 6.0,
     "min_cell_size": 20.0,
-    "max_cell_size": 30.0,
+    # Потолок ячейки: 55–150 атомов требуют 30–60 Å; жёсткий предел ниже нельзя —
+    # периодические образы начнут искажать геометрию (растёт энергия).
+    "max_cell_size": 100.0,
+    # Таймаут одного прогона CP2K; для больших систем увеличивается через
+    # config.json → cp2k_timeout_sec (секунды).
+    "cp2k_timeout_sec": 86400,
     "ot_minimizer": "DIIS",
     "ot_preconditioner": "FULL_SINGLE_INVERSE",
     "ot_energy_gap": 0.0,      # 0 — не печатать (дефолт CP2K 0.08 Ha)
@@ -1110,7 +1115,7 @@ def verify_state_from_wfn(coords, wfn_path: str, cfg: dict, project: str = "mast
     try:
         project = re.sub(r"[^a-zA-Z0-9_]", "_", project)
         max_scf = int(max_scf or RESTART_VERIFY_SCF)
-        timeout = int(timeout or CP2K_TIMEOUT)
+        timeout = int(timeout or cfg.get("cp2k_timeout_sec") or CP2K_TIMEOUT)
 
         local_wfn = os.path.join(workdir, f"{project}-RESTART.wfn")
         shutil.copyfile(wfn_path, local_wfn)
@@ -1378,7 +1383,8 @@ def calculate_isolated_atom_energy(cfg: dict):
     write_cp2k_input(inp_path, project, coords, cfg)
 
     is_cp2k_error, rc = run_cp2k_with_live_log(
-        inp_path, out_path, CP2K_TIMEOUT, cfg["output_dir"], cfg
+        inp_path, out_path, int(cfg.get("cp2k_timeout_sec") or CP2K_TIMEOUT),
+        cfg["output_dir"], cfg
     )
     if cfg.get("cleanup_cubes", CP2K_PARAMS["cleanup_cubes"]):
         cleanup_cube_files(cfg["output_dir"], project)
@@ -1473,7 +1479,8 @@ def run_dft_for_single_structure(coords, n_atoms, dim, struct_id, cfg,
     write_cp2k_input(inp_path, project, coords, cfg)
     t0 = time.time()
     is_cp2k_error, rc = run_cp2k_with_live_log(
-        inp_path, out_path, CP2K_TIMEOUT, cfg["output_dir"], cfg
+        inp_path, out_path, int(cfg.get("cp2k_timeout_sec") or CP2K_TIMEOUT),
+        cfg["output_dir"], cfg
     )
     elapsed = time.time() - t0
 

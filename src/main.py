@@ -68,7 +68,19 @@ from config_loader import Config
 
 
 # ---------- КОНСТАНТЫ ----------
-TASK_TIMEOUT = 3600        # секунды ожидания ответа от воркера
+TASK_TIMEOUT = 3600        # секунды ожидания ответа от воркера (по умолчанию)
+
+
+def _task_timeout() -> int:
+    """Таймаут задачи: config.json → task_timeout_sec.
+
+    Для больших систем (55+ атомов) один расчёт идёт часы-дни, поэтому
+    значение в config.json переопределяет константу.
+    """
+    try:
+        return int(CONFIG.get("task_timeout_sec") or TASK_TIMEOUT)
+    except Exception:  # noqa: BLE001
+        return TASK_TIMEOUT
 MAX_TASK_ATTEMPTS = 5      # сколько раз задача возвращается в очередь (ошибка/провал проверки)
 
 # Допуски дешёвых проверок геометрии
@@ -1141,15 +1153,16 @@ def register_worker(reg: WorkerRegistration):
 
 
 def _expire_tasks(now: float | None = None) -> list[str]:
-    """Возвращает в очередь задачи, которые воркеры не сдали за TASK_TIMEOUT."""
+    """Возвращает в очередь задачи, которые воркеры не сдали за _task_timeout()."""
     expired = []
+    limit = _task_timeout()
     with task_queue_lock:
         now = now if now is not None else time.time()
         for sid in [s for s, info in active_tasks.items()
-                    if now - info["time_sent"] > TASK_TIMEOUT]:
+                    if now - info["time_sent"] > limit]:
             info = active_tasks.pop(sid)
             print(f"[Master Watchdog] Задача {sid} (воркер {info['worker_id']}) просрочена "
-                  f"(таймаут {TASK_TIMEOUT} с), возвращаем в очередь.")
+                  f"(таймаут {limit} с), возвращаем в очередь.")
             _requeue_or_fail(info["task"], "timeout", requeue_always=True)
             expired.append(sid)
     return expired
@@ -1192,14 +1205,15 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
 
         # Проверка таймаута зависших задач (Watchdog)
         now = time.time()
+        limit = _task_timeout()
         expired_ids = [
             sid for sid, info in active_tasks.items()
-            if now - info["time_sent"] > TASK_TIMEOUT
+            if now - info["time_sent"] > limit
         ]
         for sid in expired_ids:
             info = active_tasks.pop(sid)
             print(f"[Master Watchdog] Задача {sid} (воркер {info['worker_id']}) просрочена "
-                  f"(таймаут {TASK_TIMEOUT} с), возвращаем в очередь.")
+                  f"(таймаут {limit} с), возвращаем в очередь.")
             _requeue_or_fail(info["task"], "timeout", requeue_always=True)
 
         # Одна задача на воркера: пока не сдал/не истёк таймаут — новую не даём
@@ -1210,7 +1224,7 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
                     "status": "busy",
                     "struct_id": sid,
                     "age_sec": age,
-                    "retry_after_sec": max(0, int(TASK_TIMEOUT - age)),
+                    "retry_after_sec": max(0, int(limit - age)),
                 }
 
         if not pending_tasks and schedule_enabled(CONFIG):
@@ -1320,10 +1334,10 @@ def submit_result(result: TaskResult):
         task_data = info["task"]
 
         # Мастер занят сборкой цепочки: работу не принимаем, но задачу НЕ снимаем —
-        # она останется за воркером и вернётся в очередь по таймауту TASK_TIMEOUT.
+        # она останется за воркером и вернётся в очередь по таймауту _task_timeout().
         if BUSY.is_set():
             print(f"[Master] занят синхронизацией: {sid} остаётся за воркером {w_id}, "
-                  f"ответ busy; вернётся по таймауту {TASK_TIMEOUT} с")
+                  f"ответ busy; вернётся по таймауту {_task_timeout()} с")
             return {"status": "busy", "reason": "master is syncing"}
 
         active_tasks.pop(sid)

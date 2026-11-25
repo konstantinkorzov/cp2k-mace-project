@@ -20,7 +20,9 @@ import numpy as np
 # ============================================================
 # Параметры генерации структур — константы (в config.json их нет).
 # ============================================================
-BOX_MARGIN = 4.0               # куб генерации: max_dist * sqrt(n) * BOX_MARGIN
+BOX_MARGIN = 1.5               # куб генерации = max_dist * n^(1/3) * BOX_MARGIN
+# Раньше было max_dist*sqrt(n)*4: для 55 атомов это ~118 Å — атомы разлетались
+# в облако, а ячейка CP2K упиралась в предел. Кластер растёт как n^(1/3).
 RANDOM_SEED = 42               # воспроизводимость
 MAX_ATTEMPTS_PER_ATOM = 10000  # попыток на размещение одного атома
 
@@ -80,7 +82,8 @@ def max_dist(cfg: dict) -> float:
 
 
 def _compute_box_size(n_atoms: int, cfg: dict) -> float:
-    return max_dist(cfg) * np.sqrt(n_atoms) * BOX_MARGIN
+    """Куб генерации: растёт как радиус шара (n^(1/3)), а не как sqrt(n)."""
+    return max_dist(cfg) * (n_atoms ** (1.0 / 3.0)) * BOX_MARGIN
 
 
 def _random_point(dim, box_size):

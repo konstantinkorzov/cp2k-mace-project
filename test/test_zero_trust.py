@@ -769,7 +769,8 @@ def busy_tests():
               all(t["struct_id"] != sid for t in main.pending_tasks))
         check("задача остаётся за воркером до таймаута",
               sid in main.active_tasks)
-        main._expire_tasks(now=main.active_tasks[sid]["time_sent"] + main.TASK_TIMEOUT + 1)
+        main._expire_tasks(now=main.active_tasks[sid]["time_sent"]
+                               + main._task_timeout() + 1)
         check("по таймауту задача вернулась в очередь",
               any(t["struct_id"] == sid for t in main.pending_tasks))
 
