@@ -28,6 +28,7 @@ build: build-cpu build-gpu
 build-cpu:
 	docker buildx build \
 		--build-arg CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_psmp \
+		--load \
 		--cache-to type=local,dest=$(CACHE_DIR_CPU),mode=max \
 		--cache-from type=local,src=$(CACHE_DIR_CPU) \
 		-t $(CPU_IMAGE) .
@@ -36,6 +37,7 @@ build-cpu:
 build-gpu:
 	docker buildx build \
 		--build-arg CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_cuda_P100_psmp \
+		--load \
 		--cache-to type=local,dest=$(CACHE_DIR_GPU),mode=max \
 		--cache-from type=local,src=$(CACHE_DIR_GPU) \
 		-t $(GPU_IMAGE) .

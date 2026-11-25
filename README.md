@@ -836,8 +836,9 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u konstantinkorzov --password-stdin
 
 * **Сборка и отправка в реестр (Release):**
   ```bash
-  make release-cpu   # CPU-версия
-  make release-gpu   # GPU-версия
+  make release       # обе версии (cpu + gpu): build → push
+  make release-cpu   # только CPU
+  make release-gpu   # только GPU
   ```
 * **Только локальная сборка:**
   ```bash
