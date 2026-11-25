@@ -4,22 +4,92 @@
 
 ---
 
+## 🚦 С чего начать: с пустой машины до рабочего узла
+
+В репозитории лежит только **код**. CP2K, PyTorch, MACE и Node.js живут в Docker-образе,
+поэтому порядок всегда такой: поставить `git` → склонировать репозиторий → поднять контейнер.
+
+### Шаг 1. git и клонирование (одинаково для Linux и Windows/WSL)
+
+```bash
+sudo apt update && sudo apt install -y git ca-certificates curl
+git clone https://github.com/konstantinkorzov/cp2k-mace-project.git
+cd cp2k-mace-project
+chmod +x run.sh
+```
+
+> На Windows эти команды выполняются **в окне Ubuntu (WSL)**, а не в PowerShell.
+
+### Шаг 2 — только для Windows. WSL2 и Docker Desktop
+
+1. **WSL2** — официальная инструкция: <https://learn.microsoft.com/windows/wsl/install>
+   ```powershell
+   wsl --install            # PowerShell от администратора: ставит WSL2 + Ubuntu
+   # перезагрузить ПК, затем:
+   wsl --set-default-version 2
+   wsl -l -v                # в колонке VERSION должно быть 2
+   ```
+   Если WSL ругается на виртуализацию (`0x80370102`) — включите в BIOS VT-x/AMD-V
+   и компонент Windows «Virtual Machine Platform»:
+   <https://learn.microsoft.com/windows/wsl/troubleshooting#error-0x80370102>
+2. **Docker Desktop**: <https://docs.docker.com/desktop/setup/install/windows-install/>
+   После установки: **Settings → Resources → WSL Integration** → включить вашу Ubuntu.
+3. Проверка (в окне Ubuntu):
+   ```bash
+   docker version           # должны быть и Client, и Server
+   ```
+
+### Шаг 3 — только для Linux. Docker (Ubuntu/Debian)
+
+Docker ставить вручную не обязательно: `run.sh` сам проверит `docker` и при отсутствии
+установит `docker-ce` (нужны `sudo` и интернет). Если ставите сами —
+<https://docs.docker.com/engine/install/ubuntu/>.
+
+Для GPU (`--gpu`) скрипт доставит NVIDIA Container Toolkit:
+<https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
+
+### Шаг 4. Первый запуск
+
+```bash
+./run.sh --cpu --name master --port 8443 --port2 8000 -d   # скачает образ и поднимет мастер
+docker exec -it cp2k-mace-cpu-master bash                  # войти внутрь контейнера
+python3 test/check_project.py                              # health-check: ждём FAIL=0
+```
+
+Веб-панель: <https://127.0.0.1:8443> (сертификат самоподписанный — «Дополнительно → Перейти»).
+
+> ⚠️ Скрипты проекта (`check_project.py`, `main.py`, `worker.py`) запускаются **внутри контейнера**:
+> там есть CP2K, numpy, fastapi и node. На «голом» Linux без контейнера `check_project.py`
+> упадёт на импортах — это не поломка, просто сначала поднимите контейнер.
+> Вариант без Docker описан ниже («Нативно в WSL, без Docker»).
+
+---
+
 ## 📋 Структура проекта
 
 ```text
 cp2k-mace-project/
 ├── Dockerfile
-├── Makefile
-├── package.json               # Настройки и зависимости веб-сервера (Node.js)
+├── Makefile                   # Сборка и публикация образов в GHCR
+├── LICENSE                    # MIT
+├── package.json               # Зависимости веб-панели (Node.js)
 ├── run.sh                     # Главный скрипт автоматизации Docker
 ├── src/
-│   ├── webserver/             # Веб-панель управления (Express, EJS)
-│   ├── main.py                # Мастер: очередь задач (FastAPI) + НЕЗАВИСИМАЯ ВЕРИФИКАЦИЯ результатов
-│   ├── worker.py              # Воркер: генерация структуры + DFT до сходимости + отправка -RESTART.wfn
+│   ├── webserver/             # Веб-панель управления (Express + EJS, 5 вкладок)
+│   │   ├── index.js           # HTTP :8080 и HTTPS :8443
+│   │   ├── procs.js           # Запуск/остановка мастеров, воркеров и MACE
+│   │   ├── reqHandler.js      # API панели
+│   │   └── views/pages/index.ejs
+│   ├── main.py                # Мастер: очередь задач (FastAPI) + независимая проверка
+│   ├── worker.py              # Воркер: структура + SCF до сходимости + отправка -RESTART.wfn
+│   ├── cp2k_runner.py         # CP2K: вход, запуск, разбор E/сил/gap и наблюдаемых
 │   ├── structure_generator.py # Генератор случайных структур (BOX_MARGIN — константа)
-│   ├── cp2k_runner.py         # CP2K: вход, запуск, разбор E/сил/gap, приёмка wfn (CP2K_PARAMS — константы)
+│   ├── chain.py               # Блокчейн-блоки (zip), UTXO, мемпул
+│   ├── crypto.py              # Ed25519, scrypt, шифрование ключей (только stdlib)
+│   ├── wallet.py              # CLI кошелька
+│   ├── webwallet.py           # JSON-кошелёк для веб-панели
+│   ├── wallet_store.py        # SQLite-хранилище кошельков
 │   ├── identity.py            # Идентичность воркера: 256-битный ключ, pubkey_hash
-│   ├── chain.py               # Блокчейн-блоки (zip): header, wfn, dft
 │   ├── master-cli.py          # CLI управления работающим мастером
 │   └── config.json            # Параметры расчёта (MACE здесь нет)
 ├── mace_pipeline/             # MACE отдельно от мастера: обучение, BFGS, HTML
@@ -28,41 +98,40 @@ cp2k-mace-project/
 │   ├── find_minimum.py        # Оптимизация BFGS на MACE-калькуляторе
 │   └── xyz_to_html.py         # Визуализатор результатов в 3D (Three.js)
 ├── test/                      # Тесты
-│   ├── master-worker.py       # legacy: песочница старой матричной схемы (не используется)
-│   ├── test_wfn_verify.py     # legacy: проверка матриц для Cu₃ (не используется)
-│   ├── check_project.py       # Сквозная проверка проекта (модули + реальный Cu2)
-│   └── test_zero_trust.py     # Оффлайн-тесты (CP2K НЕ нужен)
-├── results/                   # Результаты (создаются автоматически)
+│   ├── check_project.py       # Сквозная проверка (модули + реальный Cu2)
+│   ├── test_zero_trust.py     # Оффлайн-тесты (CP2K не нужен), 118 проверок
+│   └── probe_wfn.py           # Зонд формата -RESTART.wfn
+├── results/                   # Результаты (создаются автоматически, в git не хранятся)
 └── README.md
 ```
 
 ---
 
-## 🚀 Локальный запуск на Windows + WSL (папка проекта внутри WSL)
+## 🚀 Локальный запуск на Windows + WSL (подробно)
 
 Первый запуск делайте из WSL (`wsl` в PowerShell), а не из Windows-путей типа
 `\\wsl.localhost\...` — чтобы не было проблем с медленным I/O и путями.
 
-### Шаг 0. Проверка работоспособности (запускать ПЕРВЫМ делом)
+Сами WSL2 и Docker Desktop ставятся по ссылкам из раздела «С чего начать».
+
+### Шаг 0. Каталог проекта
+
+Все команды ниже выполняются **в окне Ubuntu**, из каталога проекта
+(`cd ~/cp2k-mace-project` — его создаёт `git clone` из раздела «С чего начать», Шаг 1).
+
+Проверка работоспособности (`python3 test/check_project.py`) делается **после** подъёма
+контейнера — см. Вариант А ниже. На хосте без контейнера и без Python-зависимостей
+(CP2K, numpy, fastapi) скрипт просто не импортируется — это ожидаемо.
+
+### Вариант А. Docker в WSL (Docker Desktop должен быть установлен)
 
 ```bash
-cd ~/cp2k-mace-project-zerotrust
-python3 test/check_project.py        # или --no-cp2k, если CP2K пока не установлен
-```
-
-Скрипт пишет лог в консоль и в `results/check_project.log`, а в конце печатает блок
-«ВСТАВЬ ЭТО В ЧАТ». Он проверит окружение, модули, оффлайн-тесты логики и (если есть CP2K)
-сделает реальную цепочку для Cu₂ и Fe₂: воркер → SCF до сходимости → файл состояния →
-приёмка состояния мастером с выдачей энергии/сил. Ждём `FAIL=0`.
-
-### Вариант А. Docker в WSL (ничего ставить не надо, как в README выше)
-
-```bash
-cd ~/cp2k-mace-project-zerotrust && chmod +x run.sh
+cd ~/cp2k-mace-project && chmod +x run.sh
 # мастер
 ./run.sh --cpu --name master --port 8443 --port2 8000 -d
 docker exec -it cp2k-mace-cpu-master bash
 #    внутри контейнера (любой из вариантов):
+#    python3 test/check_project.py            # health-check: ждём FAIL=0
 #    python3 ./src/main.py --port 8000        # сервер очереди без веб-панели
 #    npm install -g forever && forever -s start ./src/webserver/index.js   # + веб-панель на https://127.0.0.1:8443
 exit
@@ -79,7 +148,7 @@ docker logs -f cp2k-mace-cpu-worker1
 
 ```bash
 sudo apt update && sudo apt install -y python3 python3-pip python3-venv cp2k
-cd ~/cp2k-mace-project-zerotrust
+cd ~/cp2k-mace-project
 python3 -m venv .venv && source .venv/bin/activate
 pip install numpy requests fastapi uvicorn pydantic
 # опционально (только для MACE-этапов, тяжёлые пакеты): pip install mace-torch ase
@@ -185,7 +254,12 @@ node src/webserver/index.js
 
 ## 🖥 1. Быстрый запуск на чистой Linux-машине
 
-Скрипт `run.sh` полностью автоматизирует проверку и установку Docker, настройку драйверов NVIDIA (при запуске с `--gpu`) и монтирование исходного кода.
+Скрипт `run.sh` полностью автоматизирует проверку и установку Docker (`docker-ce`), настройку драйверов NVIDIA (при запуске с `--gpu`) и монтирование исходного кода.
+
+Что нужно на чистой Ubuntu/Debian: `sudo`, интернет и ~40 ГБ свободного диска
+(образ ~13 ГБ для CPU / ~21 ГБ для GPU плюс данные расчётов). Если хотите поставить Docker сами —
+<https://docs.docker.com/engine/install/ubuntu/>. Путь для Windows (WSL2 + Docker Desktop)
+описан в разделе «С чего начать» выше.
 
 ### Шаг 1. Клонирование репозитория
 
@@ -919,7 +993,7 @@ docker pull ghcr.io/konstantinkorzov/cp2k-mace:latest-gpu
 ```bash
 # установка: https://cli.github.com/  (или apt install gh)
 gh auth login                                  # один раз на машине
-cd ~/cp2k-mace-project-zerotrust
+cd ~/cp2k-mace-project
 gh repo create konstantinkorzov/cp2k-mace-project --public --source=. --remote=origin --push
 ```
 
@@ -929,7 +1003,7 @@ gh repo create konstantinkorzov/cp2k-mace-project --public --source=. --remote=o
 2. В терминале:
 
 ```bash
-cd ~/cp2k-mace-project-zerotrust
+cd ~/cp2k-mace-project
 git remote add origin https://github.com/konstantinkorzov/cp2k-mace-project.git
 git push -u origin main
 ```
