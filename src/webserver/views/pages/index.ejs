@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CP2K + MACE — панель управления</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --line: #dfe4ea;
+    --ink: #1f2933;
+    --muted: #6b7785;
+    --accent: #2b6cb0;
+    --green: #2f855a;
+    --red: #c53030;
+    --amber: #b7791f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  header {
+    background: #16222e; color: #e6edf3; padding: 14px 20px;
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .hint { color: #9fb0c0; font-size: 12px; }
+  #statusline { margin-left: auto; font-size: 12px; color: #cbd7e3; display: flex; gap: 14px; }
+  nav.tabs { display: flex; gap: 2px; padding: 0 20px; background: #1e2c3a; }
+  nav.tabs button {
+    background: transparent; border: 0; color: #a9bccd; padding: 10px 16px;
+    cursor: pointer; font-size: 14px; border-bottom: 3px solid transparent;
+  }
+  nav.tabs button.active { color: #fff; border-bottom-color: #63b3ed; }
+  main { padding: 18px 20px 60px; max-width: 1500px; margin: 0 auto; }
+  section.tab { display: none; }
+  section.tab.active { display: block; }
+  .grid { display: grid; grid-template-columns: minmax(320px, 1fr) minmax(420px, 1.3fr); gap: 16px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
+  .card h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px;
+    font: inherit; background: #fff; color: var(--ink);
+  }
+  textarea { min-height: 62px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 140px; }
+  .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button.btn {
+    padding: 7px 14px; border-radius: 5px; border: 1px solid transparent; cursor: pointer;
+    font: inherit; background: var(--accent); color: #fff;
+  }
+  button.btn.secondary { background: #edf2f7; color: var(--ink); border-color: var(--line); }
+  button.btn.danger { background: var(--red); }
+  button.btn:disabled { opacity: .55; cursor: default; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.ok { background: #e6fffa; color: var(--green); }
+  .pill.off { background: #edf2f7; color: var(--muted); }
+  .pill.err { background: #fff5f5; color: var(--red); }
+  .pill.warn { background: #fffaf0; color: var(--amber); }
+  .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .log {
+    background: #0f1720; color: #d5e2ee; font-family: ui-monospace, Consolas, monospace;
+    font-size: 12px; line-height: 1.4; padding: 10px; border-radius: 6px;
+    height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0;
+  }
+  .log.short { height: 240px; }
+  table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.tbl th, table.tbl td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  table.tbl th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  table.tbl td.num { text-align: right; font-family: ui-monospace, Consolas, monospace; }
+  .proc { border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin-bottom: 10px; }
+  .proc .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .proc .head b { font-size: 13px; }
+  .kv { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: var(--muted); }
+  .kv code { color: var(--ink); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    background: #edf2f7; border-radius: 999px; padding: 2px 8px; font-size: 12px;
+    display: inline-flex; gap: 6px; align-items: center;
+  }
+  .chip button { border: 0; background: transparent; cursor: pointer; color: var(--red); font-weight: 700; }
+  .checks { display: flex; flex-direction: column; gap: 4px; max-height: 150px; overflow: auto; }
+  .checks label { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--ink); margin: 0; }
+  .check-row { display: flex; align-items: center; gap: 4px; }
+  .check-row label { flex: 1 1 auto; min-width: 0; }
+  .icon-btn {
+    border: 1px solid var(--line); background: #fff; color: var(--muted);
+    border-radius: 4px; cursor: pointer; font-size: 12px; line-height: 1;
+    padding: 4px 6px;
+  }
+  .icon-btn:hover { color: var(--red); border-color: var(--red); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .err { color: var(--red); font-size: 12.5px; white-space: pre-wrap; }
+  .ok { color: var(--green); font-size: 12.5px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1000px) { .split { grid-template-columns: 1fr; } }
+  details summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>CP2K + MACE</h1>
+  <span class="hint">мастер · воркер · MACE · кошельки — в одном окне</span>
+  <div id="statusline">
+    <span id="st-masters">мастеров: —</span>
+    <span id="st-workers">воркеров: —</span>
+    <span id="st-height">высота: —</span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button data-tab="master" class="active">Мастер</button>
+  <button data-tab="worker">Воркер</button>
+  <button data-tab="mace">MACE</button>
+  <button data-tab="wallet1">Кошелёк 1</button>
+  <button data-tab="wallet2">Кошелёк 2</button>
+</nav>
+
+<main>
+
+<!-- ==================== МАСТЕР ==================== -->
+<section class="tab active" id="tab-master">
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>Запустить мастера</h2>
+        <p class="muted" style="margin-top:-4px">
+          Пустые порт и папка — «авто»: панель сама найдёт свободный порт (с 8000)
+          и отдельный каталог результатов, чтобы мастера не конфликтовали.
+        </p>
+        <div class="row">
+          <div>
+            <label>Порт (пусто = авто)</label>
+            <input type="number" id="m-port" placeholder="авто" min="1" max="65535" />
+          </div>
+          <div>
+            <label>Каталог результатов (пусто = авто)</label>
+            <input type="text" id="m-dir" placeholder="results" />
+          </div>
+          <div>
+            <label>Пароль кошелька</label>
+            <input type="password" id="m-password" value="master" />
+          </div>
+        </div>
+        <div style="margin-top:10px">
+          <label>Пиры (по одному URL в строке, необязательно)</label>
+          <textarea id="m-peers" placeholder="http://127.0.0.1:8001"></textarea>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-master-start">Запустить мастера</button>
+          <span id="m-msg" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Мастера</h2>
+        <div id="master-list" class="muted">пока никто не следит за очередью…</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Лог мастера</h2>
+        <div class="row" style="margin-bottom:8px">
+          <div>
+            <select id="master-log-select"></select>
+          </div>
+          <div style="flex:0 0 auto">
+            <button class="btn secondary" id="master-log-refresh">Обновить</button>
+          </div>
+        </div>
+        <pre class="log" id="master-log"></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== ВОРКЕР ==================== -->
+<section class="tab" id="tab-worker">
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>Запустить воркера</h2>
+        <div class="row">
+          <div>
+            <label>Имя (имя кошелька)</label>
+            <input type="text" id="w-name" placeholder="авто: worker1, worker2…" />
+          </div>
+          <div>
+            <label>Пароль кошелька</label>
+            <input type="password" id="w-password" value="worker" />
+          </div>
+        </div>
+
+        <h3>Адреса мастеров в сети</h3>
+        <p class="muted" style="margin:2px 0 6px">
+          Список строится из мастеров этой панели и адресов, которые мастер
+          сообщает воркеру (его пиры). Отметьте нужные — они уйдут воркеру.
+        </p>
+        <div class="checks" id="w-master-checks"></div>
+        <div style="margin-top:8px">
+          <label>Добавить адрес вручную</label>
+          <div class="row">
+            <div><input type="text" id="w-manual" placeholder="http://192.168.1.10:8000" /></div>
+            <div style="flex:0 0 auto"><button class="btn secondary" id="w-add-manual">Добавить</button></div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn" id="btn-worker-start">Запустить воркера</button>
+          <span id="w-msg" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Воркеры</h2>
+        <div id="worker-list" class="muted">ни одного воркера…</div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Лог воркера</h2>
+        <div class="row" style="margin-bottom:8px">
+          <div><select id="worker-log-select"></select></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="worker-log-refresh">Обновить</button></div>
+        </div>
+        <pre class="log" id="worker-log"></pre>
+      </div>
+
+      <div class="card">
+        <h2>Лог CP2K</h2>
+        <div class="row" style="margin-bottom:8px">
+          <div><select id="cp2k-dir"></select></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="cp2k-refresh">Обновить</button></div>
+        </div>
+        <div class="muted" id="cp2k-file" style="margin-bottom:6px">файл не выбран</div>
+        <pre class="log short" id="cp2k-log"></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== MACE ==================== -->
+<section class="tab" id="tab-mace">
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>MACE-пайплайн</h2>
+        <p class="muted" style="margin-top:-4px">
+          Блокчейн → train.xyz → обучение MACE → поиск минимума → HTML-отчёт.
+          Без интернета обучение с foundation_model недоступно; используйте
+          <code>--skip-train</code> с готовой моделью.
+        </p>
+        <div class="row">
+          <div>
+            <label>Элемент</label>
+            <input type="text" id="mace-element" placeholder="Cu" />
+          </div>
+          <div>
+            <label>Каталог результатов</label>
+            <select id="mace-dir"></select>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div>
+            <label>Готовая модель (.model, необязательно)</label>
+            <input type="text" id="mace-model" placeholder="/workspace/mace_pipeline/out/model.model" />
+          </div>
+          <div>
+            <label>Каталог вывода (необязательно)</label>
+            <input type="text" id="mace-out" placeholder="mace_pipeline/out" />
+          </div>
+        </div>
+        <div class="actions">
+          <label style="display:flex;gap:6px;align-items:center;margin:0">
+            <input type="checkbox" id="mace-skip-train" /> пропустить обучение
+          </label>
+          <label style="display:flex;gap:6px;align-items:center;margin:0">
+            <input type="checkbox" id="mace-skip-search" /> пропустить поиск минимума
+          </label>
+        </div>
+        <div class="actions">
+          <button class="btn" id="btn-mace-start">Запустить MACE</button>
+          <span id="mace-msg" class="muted"></span>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h2>Лог MACE</h2>
+        <div class="row" style="margin-bottom:8px">
+          <div><select id="mace-log-select"></select></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" id="mace-log-refresh">Обновить</button></div>
+        </div>
+        <pre class="log" id="mace-log"></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== КОШЕЛЬКИ ==================== -->
+<section class="tab" id="tab-wallet1"></section>
+<section class="tab" id="tab-wallet2"></section>
+
+</main>
+
+<script>
+/* ==================== общее ==================== */
+
+const $ = (sel, root) => (root || document).querySelector(sel);
+const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function api(url, body) {
+  const opts = body === undefined ? {} : {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+  try {
+    const r = await fetch(url, opts);
+    const data = await r.json();
+    return data;
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+let overview = { processes: [], masters: [], dirs: [] };
+let network = [];
+let activeTab = 'master';
+
+/* ==================== вкладки ==================== */
+
+$$('nav.tabs button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    activeTab = btn.dataset.tab;
+    $$('nav.tabs button').forEach((b) => b.classList.toggle('active', b === btn));
+    $$('section.tab').forEach((s) => s.classList.toggle('active', s.id === 'tab-' + activeTab));
+    if (activeTab === 'worker') { refreshNetwork(); refreshCp2k(); }
+    if (activeTab.startsWith('wallet')) refreshWallet(activeTab);
+  });
+});
+
+/* ==================== обзор ==================== */
+
+async function refreshOverview() {
+  const data = await api('/api/overview');
+  if (!data.ok) return;
+  overview = data;
+
+  const masters = data.processes.filter((p) => p.kind === 'master');
+  const workers = data.processes.filter((p) => p.kind === 'worker');
+  const mace = data.processes.filter((p) => p.kind === 'mace');
+
+  const aliveMasters = data.masters.length + (data.external || []).length;
+  const aliveWorkers = workers.filter((p) => p.alive).length;
+  const topHeight = Math.max(
+    data.masters.reduce((m, p) => Math.max(m, (p.info && p.info.height) || 0), 0),
+    (data.external || []).reduce((m, p) => Math.max(m, p.height || 0), 0));
+  $('#st-masters').textContent = 'мастеров: ' + aliveMasters;
+  $('#st-workers').textContent = 'воркеров: ' + aliveWorkers;
+  $('#st-height').textContent = 'высота: ' + topHeight;
+
+  renderMasters(masters, data.masters, data.external || []);
+  renderWorkers(workers);
+  renderMace(mace);
+  fillDirSelects(data.dirs);
+  refreshLogSelects(masters, workers, mace);
+}
+
+function fillDirSelects(dirs) {
+  const mk = (sel, keepDefault) => {
+    const el = $(sel);
+    if (!el) return;
+    const cur = el.value;
+    el.innerHTML = (keepDefault ? '<option value="">по умолчанию (results)</option>' : '')
+      + dirs.map((d) => `<option value="${esc(d)}">${esc(String(d).replace((overview.root || '') + '/', ''))}</option>`).join('');
+    if (cur) el.value = cur;
+  };
+  mk('#cp2k-dir', false);
+  mk('#mace-dir', true);
+  if (!dirs.length) {
+    $('#cp2k-dir').innerHTML = '<option value="">results</option>';
+  }
+  fillWalletRoots(dirs);
+}
+
+function renderMasters(all, alive, external) {
+  const box = $('#master-list');
+  if (!all.length && !(external && external.length)) {
+    box.innerHTML = '<span class="muted">мастеров нет</span>';
+    return;
+  }
+  const externCards = (external || []).map((e) => `
+    <div class="proc">
+      <div class="head">
+        <b>мастер :${e.port}</b> <span class="pill warn">запущен вне панели</span>
+        <span class="mono muted">${esc(e.url)}</span>
+      </div>
+      <div class="kv">
+        <span>элемент <code>${esc(e.element)}</code></span>
+        <span>высота <code>${e.height == null ? '—' : e.height}</code></span>
+        <span>очередь <code>${e.pending == null ? '—' : e.pending}</code></span>
+        <span>в работе <code>${e.active == null ? '—' : e.active}</code></span>
+      </div>
+      ${(e.peers || []).length ? `<div class="chips" style="margin-top:6px">
+        ${e.peers.map((u) => `<span class="chip">${esc(u)}</span>`).join('')}</div>` : ''}
+      <div class="actions">
+        <span class="muted">остановить можно только из терминала</span>
+      </div>
+    </div>`).join('');
+
+  box.innerHTML = externCards + all.map((p) => {
+    const info = (alive.find((a) => a.id === p.id) || {}).info || null;
+    const status = p.alive
+      ? (info && info.reachable ? '<span class="pill ok">работает</span>' : '<span class="pill warn">запускается…</span>')
+      : '<span class="pill off">остановлен</span>';
+    const peers = (info && info.peers) || p.peers || [];
+    const peerChips = peers.map((u) => `<span class="chip">${esc(u)}<button data-peer-del="${esc(u)}" data-port="${p.port}" title="удалить пир">×</button></span>`).join('')
+      || '<span class="muted">пиров нет</span>';
+    return `
+      <div class="proc">
+        <div class="head">
+          <b>${esc(p.name)}</b> ${status}
+          <span class="mono muted">pid ${p.pid || '—'}</span>
+        </div>
+        <div class="kv">
+          <span>порт <code>${p.port || '—'}</code></span>
+          <span>папка <code>${esc((p.dir || '').replace(overview.root + '/', ''))}</code></span>
+          ${info ? `<span>высота <code>${info.height == null ? '—' : info.height}</code></span>
+          <span>очередь <code>${info.pending == null ? '—' : info.pending}</code></span>
+          <span>в работе <code>${info.active == null ? '—' : info.active}</code></span>
+          <span>воркеров <code>${info.workers == null ? '—' : info.workers}</code></span>` : ''}
+        </div>
+        <h3>Пиры (их увидит воркер)</h3>
+        <div class="chips">${peerChips}</div>
+        <div class="row" style="margin-top:8px">
+          <div><input type="text" placeholder="http://192.168.1.10:8000" data-peer-input="${p.port}" /></div>
+          <div style="flex:0 0 auto"><button class="btn secondary" data-peer-add="${p.port}">Добавить</button></div>
+        </div>
+        <div class="actions">
+          <button class="btn secondary" data-show-log="${p.id}" data-kind="master">Лог</button>
+          ${p.alive ? `<button class="btn danger" data-stop="${p.id}">Остановить</button>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+
+  $$('[data-stop]', box).forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Остановить процесс?')) return;
+    const r = await api('/api/process/stop', { id: b.dataset.stop });
+    if (!r.ok) alert(r.error);
+    refreshOverview();
+  }));
+  $$('[data-show-log]', box).forEach((b) => b.addEventListener('click', () => {
+    if (b.dataset.kind === 'master') showLog('master', b.dataset.showLog);
+  }));
+  $$('[data-peer-add]', box).forEach((b) => b.addEventListener('click', async () => {
+    const port = b.dataset.peerAdd;
+    const input = $(`[data-peer-input="${port}"]`);
+    const url = (input.value || '').trim();
+    if (!url) return;
+    const r = await api('/api/master/peers', { port, action: 'add', url });
+    if (!r.ok) alert(r.error); else input.value = '';
+    refreshOverview();
+  }));
+  $$('[data-peer-del]', box).forEach((b) => b.addEventListener('click', async () => {
+    const r = await api('/api/master/peers', { port: b.dataset.port, action: 'del', url: b.dataset.peerDel });
+    if (!r.ok) alert(r.error);
+    refreshOverview();
+  }));
+}
+
+function renderWorkers(all) {
+  const box = $('#worker-list');
+  if (!all.length) { box.innerHTML = '<span class="muted">воркеров нет</span>'; return; }
+  box.innerHTML = all.map((p) => `
+    <div class="proc">
+      <div class="head">
+        <b>${esc(p.name)}</b>
+        ${p.alive ? '<span class="pill ok">работает</span>' : '<span class="pill off">остановлен</span>'}
+        <span class="mono muted">pid ${p.pid || '—'}</span>
+      </div>
+      <div class="kv"><span>мастера: <code>${esc((p.masters || []).join(', ') || '—')}</code></span></div>
+      <div class="actions">
+        <button class="btn secondary" data-show-log="${p.id}" data-kind="worker">Лог</button>
+        <button class="btn secondary" data-cp2k="1">Лог CP2K</button>
+        ${p.alive ? `<button class="btn danger" data-stop="${p.id}">Остановить</button>` : ''}
+      </div>
+    </div>`).join('');
+
+  $$('[data-stop]', box).forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Остановить воркера?')) return;
+    const r = await api('/api/process/stop', { id: b.dataset.stop });
+    if (!r.ok) alert(r.error);
+    refreshOverview();
+  }));
+  $$('[data-show-log]', box).forEach((b) => b.addEventListener('click', () => showLog('worker', b.dataset.showLog)));
+  $$('[data-cp2k]', box).forEach((b) => b.addEventListener('click', () => {
+    activeTab = 'worker';
+    refreshCp2k();
+  }));
+}
+
+function renderMace(all) {
+  const box = $('#mace-log-select');
+  if (!box) return;
+  // селектор лога MACE собирается в refreshLogSelects
+}
+
+/* ==================== логи ==================== */
+
+const logs = {
+  master: { id: null, offset: 0 },
+  worker: { id: null, offset: 0 },
+  mace: { id: null, offset: 0 },
+};
+
+function refreshLogSelects(masters, workers, mace) {
+  const fill = (sel, list, kind) => {
+    const el = $(sel);
+    if (!el) return;
+    const cur = logs[kind].id;
+    el.innerHTML = list.length
+      ? list.map((p) => `<option value="${p.id}">${esc(p.name)}${p.alive ? '' : ' (остановлен)'}</option>`).join('')
+      : '<option value="">—</option>';
+    if (cur && list.some((p) => p.id === cur)) el.value = cur;
+    else if (list.length) logs[kind].id = list[0].id;
+  };
+  fill('#master-log-select', masters, 'master');
+  fill('#worker-log-select', workers, 'worker');
+  fill('#mace-log-select', mace, 'mace');
+
+  $$('#master-log-select,#worker-log-select,#mace-log-select').forEach((el) => {
+    if (el.dataset.bound) return;
+    el.dataset.bound = '1';
+    el.addEventListener('change', () => {
+      const kind = el.id.split('-')[0];
+      logs[kind].id = el.value;
+      logs[kind].offset = 0;
+      $('#' + kind + '-log').textContent = '';
+      pollLog(kind);
+    });
+  });
+}
+
+function showLog(kind, id) {
+  logs[kind].id = id;
+  logs[kind].offset = 0;
+  const sel = $('#' + kind + '-log-select');
+  if (sel) sel.value = id;
+  $('#' + kind + '-log').textContent = '';
+  pollLog(kind);
+}
+
+async function pollLog(kind) {
+  const state = logs[kind];
+  const pre = $('#' + kind + '-log');
+  if (!pre || !state.id) return;
+  const data = await api(`/api/process/log?id=${encodeURIComponent(state.id)}&offset=${state.offset}`);
+  if (!data.ok) return;
+  if (data.offset < state.offset) pre.textContent = '';
+  if (data.chunk) pre.textContent += data.chunk;
+  state.offset = data.offset;
+  pre.scrollTop = pre.scrollHeight;
+}
+
+setInterval(() => {
+  if (activeTab === 'master') pollLog('master');
+  if (activeTab === 'worker') pollLog('worker');
+  if (activeTab === 'mace') pollLog('mace');
+}, 1500);
+
+setInterval(refreshOverview, 4000);
+
+$('#master-log-refresh').addEventListener('click', () => pollLog('master'));
+$('#worker-log-refresh').addEventListener('click', () => pollLog('worker'));
+$('#mace-log-refresh').addEventListener('click', () => pollLog('mace'));
+
+/* ==================== запуск мастера ==================== */
+
+$('#btn-master-start').addEventListener('click', async () => {
+  const btn = $('#btn-master-start');
+  btn.disabled = true;
+  $('#m-msg').textContent = 'запускаю…';
+  const peers = $('#m-peers').value.split(/[\s,;]+/).filter(Boolean);
+  const r = await api('/api/master/start', {
+    port: $('#m-port').value || null,
+    dir: $('#m-dir').value.trim() || null,
+    password: $('#m-password').value || 'master',
+    peers,
+  });
+  btn.disabled = false;
+  if (r.ok) {
+    $('#m-msg').innerHTML = `<span class="ok">порт ${r.process.port}, папка ${esc((r.process.dir || '').replace(overview.root + '/', ''))}</span>`;
+    refreshOverview();
+  } else {
+    $('#m-msg').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+  }
+});
+
+/* ==================== сеть и воркеры ==================== */
+
+async function refreshNetwork() {
+  const data = await api('/api/network');
+  if (!data.ok) return;
+  network = data.nodes || [];
+  renderNetwork();
+}
+
+function renderNetwork() {
+  const box = $('#w-master-checks');
+  if (!network.length) {
+    box.innerHTML = '<span class="muted">мастеров пока нет — запустите мастера на вкладке «Мастер»</span>';
+    return;
+  }
+  const chosen = new Set(Array.from(box.querySelectorAll('input:checked')).map((i) => i.value));
+  box.innerHTML = network.map((n) => `
+    <div class="check-row">
+      <label>
+        <input type="checkbox" value="${esc(n.url)}" ${chosen.has(n.url) ? 'checked' : ''} />
+        <span class="mono">${esc(n.url)}</span>
+        <span class="pill ${n.ok ? 'ok' : 'off'}">${n.ok ? 'высота ' + (n.height == null ? '?' : n.height) : 'недоступен'}</span>
+        <span class="muted">${esc(n.source || '')}</span>
+      </label>
+      ${n.manual ? `<button class="icon-btn" data-edit="${esc(n.url)}" title="изменить адрес">✎</button>
+      <button class="icon-btn" data-del="${esc(n.url)}" title="убрать из списка">×</button>` : ''}
+    </div>`).join('');
+
+  $$('[data-del]', box).forEach((b) => b.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    network = network.filter((n) => n.url !== b.dataset.del);
+    renderNetwork();
+  }));
+  $$('[data-edit]', box).forEach((b) => b.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    const next = prompt('Новый адрес мастера', b.dataset.edit);
+    if (!next) return;
+    const url = next.trim();
+    if (!url) return;
+    const node = network.find((n) => n.url === b.dataset.edit);
+    if (node) { node.url = url; node.ok = true; node.height = null; }
+    renderNetwork();
+  }));
+}
+
+$('#w-add-manual').addEventListener('click', () => {
+  const url = ($('#w-manual').value || '').trim();
+  if (!url) return;
+  if (!network.some((n) => n.url === url)) {
+    network.push({ url, ok: true, height: null, source: 'вручную', manual: true });
+  }
+  $('#w-manual').value = '';
+  renderNetwork();
+});
+
+$('#btn-worker-start').addEventListener('click', async () => {
+  const btn = $('#btn-worker-start');
+  const masters = Array.from($('#w-master-checks').querySelectorAll('input:checked')).map((i) => i.value);
+  if (!masters.length) {
+    $('#w-msg').innerHTML = '<span class="err">отметьте хотя бы одного мастера</span>';
+    return;
+  }
+  btn.disabled = true;
+  $('#w-msg').textContent = 'запускаю…';
+  const r = await api('/api/worker/start', {
+    name: $('#w-name').value.trim() || null,
+    password: $('#w-password').value || 'worker',
+    masters,
+  });
+  btn.disabled = false;
+  if (r.ok) {
+    $('#w-msg').innerHTML = `<span class="ok">${esc(r.process.name)} запущен</span>`;
+    refreshOverview();
+  } else {
+    $('#w-msg').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+  }
+});
+
+/* ==================== лог CP2K ==================== */
+
+async function refreshCp2k() {
+  const dir = $('#cp2k-dir').value || '';
+  const data = await api('/api/cp2k/log?dir=' + encodeURIComponent(dir) + '&tail=40000');
+  const pre = $('#cp2k-log');
+  if (!data.ok) { $('#cp2k-file').textContent = data.error || 'нет данных'; return; }
+  if (!data.file) { $('#cp2k-file').textContent = 'в этом каталоге нет .out — расчёт ещё не начинался'; pre.textContent = ''; return; }
+  $('#cp2k-file').textContent = data.file + '  ·  ' + Math.round(data.size / 1024) + ' КБ'
+    + (data.truncated ? '  ·  показан конец файла' : '');
+  pre.textContent = data.content;
+  pre.scrollTop = pre.scrollHeight;
+}
+
+$('#cp2k-refresh').addEventListener('click', refreshCp2k);
+$('#cp2k-dir').addEventListener('change', refreshCp2k);
+setInterval(() => { if (activeTab === 'worker') refreshCp2k(); }, 5000);
+
+/* ==================== MACE ==================== */
+
+$('#btn-mace-start').addEventListener('click', async () => {
+  const btn = $('#btn-mace-start');
+  btn.disabled = true;
+  $('#mace-msg').textContent = 'запускаю…';
+  const r = await api('/api/mace/run', {
+    element: $('#mace-element').value.trim() || null,
+    resultsDir: $('#mace-dir').value || null,
+    outputDir: $('#mace-out').value.trim() || null,
+    model: $('#mace-model').value.trim() || null,
+    skipTrain: $('#mace-skip-train').checked,
+    skipSearch: $('#mace-skip-search').checked,
+  });
+  btn.disabled = false;
+  if (r.ok) {
+    $('#mace-msg').innerHTML = `<span class="ok">запущен (${esc(r.process.id)})</span>`;
+    refreshOverview();
+  } else {
+    $('#mace-msg').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+  }
+});
+
+/* ==================== кошельки ==================== */
+
+const wallets = {
+  wallet1: { state: null, password: 'master' },
+  wallet2: { state: null, password: 'worker' },
+};
+
+function buildWalletTab(tab) {
+  const el = document.getElementById('tab-' + tab);
+  if (!el || el.dataset.built) return;
+  el.dataset.built = '1';
+  const isMaster = tab === 'wallet1';
+  el.innerHTML = `
+    <div class="grid">
+      <div>
+        <div class="card">
+          <h2>${isMaster ? 'Кошелёк мастера' : 'Кошелёк воркера'}</h2>
+          <p class="muted" style="margin-top:-4px">
+            Пароль определяет, чей кошелёк открыть: <code>master</code> — мастер,
+            <code>worker</code> — воркеры. Кошельки лежат в общей базе выбранного
+            каталога результатов.
+          </p>
+          <div class="row">
+            <div>
+              <label>Пароль</label>
+              <input type="password" id="${tab}-password" value="${isMaster ? 'master' : 'worker'}" />
+            </div>
+            <div>
+              <label>Каталог результатов</label>
+              <select id="${tab}-root"></select>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn" id="${tab}-open">Открыть</button>
+            <span class="muted" id="${tab}-msg"></span>
+          </div>
+          <details style="margin-top:10px">
+            <summary>Сменить пароль кошелька</summary>
+            <div class="row" style="margin-top:8px">
+              <div><label>Новый пароль</label><input type="password" id="${tab}-newpass" /></div>
+              <div style="flex:0 0 auto"><button class="btn secondary" id="${tab}-chpass">Сменить</button></div>
+            </div>
+            <p class="muted">Нужно указать новый пароль для единственного кошелька,
+            который подходит под текущий (иначе — роль/имя через CLI).</p>
+          </details>
+        </div>
+
+        <div class="card" id="${tab}-send-card" style="display:none">
+          <h2>Перевести монеты</h2>
+          <div class="row">
+            <div><label>Адрес получателя</label><input type="text" id="${tab}-to" /></div>
+            <div><label>Сумма</label><input type="number" id="${tab}-amount" step="0.1" min="0" /></div>
+            <div><label>Комиссия</label><input type="number" id="${tab}-fee" step="0.01" value="0.1" /></div>
+            <div><label>Мастер</label><select id="${tab}-master"></select></div>
+          </div>
+          <div class="actions">
+            <button class="btn" id="${tab}-send">Отправить</button>
+            <span class="muted" id="${tab}-send-msg"></span>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2>Содержимое</h2>
+          <div id="${tab}-content" class="muted">нажмите «Открыть»</div>
+        </div>
+      </div>
+    </div>`;
+
+  document.getElementById(tab + '-open').addEventListener('click', async () => {
+    const password = document.getElementById(tab + '-password').value;
+    const root = document.getElementById(tab + '-root').value;
+    wallets[tab].password = password;
+    const msg = document.getElementById(tab + '-msg');
+    msg.textContent = 'читаю…';
+    const data = await api('/api/wallet/info', { password, resultsRoot: root || null });
+    if (!data.ok) {
+      msg.innerHTML = `<span class="err">${esc(data.error || 'ошибка')}</span>`;
+      document.getElementById(tab + '-content').innerHTML =
+        '<span class="muted">кошелёк не открыт</span>';
+      return;
+    }
+    msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`;
+    document.getElementById(tab + '-send-card').style.display = 'block';
+    renderWallet(tab, data);
+  });
+
+  document.getElementById(tab + '-chpass').addEventListener('click', async () => {
+    const password = document.getElementById(tab + '-password').value;
+    const newPassword = document.getElementById(tab + '-newpass').value;
+    if (!newPassword) return;
+    const r = await api('/api/wallet/passwd', {
+      password, newPassword, resultsRoot: document.getElementById(tab + '-root').value || null,
+    });
+    const msg = document.getElementById(tab + '-msg');
+    msg.innerHTML = r.ok
+      ? `<span class="ok">пароль ${esc(r.wallet)} изменён — обновите поле пароля</span>`
+      : `<span class="err">${esc(r.error)}</span>`;
+  });
+
+  document.getElementById(tab + '-send').addEventListener('click', async () => {
+    const btn = document.getElementById(tab + '-send');
+    const msg = document.getElementById(tab + '-send-msg');
+    const password = document.getElementById(tab + '-password').value;
+    const sel = document.getElementById(tab + '-master');
+    const masters = sel.value ? [sel.value] : [];
+    btn.disabled = true;
+    msg.textContent = 'отправляю…';
+    const r = await api('/api/wallet/send', {
+      password,
+      resultsRoot: document.getElementById(tab + '-root').value || null,
+      to: document.getElementById(tab + '-to').value.trim(),
+      amount: document.getElementById(tab + '-amount').value,
+      fee: document.getElementById(tab + '-fee').value,
+      masters,
+      role: isMaster ? 'master' : 'worker',
+    });
+    btn.disabled = false;
+    msg.innerHTML = r.ok
+      ? `<span class="ok">tx ${esc(r.txid.slice(0, 16))}… принята ${esc((r.accepted_by || []).join(', '))}</span>`
+      : `<span class="err">${esc(r.error || 'мастер не принял транзакцию')}</span>`;
+    if (r.ok) refreshWallet(tab);
+  });
+}
+
+function renderWallet(tab, data) {
+  const box = document.getElementById(tab + '-content');
+  if (!data.wallets || !data.wallets.length) {
+    box.innerHTML = '<span class="muted">пусто</span>';
+    return;
+  }
+  box.innerHTML = data.wallets.map((w) => {
+    const addrs = w.addresses.map((a) => `
+      <div class="mono muted" style="font-size:11.5px">${esc(a.address)}</div>`).join('');
+    const txs = (w.transactions || []).slice().reverse().map((t) => {
+      const amount = t.received ? '+' + t.received.toFixed(4) : '−' + t.sent.toFixed(4);
+      const cls = t.received ? 'ok' : '';
+      return `<tr>
+        <td class="num">${t.block}</td>
+        <td>${esc(t.type)}</td>
+        <td class="num ${cls}">${amount}</td>
+        <td class="num">${t.fee ? t.fee.toFixed(6) : '—'}</td>
+        <td class="num">${t.confirmations}</td>
+        <td class="mono" title="${esc(t.txid)}">${esc(t.txid.slice(0, 12))}…</td>
+      </tr>`;
+    }).join('');
+
+    return `
+      <div class="proc">
+        <div class="head">
+          <b>${esc(w.role)} / ${esc(w.name)}</b>
+          <span class="pill ok">доступно ${w.totals.available.toFixed(2)}</span>
+          <span class="pill warn">pending ${w.totals.pending.toFixed(2)}</span>
+          <span class="pill off">всего ${w.totals.total.toFixed(2)}</span>
+        </div>
+        <h3>Адреса</h3>
+        ${addrs || '<span class="muted">нет</span>'}
+        <h3>Транзакции</h3>
+        ${txs ? `<table class="tbl">
+          <thead><tr><th>Блок</th><th>Тип</th><th>Сумма</th><th>Комиссия</th>
+          <th>Подтв.</th><th>Txid</th></tr></thead>
+          <tbody>${txs}</tbody></table>`
+        : '<span class="muted">транзакций пока нет</span>'}
+      </div>`;
+  }).join('');
+}
+
+async function refreshWallet(tab) {
+  const st = wallets[tab];
+  if (!st || !st.state) return;
+  const data = await api('/api/wallet/info', {
+    password: document.getElementById(tab + '-password').value,
+    resultsRoot: document.getElementById(tab + '-root').value || null,
+  });
+  if (data.ok) { st.state = data; renderWallet(tab, data); }
+}
+
+function fillWalletRoots(dirs) {
+  for (const tab of ['wallet1', 'wallet2']) {
+    const sel = document.getElementById(tab + '-root');
+    if (!sel) continue;
+    const cur = sel.value;
+    sel.innerHTML = dirs.map((d) =>
+      `<option value="${esc(d)}">${esc(d.replace(overview.root + '/', ''))}</option>`).join('');
+    if (cur) sel.value = cur;
+  }
+  // список мастеров для отправки tx
+  for (const tab of ['wallet1', 'wallet2']) {
+    const sel = document.getElementById(tab + '-master');
+    if (!sel) continue;
+    const nodes = overview.masters.map((m) => `http://127.0.0.1:${m.port}`);
+    const cur = sel.value;
+    sel.innerHTML = nodes.map((u) => `<option value="${esc(u)}">${esc(u)}</option>`).join('');
+    if (cur) sel.value = cur;
+  }
+}
+
+/* ==================== инициализация ==================== */
+
+buildWalletTab('wallet1');
+buildWalletTab('wallet2');
+$('#wallet1-password').value = 'master';
+$('#wallet2-password').value = 'worker';
+
+const _origFillDirs = fillDirSelects;
+fillDirSelects = function (dirs) {
+  _origFillDirs(dirs);
+};
+
+refreshOverview().then(() => {
+  fillWalletRoots(overview.dirs);
+  $('#wallet1-root').value = overview.dirs[0] || '';
+  $('#wallet2-root').value = overview.dirs[0] || '';
+});
+refreshNetwork();
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+# --- данные расчётов и рантайм ---
+results
+results2
+results-*
+.webui
+mace_output
+
+# --- секреты и сертификаты ---
+src/webserver/privkey.pem
+src/webserver/fullchain.pem
+*.db
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- Node ---
+node_modules/
+
+# --- кэш сборки образов ---
+.buildx-cache-cpu
+.buildx-cache-gpu
+
+# --- артефакты CP2K и данные ---
+*.xyz
+*.zip
+*.wfn
+*.out
+*.log
+*.Identifier
+
+# --- ОС ---
+.DS_Store
+Thumbs.db

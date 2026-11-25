@@ -1,0 +1,7 @@
+# Единые окончания строк: в репозитории — LF, скрипты — LF всегда
+* text=auto
+*.sh text eol=lf
+*.py  text eol=lf
+*.pem text eol=lf
+*.zip binary
+*.wfn binary

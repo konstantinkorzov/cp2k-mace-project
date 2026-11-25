@@ -1,0 +1,54 @@
+{
+  "element": {
+    "value": "Cu",
+    "help": "Химический элемент кластеров."
+  },
+  "peers": {
+    "value": [],
+    "help": "URL других мастеров для синхронизации цепочки, напр. ['http://127.0.0.1:8001']. Также --peer и MASTER_PEERS."
+  },
+  "atom_diameter": {
+    "value": 2,
+    "help": "Диаметр атома в Å. От него: min_dist = diameter, max_dist = 2*diameter (константы structure_generator.py)."
+  },
+  "structures_per_n": {
+    "value": {
+      "2": 10,
+      "3": 10,
+      "4": 10,
+      "5": 10
+    },
+    "help": "Сколько структур генерировать для каждого n_atoms (ключи — строки)."
+  },
+  "dimensions_per_n": {
+    "value": {
+      "2": [
+        3
+      ],
+      "3": [
+        2
+      ],
+      "4": [
+        2,
+        3
+      ],
+      "5": [
+        2,
+        3
+      ]
+    },
+    "help": "Какие размерности генерировать для каждого n_atoms."
+  },
+  "verbose_cp2k": {
+    "value": true,
+    "help": "Печатать ключевые строки вывода CP2K в реальном времени."
+  },
+  "restart_max_mb": {
+    "value": 50,
+    "help": "Лимит размера принятого файла состояния (-RESTART.wfn), МБ. Защита мастера от мусора/DoS."
+  },
+  "coinbase_confirmations": {
+    "value": 1,
+    "help": "Сколько блоков должно пройти, чтобы выход стал доступен для траты (coinbase maturity). Меняется через master-cli config set."
+  }
+}

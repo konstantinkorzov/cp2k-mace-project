@@ -1,0 +1,28 @@
+{
+  "element": "Cu",
+  "results_dir": "../results",
+  "output_dir": "../mace_output",
+
+  "foundation_model": "small",
+  "device": "cpu",
+  "seed": 42,
+  "max_num_epochs": 50,
+  "lr": 0.001,
+  "batch_size": 1,
+  "valid_fraction": 0.2,
+  "eval_interval": 5,
+  "energy_weight": 1.0,
+  "forces_weight": 10.0,
+
+  "search": {
+    "n_atoms": 2,
+    "dim": 3,
+    "count": 10,
+    "min_dist": 2.0,
+    "max_dist": 4.0,
+    "fmax": 0.05,
+    "steps": 200
+  },
+
+  "html_name": "structures.html"
+}
