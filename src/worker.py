@@ -131,25 +131,9 @@ def generate_structure(n_atoms: int, dim: int, cfg: dict, struct_id: str, logger
     if seed is None:
         seed = random.SystemRandom().randrange(10 ** 9)
     seed = int(seed)
-    template = cfg.get("template")
-    logger.info(f"Генерирую структуру: n={n_atoms}, dim={dim}, seed={seed}, "
+    logger.info(f"Генерирую случайную структуру: n={n_atoms}, dim={dim}, seed={seed}, "
                 f"элемент {cfg['element']}, min_dist={structure_generator.min_dist(cfg):.2f}, "
-                f"max_dist={structure_generator.max_dist(cfg):.2f}"
-                + (f", шаблон {template.get('source')}" if template else ", случайная"))
-
-    if template:
-        # Мастер задал template_xyz: структура должна быть РЯДОМ с образцом,
-        # а не случайным клубком. Размер подгоняется под n этапа.
-        try:
-            coords = structure_generator.generate_from_template(
-                n_atoms=n_atoms, dim=dim, cfg=cfg, template=template,
-                seed=seed, max_attempts=5)
-            logger.info(f"Структура из шаблона готова: {coords.shape[0]} атомов "
-                        f"(задание {struct_id})")
-            return coords, seed
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Шаблон не дал валидную структуру ({e}) — "
-                           f"генерирую случайную")
+                f"max_dist={structure_generator.max_dist(cfg):.2f}")
 
     coords = structure_generator.generate_random_cluster(
         n_atoms=n_atoms,

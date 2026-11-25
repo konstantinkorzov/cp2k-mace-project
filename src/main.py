@@ -223,17 +223,6 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     # подтверждения чтения restart — константы в cp2k_runner.py (RESTART_VERIFY_SCF).
     cfg.setdefault("restart_max_mb", 50)                  # лимит размера принятого wfn
 
-    # Необязательный шаблон геометрии (template_xyz): путь к XYZ с образцовой
-    # структурой. Файл читает мастер при старте (_load_template) и передаёт
-    # координаты воркеру в задании — воркер деформирует шаблон, а не генерирует
-    # случайный клубок. Сам по себе шаблон не меняет правила приёмки.
-    tpl = str(cfg.get("template_xyz") or "").strip()
-    cfg["template"] = None
-    cfg["template_path"] = None
-    if tpl:
-        cfg["template_path"] = (tpl if os.path.isabs(tpl)
-                                else os.path.join(PROJECT_ROOT, tpl))
-
     # Мастеру обязательно нужно описание системы
     _require(cfg, ["system"])
 
@@ -303,59 +292,6 @@ def load_config(path: str, results_root: str | None = None) -> Config:
 
 
 CONFIG = load_config(CONFIG_PATH)
-
-
-def _load_template(cfg) -> None:
-    """Читает template_xyz и проверяет совместимость с system.
-
-    Шаблон — это сид геометрии, а не часть консенсуса: правила приёмки
-    (состав, min_dist, сходимость SCF) остаются прежними. Поэтому сюда не
-    встраивается никакая магия — только проверки, что из шаблона вообще
-    можно получить допустимую структуру.
-    """
-    cfg["template"] = None
-    path = cfg.get("template_path")
-    if not path:
-        return
-
-    tpl = structure_generator.load_template_xyz(path)
-    frames = tpl["frames"]
-    first = frames[0]
-    counts: dict[str, int] = {}
-    for sym in first["symbols"]:
-        counts[sym] = counts.get(sym, 0) + 1
-
-    comp = cfg["composition"]
-    unknown = sorted(set(counts) - set(comp))
-    if unknown:
-        raise SystemExit(
-            f"[Master] ✗ template_xyz: элементы {unknown} отсутствуют в system.composition "
-            f"{comp}. Шаблон должен быть из той же системы.")
-
-    unit = sum(comp.values())
-    total = sum(counts.values())
-    expected = {sym: cnt / unit for sym, cnt in comp.items()}
-    actual = {sym: cnt / total for sym, cnt in counts.items()}
-    ratio_ok = all(abs(actual.get(sym, 0.0) - exp) <= 0.02 for sym, exp in expected.items())
-
-    d_min = structure_generator.min_dist(cfg)
-    d_tpl = structure_generator.template_min_distance(tpl)
-    if d_tpl < d_min * MIN_DIST_TOLERANCE:
-        raise SystemExit(
-            f"[Master] ✗ template_xyz: минимальное расстояние в шаблоне {d_tpl:.3f} Å "
-            f"меньше допустимого {d_min * MIN_DIST_TOLERANCE:.3f} Å "
-            f"(min_dist = {d_min:.3f} = system.atom_diameter × {structure_generator.MIN_DIST_FACTOR}). "
-            f"Уменьшите atom_diameter или возьмите другой шаблон.")
-
-    sizes = sorted({len(f["coords"]) for f in frames})
-    cfg["template"] = tpl
-    print(f"[Master] 🧩 шаблон геометрии: {tpl['source']} — кадров {len(frames)}, "
-          f"атомов {sizes}, min d = {d_tpl:.3f} Å; состав {counts}")
-    if not ratio_ok:
-        print(f"[Master] ⚠ состав шаблона {counts} не пропорционален system.composition "
-              f"{comp} — сорт атомов будет назначен по формуле, шаблон задаёт только геометрию")
-    print("[Master] 🧩 воркер будет не генерировать случайный кластер, а деформировать шаблон "
-          "(шум + поворот), размер подгоняется под n этапа")
 
 
 # ---------- CLI / Порт ----------
@@ -519,9 +455,6 @@ def task_cfg_payload(cfg) -> dict:
         "formula_size": cfg.get("formula_size") or 1,
         "charge": cfg.get("charge") or 0,
         "multiplicity": cfg.get("multiplicity") or 0,
-        # шаблон геометрии (если задан template_xyz): воркер деформирует его,
-        # а не генерирует случайный клубок
-        "template": cfg.get("template"),
         # энергия изолированного атома считается ТОЛЬКО мастером (при старте)
         # и передаётся воркеру для лога E_binding/atom
         "e_isolated_atom": cfg.get("e_isolated_atom"),
@@ -2347,7 +2280,6 @@ def _main_impl():
 
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
     _load_mempool()
-    _load_template(CONFIG)
 
     # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос
     conn = wallet_store.open_db(CONFIG["wallet_store_db"])
