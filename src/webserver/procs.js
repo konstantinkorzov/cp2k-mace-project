@@ -92,6 +92,19 @@ function resolveDir(dir) {
     return path.isAbsolute(dir) ? dir : path.join(ROOT, dir);
 }
 
+/** Порт мастера по умолчанию из src/config.json (ключ "port"). */
+function configuredMasterPort() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(path.join(ROOT, 'src', 'config.json'), 'utf8'));
+        const entry = raw.port;
+        const value = (entry && typeof entry === 'object' && 'value' in entry) ? entry.value : entry;
+        const port = parseInt(value, 10);
+        return Number.isInteger(port) && port > 0 && port < 65536 ? port : 8000;
+    } catch (e) {
+        return 8000;
+    }
+}
+
 function start(rec, cmd, args, extraEnv) {
     const logFile = path.join(LOG_DIR, rec.id + '.log');
     const fd = fs.openSync(logFile, 'a');
@@ -138,7 +151,7 @@ async function startMaster(opts = {}) {
     const password = String(opts.password || 'master');
     let port = parseInt(opts.port, 10);
     if (!Number.isInteger(port) || port <= 0) {
-        port = await pickPort(8000);
+        port = await pickPort(configuredMasterPort());
     } else if (!(await portFree(port))) {
         throw new Error(`порт ${port} занят — укажите другой или оставьте «авто»`);
     }
@@ -316,14 +329,19 @@ function getJson(url, timeoutMs = 1200) {
 async function discoverMasters(from = 8000, to = 8010) {
     const skip = new Set([...processes.values()]
         .filter((r) => r.kind === 'master' && isAlive(r.pid)).map((r) => r.port));
-    const out = [];
+    const ports = [];
     for (let port = from; port <= to; port += 1) {
-        if (skip.has(port)) continue;
+        if (!skip.has(port)) ports.push(port);
+    }
+    // параллельно: последовательный опрос 10 портов занимал ~10 с
+    const found = await Promise.all(ports.map(async (port) => {
         const h = await getJson(`http://127.0.0.1:${port}/chain/height`);
-        if (!h || typeof h.element !== 'string') continue;
-        const queue = await getJson(`http://127.0.0.1:${port}/queue-status`);
-        const peers = await getJson(`http://127.0.0.1:${port}/admin/peers`);
-        out.push({
+        if (!h || typeof h.element !== 'string') return null;
+        const [queue, peers] = await Promise.all([
+            getJson(`http://127.0.0.1:${port}/queue-status`),
+            getJson(`http://127.0.0.1:${port}/admin/peers`),
+        ]);
+        return {
             port,
             url: `http://127.0.0.1:${port}`,
             element: h.element,
@@ -332,9 +350,9 @@ async function discoverMasters(from = 8000, to = 8010) {
             pending: queue ? queue.pending : null,
             active: queue ? queue.active : null,
             peers: peers ? (peers.peers || []) : [],
-        });
-    }
-    return out;
+        };
+    }));
+    return found.filter(Boolean);
 }
 
 /** Самый свежий .out CP2K в каталоге результатов (для вкладки «Воркер»). */
@@ -392,6 +410,7 @@ module.exports = {
     knownResultsDirs,
     latestCp2kLog,
     discoverMasters,
+    configuredMasterPort,
     pickPort,
     portFree,
     isAlive,

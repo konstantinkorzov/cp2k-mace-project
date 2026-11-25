@@ -18,6 +18,7 @@ RESTART_VERIFY_SCF шагов.
 import os
 import sys
 import time
+import json
 import base64
 import random
 import logging
@@ -35,6 +36,19 @@ RETRY_DELAY = 5          # секунд между попытками подкл
 LOCAL_RETRIES = 3        # сколько раз воркер локально повторяет задачу (новая структура)
 PEER_REFRESH_SEC = 60    # как часто спрашивать у мастеров адреса других мастеров
 MAX_MASTERS = 32         # сколько адресов мастеров воркер готов держать
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _config_defaults() -> dict:
+    """Значения из src/config.json (формат {"value": ..., "help": ...})."""
+    try:
+        with open(os.path.join(PROJECT_ROOT, "src", "config.json"), encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
+            for k, v in raw.items()}
 
 
 def setup_logger(worker_id: str, log_dir: str):
@@ -321,8 +335,11 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
 
 def main():
     # Автоматически считываем переменные окружения, переданные через Docker (или fallback на дефолты)
-    default_server = os.environ.get("MASTER_HOST", "host.docker.internal")
-    default_port = int(os.environ.get("MASTER_PORT", "8000"))
+    cfg_defaults = _config_defaults()
+    default_server = (os.environ.get("MASTER_HOST")
+                      or str(cfg_defaults.get("worker_server") or "host.docker.internal"))
+    default_port = int(os.environ.get("MASTER_PORT")
+                       or cfg_defaults.get("worker_port") or 8000)
 
     parser = argparse.ArgumentParser(description="Запуск воркера CP2K")
     parser.add_argument("--port", type=int, default=default_port, help="Порт сервера main.py")

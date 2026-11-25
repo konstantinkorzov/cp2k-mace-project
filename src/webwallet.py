@@ -303,6 +303,17 @@ def tx_details(root: str, txid: str, masters: list[str] | None = None) -> dict:
             "error": "транзакция не найдена ни в блоках, ни в мемпуле известных мастеров"}
 
 
+def locked_utxos(masters: list[str] | None) -> set[tuple[str, int]]:
+    """Выходы, уже потраченные в мемпулах: их нельзя тратить второй раз."""
+    locked = set()
+    for tx in _mempool(masters).values():
+        for i in tx.get("inputs", []):
+            if i.get("coinbase"):
+                continue
+            locked.add((i.get("txid"), int(i.get("vout", -1))))
+    return locked
+
+
 def send(root: str, password: str, to: str, amount: float, fee: float,
          masters: list[str], confirmations: int, role: str | None,
          name: str | None) -> dict:
@@ -321,9 +332,12 @@ def send(root: str, password: str, to: str, amount: float, fee: float,
     wallet = wallets[0]
 
     tx = chain.build_wallet_transfer(wallet, element_dir, to, amount, fee=fee,
-                                     confirmations=confirmations)
+                                     confirmations=confirmations,
+                                     exclude=locked_utxos(masters))
     if tx is None:
-        return {"ok": False, "error": "недостаточно подтверждённых средств"}
+        return {"ok": False,
+                "error": "недостаточно подтверждённых средств (часть может быть "
+                         "заблокирована неподтверждёнными транзакциями)"}
 
     accepted_by = []
     attempts = []

@@ -874,11 +874,13 @@ function buildWalletTab(tab) {
     }
     msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
       + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0}</span>`
+      + ` <span class="muted">· обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`
       + ((data.also_matched || []).length
         ? ` <span class="muted">(этот же пароль есть у: ${esc(data.also_matched.join(', '))} —
            они показаны в своей вкладке)</span>`
         : '');
     document.getElementById(tab + '-send-card').style.display = 'block';
+    wallets[tab].state = data;
     renderWallet(tab, data);
   });
 
@@ -1042,8 +1044,17 @@ async function refreshWallet(tab) {
     password: document.getElementById(tab + '-password').value,
     resultsRoot: document.getElementById(tab + '-root').value || null,
     role: tab === 'wallet1' ? 'master' : 'worker',
+    masters: walletMasters(),
   });
-  if (data.ok) { st.state = data; renderWallet(tab, data); }
+  if (data.ok) {
+    st.state = data;
+    renderWallet(tab, data);
+    const msg = document.getElementById(tab + '-msg');
+    if (msg) {
+      msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
+        + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0} · обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`;
+    }
+  }
 }
 
 function walletMasters() {
@@ -1078,7 +1089,8 @@ function fillWalletRoots(dirs) {
 /* ==================== настройки (src/config.json) ==================== */
 
 // Мастер передаёт воркеру только эти ключи (см. task_cfg_payload в src/main.py)
-const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k'];
+const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k',
+  'worker_server', 'worker_port'];
 
 function configField(key, entry) {
   const wrapped = entry && typeof entry === 'object' && 'value' in entry;
@@ -1185,6 +1197,14 @@ refreshOverview().then(() => {
   $('#wallet1-root').value = overview.dirs[0] || '';
   $('#wallet2-root').value = overview.dirs[0] || '';
 });
+
+// подсказываем порт мастера из настроек (config.json → port)
+api('/api/config').then((d) => {
+  if (!d.ok) return;
+  const p = d.config.port;
+  const v = (p && typeof p === 'object' && 'value' in p) ? p.value : p;
+  if (v) $('#m-port').placeholder = `${v} (из настроек)`;
+});
 refreshNetwork();
 
 // Кошелёк — независимый клиент: пока вкладка открыта, он сам периодически
@@ -1192,7 +1212,7 @@ refreshNetwork();
 setInterval(() => {
   const tab = activeTab === 'wallet1' ? 'wallet1' : (activeTab === 'wallet2' ? 'wallet2' : null);
   if (tab && wallets[tab].state) refreshWallet(tab);
-}, 6000);
+}, 5000);
 
 // список мастеров тоже обновляем — адреса могут появиться через gossip
 setInterval(() => {

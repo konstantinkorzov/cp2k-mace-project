@@ -256,7 +256,8 @@ CONFIG = load_config(CONFIG_PATH)
 # ---------- CLI / Порт ----------
 def get_args():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=None,
+                        help="порт FastAPI-сервера (иначе port из config.json или 8000)")
     parser.add_argument("--password", type=str, default=None,
                         help="пароль кошелька мастера (иначе MASTER_PASSWORD или запрос)")
     parser.add_argument("--peer", action="append", default=None,
@@ -850,6 +851,24 @@ def _save_mempool():
         print(f"[Master] ! не удалось сохранить мемпул: {e}")
 
 
+def _tx_input_keys(tx: dict) -> set:
+    return {(i.get("txid"), int(i.get("vout", -1)))
+            for i in tx.get("inputs", []) if not i.get("coinbase")}
+
+
+def _drop_conflicts(tx: dict) -> list[str]:
+    """Убирает из мемпула tx, тратящие те же входы (замена по новизне)."""
+    keys = _tx_input_keys(tx)
+    if not keys:
+        return []
+    with MEMPOOL_LOCK:
+        clash = [tid for tid, other in MEMPOOL.items()
+                 if other is not tx and (_tx_input_keys(other) & keys)]
+        for tid in clash:
+            MEMPOOL.pop(tid, None)
+    return clash
+
+
 def _load_mempool():
     """Читает мемпул с диска; уже устаревшие tx отсеются при сборке блока."""
     path = _mempool_path()
@@ -862,15 +881,48 @@ def _load_mempool():
         print(f"[Master] ! мемпул не прочитан ({e}) — начинаю с пустого")
         return 0
     loaded = 0
-    with MEMPOOL_LOCK:
-        for tx in data if isinstance(data, list) else []:
-            tid = tx.get("txid") or chain_mod.txid_of(tx)
-            tx["txid"] = tid
+    for tx in data if isinstance(data, list) else []:
+        tid = tx.get("txid") or chain_mod.txid_of(tx)
+        tx["txid"] = tid
+        _drop_conflicts(tx)
+        with MEMPOOL_LOCK:
             MEMPOOL[tid] = tx
-            loaded += 1
+        loaded += 1
     if loaded:
         print(f"[Master] Мемпул восстановлен: {loaded} tx")
     return loaded
+
+
+def _prune_mempool(reason: str = "") -> int:
+    """
+    Чистит мемпул после появления нового блока (своего или из сети):
+    если вход уже потрачен (tx попала в блок) или конфликтует — убираем.
+    """
+    with MEMPOOL_LOCK:
+        items = list(MEMPOOL.items())
+    if not items:
+        return 0
+
+    utxo = chain_mod.utxo_set(CONFIG["output_dir"])
+    height = chain_mod.next_seq(CONFIG["output_dir"])
+    conf = int(CONFIG.get("coinbase_confirmations", chain_mod.DEFAULT_CONFIRMATIONS))
+    drop = []
+    for tid, tx in items:
+        ok, _problems = chain_mod.validate_tx(
+            tx, CONFIG["output_dir"], height, conf, utxo=utxo)
+        if not ok:
+            drop.append(tid)
+    if not drop:
+        return 0
+
+    with MEMPOOL_LOCK:
+        for tid in drop:
+            MEMPOOL.pop(tid, None)
+    _save_mempool()
+    suffix = f" ({reason})" if reason else ""
+    print(f"[Master] мемпул обновлён{suffix}: убрано {len(drop)} tx "
+          f"(попали в блок или конфликтуют)")
+    return len(drop)
 
 @app.get("/queue-status")
 def queue_status():
@@ -1370,6 +1422,7 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
                 raise RuntimeError(f"блок {seq}: {'; '.join(why)}")
             accepted += 1
         print(f"[Reorg] ✓ переключился на ветку {peer} (высота {remote})")
+        _prune_mempool("reorg")
         return {"accepted": accepted, "errors": []}
     except Exception as e:  # noqa: BLE001
         # Откат: удалить новые блоки и вернуть старые из orphan
@@ -1427,6 +1480,8 @@ def sync_from_peer(peer: str) -> dict:
             break
         accepted += 1
 
+    if accepted:
+        _prune_mempool("блок из сети")
     return {"ok": not errors, "accepted": accepted, "errors": errors}
 
 
@@ -1461,10 +1516,15 @@ def _gossip_peers() -> list[str]:
 
 
 def _gossip_loop(interval: int = PEER_GOSSIP_INTERVAL):
+    """Фон: обмен адресами + догон сети, даже если анонс потерялся."""
     while True:
         time.sleep(interval)
         try:
             _gossip_peers()
+            if CONFIG.get("peers"):
+                for res in sync_all_peers():
+                    if res.get("accepted"):
+                        print(f"[Peer] {res['peer']}: догнал {res['accepted']} блок(ов)")
         except Exception as e:  # noqa: BLE001
             print(f"[Peer] gossip ошибка: {e}")
 
@@ -1564,9 +1624,12 @@ def tx_submit(req: TxSubmit):
         return {"status": "rejected", "reason": "; ".join(problems[:5])}
     tid = tx.get("txid") or chain_mod.txid_of(tx)
     tx["txid"] = tid
+    clash = _drop_conflicts(tx)
     with MEMPOOL_LOCK:
         MEMPOOL[tid] = tx
     _save_mempool()
+    if clash:
+        print(f"[Master] мемпул: {len(clash)} конфликтующих tx заменено новой {tid[:12]}…")
     print(f"[Master] 📥 tx {tid[:12]}… принята в мемпул")
     return {"status": "accepted", "txid": tid}
 
@@ -1909,6 +1972,7 @@ def _main_impl():
     global pending_tasks
 
     args = get_args()
+    # Порт: --port важнее, иначе из config.json, иначе 8000
     port = args.port
     _master_password.override = args.password
 
@@ -1921,6 +1985,9 @@ def _main_impl():
         STATUS_FILE = CONFIG["status_file"]
         ARCHIVE_FILE = CONFIG["archive_file"]
     CONFIG["peers"] = _collect_peers(args)
+
+    if port is None:
+        port = int(CONFIG.get("port") or 8000)
 
     print("=" * 60)
     print(f"ЗАПУСК В РЕЖИМЕ СЕРВЕРА (ПОРТ: {port})")

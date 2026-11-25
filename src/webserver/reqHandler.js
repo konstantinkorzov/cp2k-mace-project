@@ -450,6 +450,10 @@ function onSaveConfig(req, res) {
 
         const raw = fs.readFileSync(global.paths.CONFIG_PATH, 'utf8');
         const current = JSON.parse(raw);
+        // сохраняем владельца файла: панель работает root'ом в контейнере,
+        // а проект в bind-mount принадлежит пользователю (иначе файл станет root-овым)
+        let owner = null;
+        try { owner = fs.statSync(global.paths.CONFIG_PATH); } catch (e) { owner = null; }
         const updated = {};
         for (const key of Object.keys(current)) {
             const cur = current[key];
@@ -465,6 +469,9 @@ function onSaveConfig(req, res) {
         }
         const tmp = global.paths.CONFIG_PATH + '.tmp';
         fs.writeFileSync(tmp, JSON.stringify(updated, null, 2), 'utf8');
+        if (owner) {
+            try { fs.chownSync(tmp, owner.uid, owner.gid); } catch (e) { /* без прав — пропускаем */ }
+        }
         fs.renameSync(tmp, global.paths.CONFIG_PATH);
         res.json({ ok: true, config: updated });
     } catch (e) {

@@ -234,7 +234,8 @@ def build_transfer(element_dir: str, from_addresses: set[str], to_address: str,
                    change_address: str, value: float = REWARD_VALUE,
                    confirmations: int = DEFAULT_CONFIRMATIONS,
                    height: int | None = None,
-                   fee: float = TX_FEE) -> dict | None:
+                   fee: float = TX_FEE,
+                   exclude: set[tuple[str, int]] | None = None) -> dict | None:
     """
     Собирает перевод `value` монет на `to_address` с подтверждённых выходов
     мастера. Комиссия `fee` уходит майнеру (в coinbase этого же блока),
@@ -242,6 +243,10 @@ def build_transfer(element_dir: str, from_addresses: set[str], to_address: str,
     """
     height = height if height is not None else next_seq(element_dir)
     available = available_utxos(element_dir, from_addresses, confirmations, height)
+    if exclude:
+        # не тратим то, что уже заблокировано в мемпуле (иначе заменим свою же tx)
+        available = [u for u in available
+                     if (u["txid"], int(u["vout"])) not in exclude]
     if not available:
         return None
 
@@ -322,13 +327,14 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
 def build_wallet_transfer(wallet, element_dir: str, to_address: str,
                           value: float, fee: float = TX_FEE,
                           confirmations: int = DEFAULT_CONFIRMATIONS,
-                          height: int | None = None) -> dict | None:
+                          height: int | None = None,
+                          exclude: set[tuple[str, int]] | None = None) -> dict | None:
     """Собирает и подписывает перевод с адресов кошелька (wallet.addresses())."""
     height = height if height is not None else next_seq(element_dir)
     change = wallet.latest_key()["address"]
     tx = build_transfer(element_dir, wallet.addresses(), to_address, change,
                         value=value, confirmations=confirmations,
-                        height=height, fee=fee)
+                        height=height, fee=fee, exclude=exclude)
     if tx is None:
         return None
     sign_transaction(tx, wallet, utxo_set(element_dir))
