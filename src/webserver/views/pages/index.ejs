@@ -1089,8 +1089,9 @@ function fillWalletRoots(dirs) {
 /* ==================== настройки (src/config.json) ==================== */
 
 // Мастер передаёт воркеру только эти ключи (см. task_cfg_payload в src/main.py)
-const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k',
-  'worker_server', 'worker_port'];
+const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k', 'worker_port'];
+// Эти ключи относятся только к воркеру — в настройках мастера их не показываем
+const HIDDEN_IN_MASTER = ['worker_server', 'worker_port'];
 
 function configField(key, entry) {
   const wrapped = entry && typeof entry === 'object' && 'value' in entry;
@@ -1123,8 +1124,9 @@ async function loadConfigForm(which) {
   }
   const cfg = data.config || {};
   box.dataset.json = JSON.stringify(cfg);
-  const keys = Object.keys(cfg).filter((k) =>
-    which === 'master' || WORKER_CONFIG_KEYS.includes(k));
+  const keys = Object.keys(cfg).filter((k) => (which === 'master'
+    ? !HIDDEN_IN_MASTER.includes(k)
+    : WORKER_CONFIG_KEYS.includes(k)));
   box.innerHTML = keys.map((k) => configField(k, cfg[k])).join('')
     || '<span class="muted">нет полей</span>';
   if (msg) msg.textContent = '';

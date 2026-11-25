@@ -336,8 +336,7 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
 def main():
     # Автоматически считываем переменные окружения, переданные через Docker (или fallback на дефолты)
     cfg_defaults = _config_defaults()
-    default_server = (os.environ.get("MASTER_HOST")
-                      or str(cfg_defaults.get("worker_server") or "host.docker.internal"))
+    default_server = os.environ.get("MASTER_HOST", "host.docker.internal")
     default_port = int(os.environ.get("MASTER_PORT")
                        or cfg_defaults.get("worker_port") or 8000)
 
