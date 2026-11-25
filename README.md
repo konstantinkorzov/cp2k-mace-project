@@ -987,9 +987,11 @@ grep -rl 'konstantinkorzov' --exclude-dir=node_modules --exclude-dir=.git . \
 
 ### Мелочи, которые стоит сделать сразу
 
+* **Лицензия.** MIT уже добавлен (`LICENSE`), и такая же метка стоит в `Dockerfile`.
+  Если нужна другая лицензия — замените файл и поправьте
+  `org.opencontainers.image.licenses`.
 * **Автор коммитов.** Сейчас в первом коммите `Konstantin Korzov <konstantinkorzov@users.noreply.github.com>`.
   Поменять: `git config user.email ...` и затем `git commit --amend --reset-author`.
-* **Лицензия.** Добавьте `LICENSE` (например, MIT) — без неё формально нельзя использовать код.
 * **Сертификат для HTTPS.** В репозитории его нет; панель создаёт самоподписанный
   `src/webserver/*.pem` при первом запуске (`openssl` есть в образе). Для «настоящего»
   HTTPS положите свои `privkey.pem`/`fullchain.pem` в `src/webserver/`.
