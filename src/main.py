@@ -202,9 +202,9 @@ def load_config(path: str, results_root: str | None = None) -> Config:
         RESULTS_ROOT = os.path.abspath(results_root)
     cfg = Config.load(path)
 
-    # Генерацию делает воркер; мастер передаёт только диаметр атома.
-    # min_dist = diameter, max_dist = 2*diameter — константы structure_generator.
-    cfg.setdefault("atom_diameter", 2.0)
+    # Генерацию делает воркер; мастер передаёт только диаметр атома (он же
+    # определяет min/max расстояние в _check_geometry — параметр консенсуса,
+    # поэтому живёт в system, а не в общих настройках).
     cfg["cell_size"] = float(cp2k_runner.CP2K_PARAMS["min_cell_size"])
 
     cfg.setdefault("hartree_to_ev", HARTREE_TO_EV)
@@ -215,10 +215,12 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     # подтверждения чтения restart — константы в cp2k_runner.py (RESTART_VERIFY_SCF).
     cfg.setdefault("restart_max_mb", 50)                  # лимит размера принятого wfn
 
-    # Мастеру обязательно нужно знать систему и (в ручном режиме) число атомов
-    _require(cfg, ["system"] if cfg.get("system") else ["element", "structures_per_n", "dimensions_per_n"])
+    # Мастеру обязательно нужно описание системы
+    _require(cfg, ["system"])
 
     system = cfg.get("system") or {}
+    cfg["atom_diameter"] = float(
+        system.get("atom_diameter") or cfg.get("atom_diameter") or 2.0)
     name = str(system.get("name") or cfg.get("element") or "Cu")
     comp = system.get("composition") or cfg.get("composition") or {}
     comp = {str(k): int(v) for k, v in comp.items()} or {name: 1}
@@ -316,27 +318,43 @@ def _master_password() -> str | None:
 
 # ---------- Очередь заданий: мастер раздаёт только число атомов ----------
 # ---------- Расписание размеров по высоте цепочки ----------
-def schedule_enabled(cfg) -> bool:
-    return isinstance(cfg.get("schedule"), dict) and bool(cfg["schedule"])
+# =====================================================================
+# РАСПИСАНИЕ РАЗМЕРОВ — КОНСЕНСУСНЫЕ КОНСТАНТЫ, НЕ ЧИТАЮТСЯ ИЗ config.json
+# =====================================================================
+# Эти числа определяют, какой размер кластера считается на каждой высоте
+# цепочки. Если у двух мастеров они разные — цепочки разойдутся, поэтому
+# менять их можно только вместе с версией протокола (форк сознательно).
+ATOM_SCHEDULE = {
+    "start_atoms": 2,     # первый размер кластера
+    "base_blocks": 10,    # блоков на первый этап
+    "exponent": 1.5,      # B(s) = base_blocks * s^exponent
+    "max_atoms": 0,       # 0 — без потолка, размер растёт с высотой
+}
+
+# Размерности чередуются: объёмная (3) и плоская (2) структуры через одну.
+DIM_CYCLE = (3, 2)
+
+
+def schedule_enabled(cfg=None) -> bool:
+    """Расписание — единственный режим, поэтому всегда True (оставлено для совместимости)."""
+    return True
 
 
 def stage_for_height(height: int, cfg) -> dict:
     """
     Этап = размер кластера. Для этапа s:
       n_atoms = start + (s-1)*formula_size
-      blocks  = base * s^exponent      (рекомендуется exponent ≈ 1.5)
+      blocks  = base * s^exponent
 
-    Высота `height` — сколько блоков уже принято. Этап s покрывает
+    Параметры — константы ATOM_SCHEDULE (общие для всей сети).
+    Высота height — сколько блоков уже принято; этап s покрывает
     [C(s-1), C(s)), где C — сумма blocks по предыдущим этапам.
     """
-    sch = cfg.get("schedule") or {}
-    base = max(1, int(sch.get("base_blocks", 10)))
-    power = float(sch.get("exponent", 1.5))
+    base = max(1, int(ATOM_SCHEDULE["base_blocks"]))
+    power = float(ATOM_SCHEDULE["exponent"])
     unit = max(1, int(cfg.get("formula_size") or 1))
-    start = int(sch.get("start_atoms", 2))
-    if start < unit:
-        start = unit
-    max_atoms = int(sch.get("max_atoms", 0) or 0)
+    start = max(int(ATOM_SCHEDULE["start_atoms"]), unit)
+    max_atoms = int(ATOM_SCHEDULE["max_atoms"] or 0)
 
     acc, s = 0, 1
     while True:
@@ -353,14 +371,14 @@ def stage_for_height(height: int, cfg) -> dict:
 
 def schedule_tasks_for_stage(stage: dict, cfg, start_index: int = 0,
                              count: int | None = None) -> list[dict]:
+    """Задания этапа. Размерность чередуется: 3D, 2D, 3D, 2D…"""
     n_atoms = int(stage["n_atoms"])
-    dim = int((cfg.get("schedule") or {}).get("dim", 3))
     count = int(count or stage["blocks"])
     return [{
         "struct_id": f"n{n_atoms}_t{start_index + i:05d}",
         "task_index": start_index + i,
         "n_atoms": n_atoms,
-        "dim": dim,
+        "dim": int(DIM_CYCLE[(start_index + i) % len(DIM_CYCLE)]),
         "attempts": 0,
     } for i in range(count)]
 
@@ -384,28 +402,6 @@ def _sync_stage(reason: str = ""):
     suffix = f" ({reason})" if reason else ""
     print(f"[Master] 🧬 этап {stage['stage']}{suffix}: кластер n={stage['n_atoms']}, "
           f"блоков на этап {stage['blocks']}; старые размеры больше не принимаются")
-
-
-def build_task_queue(cfg) -> list[dict]:
-    """
-    Строит задания «сгенерируй случайный кластер из n_atoms атомов размерности dim».
-    Структуру генерирует воркер, мастер лишь выдаёт уникальный struct_id.
-    """
-    per_n = {int(k): int(v) for k, v in cfg["structures_per_n"].items()}
-    dims_per_n = {int(k): list(v) for k, v in cfg["dimensions_per_n"].items()}
-
-    tasks = []
-    for n_atoms in sorted(per_n):
-        for dim in dims_per_n.get(n_atoms, [3]):
-            for i in range(per_n[n_atoms]):
-                tasks.append({
-                    "struct_id": f"n{n_atoms}_d{dim}_{i:04d}",
-                    "task_index": len(tasks),
-                    "n_atoms": n_atoms,
-                    "dim": int(dim),
-                    "attempts": 0,
-                })
-    return tasks
 
 
 def task_cfg_payload(cfg) -> dict:
@@ -2220,22 +2216,11 @@ def _main_impl():
     with task_queue_lock:
         failed_tasks.update(failed_ids)
 
-    if schedule_enabled(CONFIG):
-        _sync_stage("старт")
-        stage = CONFIG["_stage_info"]
-        print(f"[Master] Расписание: этап {stage['stage']}, кластер n={stage['n_atoms']}, "
-              f"{stage['blocks']} блоков на этап (уже сделано {stage['done']})")
-        with task_queue_lock:
-            print(f"[Server] Очередь заполнена. Всего задач: {len(pending_tasks)}")
-    else:
-        tasks = build_task_queue(CONFIG)
-        done_ids = _load_id_set(CONFIG["verified_ids_file"])
-        tasks = [t for t in tasks
-                 if t["struct_id"] not in done_ids and t["struct_id"] not in failed_ids]
-        print(f"Заданий в очереди: {len(tasks)} (уже принято: {len(done_ids)}, "
-              f"ранее забраковано: {len(failed_ids)})")
-        with task_queue_lock:
-            pending_tasks = tasks
+    _sync_stage("старт")
+    stage = CONFIG["_stage_info"]
+    print(f"[Master] Расписание: этап {stage['stage']}, кластер n={stage['n_atoms']}, "
+          f"{stage['blocks']} блоков на этап (уже сделано {stage['done']})")
+    with task_queue_lock:
         print(f"[Server] Очередь заполнена. Всего задач: {len(pending_tasks)}")
     print(f"[Server] Поднимаю FastAPI сервер на http://0.0.0.0:{port} ...")
 

@@ -4,19 +4,10 @@
       "name": "Cu",
       "composition": {
         "Cu": 1
-      }
+      },
+      "atom_diameter": 2.0
     },
-    "help": "Что считаем: name — имя системы (каталог results/<name>, поле в header), composition — формульная единица. Примеры: {'name':'Cu','composition':{'Cu':1}}; {'name':'Al2O3','composition':{'Al':2,'O':3}}; {'name':'NaCl','composition':{'Na':1,'Cl':1}}. Элементы должны быть в PSEUDOPOTENTIALS (src/cp2k_runner.py)."
-  },
-  "schedule": {
-    "value": {
-      "start_atoms": 2,
-      "base_blocks": 10,
-      "exponent": 1.5,
-      "max_atoms": 0,
-      "dim": 3
-    },
-    "help": "Рост кластера по высоте цепочки: этап s → n = start_atoms + (s-1)*formula_size, блоков на этап = base_blocks * s^exponent. max_atoms=0 — без потолка (рост до любого размера)."
+    "help": "Что считаем: name — имя системы (каталог results/<name>, поле в header), composition — формульная единица, atom_diameter — диаметр атома (Å), от него min_dist = diameter, max_dist = 2*diameter. Примеры: {'name':'Cu','composition':{'Cu':1},'atom_diameter':2.0}; {'name':'Al2O3','composition':{'Al':2,'O':3},'atom_diameter':1.8}. Элементы должны быть в PSEUDOPOTENTIALS (src/cp2k_runner.py)."
   },
   "charge": {
     "value": 0,
@@ -38,38 +29,6 @@
     "value": [],
     "help": "URL других мастеров для синхронизации цепочки, напр. ['http://127.0.0.1:8001']. Также --peer и MASTER_PEERS."
   },
-  "atom_diameter": {
-    "value": 2,
-    "help": "Диаметр атома в Å. От него: min_dist = diameter, max_dist = 2*diameter (константы structure_generator.py)."
-  },
-  "structures_per_n": {
-    "value": {
-      "2": 10,
-      "3": 10,
-      "4": 10,
-      "5": 10
-    },
-    "help": "Только для ручного режима (если удалить schedule): сколько структур генерировать для каждого n_atoms."
-  },
-  "dimensions_per_n": {
-    "value": {
-      "2": [
-        3
-      ],
-      "3": [
-        2
-      ],
-      "4": [
-        2,
-        3
-      ],
-      "5": [
-        2,
-        3
-      ]
-    },
-    "help": "Только для ручного режима (если удалить schedule): какие размерности генерировать для каждого n_atoms."
-  },
   "verbose_cp2k": {
     "value": true,
     "help": "Печатать ключевые строки вывода CP2K в реальном времени."
@@ -80,7 +39,7 @@
   },
   "cp2k_timeout_sec": {
     "value": 172800,
-    "help": "Таймаут одного прогона CP2K, секунды (48 ч). Для больших систем увеличивайте. Прогон с большим таймаутом может убить только он сам или watchdog задачи."
+    "help": "Таймаут одного прогона CP2K, секунды (48 ч). Для больших систем увеличивайте."
   },
   "task_timeout_sec": {
     "value": 259200,

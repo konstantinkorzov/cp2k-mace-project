@@ -201,20 +201,37 @@ def worker_tests():
 
 def queue_tests():
     print("\n--- 13. Очередь заданий и конфиг ---")
-    tasks = main.build_task_queue(main.CONFIG)
+    cfg = main.CONFIG
+
+    st1 = main.stage_for_height(0, cfg)
+    check("этап 1: 2 атома, 10 блоков",
+          st1["n_atoms"] == 2 and st1["blocks"] == 10, str(st1))
+    st2 = main.stage_for_height(10, cfg)
+    check("высота 10 → 3 атома (димер больше не принимается)",
+          st2["n_atoms"] == 3 and st2["stage"] == 2, str(st2))
+    check("размер растёт с высотой",
+          main.stage_for_height(5000, cfg)["n_atoms"] > st2["n_atoms"])
+
+    tasks = main.schedule_tasks_for_stage(st1, cfg)
     ids = [t["struct_id"] for t in tasks]
-    per_n = {int(k): int(v) for k, v in main.CONFIG["structures_per_n"].items()}
-    expected = sum(per_n[n] * len(main.CONFIG["dimensions_per_n"].get(str(n), [3])) for n in per_n)
-    check("заданий столько, сколько структур в config.json", len(tasks) == expected,
-          f"n={len(tasks)} (ожидалось {expected})")
+    check("заданий на этап = blocks", len(tasks) == st1["blocks"], f"{len(tasks)}")
     check("ids уникальны", len(ids) == len(set(ids)))
+    check("размерности чередуются 2D/3D",
+          sorted({t["dim"] for t in tasks}) == [2, 3],
+          str([t["dim"] for t in tasks[:6]]))
     check("мастер не передаёт готовые coords", all("coords" not in t for t in tasks))
+
+    check("расписание — константы, а не config.json",
+          "schedule" not in cfg and "max_atoms" in main.ATOM_SCHEDULE)
+    check("заряд/мультиплетность в конфиге",
+          "charge" in cfg and "multiplicity" in cfg)
     check("конфиг: псевдопотенциал и валентность определены",
-          main.CONFIG["potential"] == "GTH-PBE-q11" and main.CONFIG["n_valence"] == 11)
+          "GTH-PBE-q11" in str(cfg["potential"]) and cfg["n_valence"] == 11)
     check("конфиг: реестры заданы",
           all(main.CONFIG.get(k) for k in ("verified_ids_file", "failed_ids_file")))
     payload_cfg = main.task_cfg_payload(main.CONFIG)
     check("воркеру передаётся диаметр атома", "atom_diameter" in payload_cfg)
+    check("воркеру передаётся состав", "composition" in payload_cfg)
     check("в payload нет ручек CP2K/генерации/режима проверки",
           not any(k in payload_cfg for k in ("verify_mode", "cutoff", "eps_scf",
                                              "box_size_margin", "max_scf",
