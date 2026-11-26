@@ -887,15 +887,22 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
 
 def _drain_mempool(utxo: dict, height: int, confirmations: int):
     """
-    Отбирает из мемпула валидные на высоте height транзакции.
-    Возвращает (список для блока, суммарная комиссия).
-    Невалидные/конфликтующие удаляются из мемпула.
+    Отбирает транзакции для блока: по убыванию комиссии (как в Bitcoin),
+    не больше MAX_TXS_PER_BLOCK. Остальные остаются ждать следующего блока.
+    Невалидные/конфликтующие (вход уже потрачен) удаляются.
     """
     included, drop = [], []
-    fee_total = 0.0
+    fee_total = 0
     with MEMPOOL_LOCK:
         items = list(MEMPOOL.items())
-    for tid, tx in items:
+
+    def fee_of(item):
+        fee = chain_mod.tx_fee_safe(item[1], utxo)
+        return -1 if fee is None else fee
+
+    for tid, tx in sorted(items, key=fee_of, reverse=True):
+        if len(included) >= chain_mod.MAX_TXS_PER_BLOCK:
+            break                     # остаток ждёт следующего блока
         ok, _problems = chain_mod.validate_tx(
             tx, CONFIG["output_dir"], height, confirmations, utxo=utxo)
         if not ok:
@@ -1237,20 +1244,33 @@ PAUSED = False
 # Мастер занят сборкой/догоном цепочки: новые работы не принимаются
 BUSY = threading.Event()
 
-# Мемпул: txid -> транзакция, ожидающая включения в блок
+# Мемпул: txid -> транзакция, ожидающая включения в блок.
+# Политика как в Bitcoin: ограниченный размер, вытеснение по комиссии,
+# замена конфликта только более дорогой транзакцией.
 MEMPOOL: dict[str, dict] = {}
 MEMPOOL_LOCK = threading.Lock()
+MEMPOOL_MAX_TX = 10_000          # ~5 МБ тел; больше не держим
+MEMPOOL_SAVE_INTERVAL = 2.0      # дебаунс записи (раньше файл писался на каждый submit)
+_MEMPOOL_DIRTY = False
+_MEMPOOL_SAVED_AT = 0.0
 
 
 def _mempool_path() -> str:
     return os.path.join(CONFIG["output_dir"], "mempool.json")
 
 
-def _save_mempool():
-    """Персист мемпула: перезапуск мастера не должен терять неподтверждённые tx."""
+def _save_mempool(force: bool = False):
+    """Персист мемпула с дебаунсом: O(n²) записи на флуд больше нет."""
+    global _MEMPOOL_DIRTY, _MEMPOOL_SAVED_AT
+    now = time.time()
+    with MEMPOOL_LOCK:
+        if not force and now - _MEMPOOL_SAVED_AT < MEMPOOL_SAVE_INTERVAL:
+            _MEMPOOL_DIRTY = True
+            return
+        data = list(MEMPOOL.values())
+        _MEMPOOL_DIRTY = False
+        _MEMPOOL_SAVED_AT = now
     try:
-        with MEMPOOL_LOCK:
-            data = list(MEMPOOL.values())
         tmp = _mempool_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1259,26 +1279,41 @@ def _save_mempool():
         print(f"[Master] ! не удалось сохранить мемпул: {e}")
 
 
+def _mempool_flush_loop(interval: float = MEMPOOL_SAVE_INTERVAL):
+    """Фоновая запись отложенных изменений мемпула."""
+    while True:
+        time.sleep(interval)
+        if _MEMPOOL_DIRTY:
+            _save_mempool(force=True)
+
+
 def _tx_input_keys(tx: dict) -> set:
     return {(i.get("txid"), int(i.get("vout", -1)))
             for i in tx.get("inputs", []) if not i.get("coinbase")}
 
 
-def _drop_conflicts(tx: dict) -> list[str]:
-    """Убирает из мемпула tx, тратящие те же входы (замена по новизне)."""
+def _conflicting_txs(tx: dict) -> list[str]:
+    """txid-ы мемпула, тратящие те же входы (взаимоисключающие)."""
     keys = _tx_input_keys(tx)
     if not keys:
         return []
     with MEMPOOL_LOCK:
-        clash = [tid for tid, other in MEMPOOL.items()
-                 if other is not tx and (_tx_input_keys(other) & keys)]
-        for tid in clash:
-            MEMPOOL.pop(tid, None)
+        return [tid for tid, other in MEMPOOL.items()
+                if other is not tx and (_tx_input_keys(other) & keys)]
+
+
+def _drop_conflicts(tx: dict) -> list[str]:
+    """Убирает конфликты без сравнения комиссий (загрузка/реорг)."""
+    clash = _conflicting_txs(tx)
+    if clash:
+        with MEMPOOL_LOCK:
+            for tid in clash:
+                MEMPOOL.pop(tid, None)
     return clash
 
 
 def _load_mempool():
-    """Читает мемпул с диска; уже устаревшие tx отсеются при сборке блока."""
+    """Читает мемпул с диска; лишнее сверх лимита отсекается по комиссии."""
     path = _mempool_path()
     if not os.path.exists(path):
         return 0
@@ -1296,6 +1331,22 @@ def _load_mempool():
         with MEMPOOL_LOCK:
             MEMPOOL[tid] = tx
         loaded += 1
+
+    if len(MEMPOOL) > MEMPOOL_MAX_TX:
+        utxo = chain_mod.utxo_set(CONFIG["output_dir"])
+        ranked = []
+        with MEMPOOL_LOCK:
+            items = list(MEMPOOL.items())
+        for tid, tx in items:
+            fee = chain_mod.tx_fee_safe(tx, utxo)
+            ranked.append(((-1 if fee is None else fee), tid))
+        ranked.sort()
+        victims = [tid for _, tid in ranked[:len(ranked) - MEMPOOL_MAX_TX]]
+        with MEMPOOL_LOCK:
+            for tid in victims:
+                MEMPOOL.pop(tid, None)
+        print(f"[Master] мемпул усечён до {MEMPOOL_MAX_TX} tx (вытеснено {len(victims)})")
+
     if loaded:
         print(f"[Master] Мемпул восстановлен: {loaded} tx")
     return loaded
@@ -1331,6 +1382,7 @@ def _prune_mempool(reason: str = "") -> int:
     print(f"[Master] мемпул обновлён{suffix}: убрано {len(drop)} tx "
           f"(попали в блок или конфликтуют)")
     return len(drop)
+
 
 @app.get("/queue-status")
 def queue_status():
@@ -2286,24 +2338,68 @@ class TxSubmit(BaseModel):
 
 @app.post("/tx/submit")
 def tx_submit(req: TxSubmit):
-    _ = CONFIG
     if BUSY.is_set():
         return {"status": "busy", "reason": "master is syncing"}
     tx = dict(req.tx or {})
     conf = int(CONFIG.get("coinbase_confirmations", chain_mod.DEFAULT_CONFIRMATIONS))
+    utxo = chain_mod.utxo_set(CONFIG["output_dir"])
     ok, problems = chain_mod.validate_tx(tx, CONFIG["output_dir"],
-                                         confirmations=conf)
+                                         confirmations=conf, utxo=utxo)
     if not ok:
         return {"status": "rejected", "reason": "; ".join(problems[:5])}
+
     tid = tx.get("txid") or chain_mod.txid_of(tx)
     tx["txid"] = tid
-    clash = _drop_conflicts(tx)
+    fee = chain_mod.tx_fee_safe(tx, utxo)
+    fee = 0 if fee is None else fee
+    keys = _tx_input_keys(tx)
+
+    evicted = None
     with MEMPOOL_LOCK:
+        # 1) Конфликт (тот же вход): заменить можно только более дорогой tx.
+        clash = [t for t, other in MEMPOOL.items()
+                 if other is not tx and (_tx_input_keys(other) & keys)]
+        if clash:
+            old_fee = 0
+            for t in clash:
+                f = chain_mod.tx_fee_safe(MEMPOOL[t], utxo)
+                old_fee += max(0, f or 0)
+            if fee <= old_fee:
+                return {"status": "rejected",
+                        "reason": f"замена только дороже: конфликтующая "
+                                  f"комиссия {old_fee}, ваша {fee}"}
+
+        # 2) Лимит размера: вытесняем самую дешёвую, если новая дороже.
+        #    Конфликты уйдут сами — их не считаем и не выбираем жертвой.
+        remaining = len(MEMPOOL) - len(clash)
+        if remaining >= MEMPOOL_MAX_TX and tid not in MEMPOOL:
+            cheapest_tid, cheapest_fee = None, None
+            for t, other in MEMPOOL.items():
+                if t in clash:
+                    continue
+                f = chain_mod.tx_fee_safe(other, utxo)
+                f = -1 if f is None else f
+                if cheapest_fee is None or f < cheapest_fee:
+                    cheapest_tid, cheapest_fee = t, f
+            if cheapest_tid is None or fee <= cheapest_fee:
+                return {"status": "rejected",
+                        "reason": f"мемпул полон: минимальная комиссия "
+                                  f"{cheapest_fee}, ваша {fee}"}
+            MEMPOOL.pop(cheapest_tid, None)
+            evicted = cheapest_tid
+
+        for t in clash:
+            MEMPOOL.pop(t, None)
         MEMPOOL[tid] = tx
+
     _save_mempool()
     if clash:
-        print(f"[Master] мемпул: {len(clash)} конфликтующих tx заменено новой {tid[:12]}…")
-    print(f"[Master] 📥 tx {tid[:12]}… принята в мемпул")
+        print(f"[Master] мемпул: {len(clash)} конфликтующих tx заменено "
+              f"более дорогой {tid[:12]}…")
+    if evicted:
+        print(f"[Master] мемпул: вытеснена дешёвая tx {evicted[:12]}… "
+              f"(комиссия новой {fee})")
+    print(f"[Master] 📥 tx {tid[:12]}… принята в мемпул (комиссия {fee})")
     return {"status": "accepted", "txid": tid}
 
 
@@ -2638,6 +2734,10 @@ def main():
             archive_maker.make_artifacts_archive(CONFIG)
         except Exception as e:
             print(f"[main] Ошибка при упаковке: {e}")
+        try:
+            _save_mempool(force=True)
+        except Exception:  # noqa: BLE001
+            pass
         remove_pid()
         write_status(final_state, exit_code=exit_code)
         restore_std_logger()
@@ -2725,6 +2825,7 @@ def _main_impl():
         threading.Thread(target=catch_up_chain, daemon=True).start()
 
     threading.Thread(target=_watchdog_loop, daemon=True).start()
+    threading.Thread(target=_mempool_flush_loop, daemon=True).start()
     threading.Thread(target=_gossip_loop, daemon=True).start()
 
     # Энергия изолированного атома — один раз, для энергии связи в кадрах

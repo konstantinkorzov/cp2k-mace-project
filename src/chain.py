@@ -44,6 +44,9 @@ DFT_NAME = "dft.json"
 COINBASE_VALUE = 50_000_000
 REWARD_VALUE = 25_000_000
 TX_FEE = 100_000                 # комиссия за перевод (входы − выходы), int
+# Консенсусный предел переводов в блоке: блок не должен расти безгранично,
+# иначе «дорогие первыми» в мемпуле не имеет смысла.
+MAX_TXS_PER_BLOCK = 2_000
 DEFAULT_CONFIRMATIONS = 1
 # Зрелость coinbase — КОНСЕНСУС (не настройка): coinbase-выход блока N можно
 # тратить только в блоке N + COINBASE_MATURITY. Bitcoin держит 100; здесь 1 —
@@ -131,6 +134,14 @@ def tx_fee(tx: dict, utxo: dict) -> float:
                    for i in tx.get("inputs", []))
     total_out = sum_outputs(tx)
     return total_in - total_out
+
+
+def tx_fee_safe(tx: dict, utxo: dict) -> int | None:
+    """Комиссия или None, если вход уже потрачен/некорректен (не падаем)."""
+    try:
+        return tx_fee(tx, utxo)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def make_coinbase(height: int, address: str, value: int = COINBASE_VALUE) -> dict:
@@ -604,6 +615,9 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
     coinbases = [t for t in txs if t.get("type") == "coinbase"]
     if len(coinbases) != 1:
         problems.append(f"{label}: coinbase-транзакций {len(coinbases)}, ожидается 1")
+    transfers = [t for t in txs if t.get("type") != "coinbase"]
+    if len(transfers) > MAX_TXS_PER_BLOCK:
+        problems.append(f"{label}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
     block_fee = 0.0
     for tx in txs:
@@ -794,6 +808,9 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
         coinbases = [t for t in txs if t.get("type") == "coinbase"]
         if len(coinbases) != 1:
             problems.append(f"{b['name']}: coinbase-транзакций {len(coinbases)}, ожидается 1")
+        transfers = [t for t in txs if t.get("type") != "coinbase"]
+        if len(transfers) > MAX_TXS_PER_BLOCK:
+            problems.append(f"{b['name']}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
         # обычные транзакции: ссылки на UTXO, подписи Ed25519, комиссии
         block_fee = 0.0

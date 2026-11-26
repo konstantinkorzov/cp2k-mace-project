@@ -1092,6 +1092,97 @@ def rfc8032_tests():
         check("неканоническая S (S+q) отклонена", not crypto.verify(pub, msg, malleated))
 
 
+def mempool_policy_tests():
+    print("\n--- 30. Мемпул: вытеснение по комиссии и отбор в блок ---")
+    tmp = tempfile.mkdtemp(prefix="mempool_")
+    old_dir = main.CONFIG.get("output_dir")
+    old_max = main.MEMPOOL_MAX_TX
+    old_block = chain.MAX_TXS_PER_BLOCK
+    try:
+        main.CONFIG["output_dir"] = tmp
+        main.MEMPOOL.clear()
+        main.MEMPOOL_MAX_TX = 3
+
+        seed = os.urandom(32)
+        pub = crypto.public_key_from_seed(seed)
+        addr = crypto.address_from_public(pub)
+
+        state = os.path.join(tmp, "state.wfn")
+        with open(state, "wb") as f:
+            f.write(b"mempool-test" * 50)
+        sha, rel = chain.store_blob(tmp, state)
+        dft = {"energy_ev": -42.0,
+               "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
+               "geometry": [[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]]}
+        coinbases = []
+        for seq in range(1, 7):
+            cb = chain.make_coinbase(seq, addr, chain.COINBASE_VALUE)
+            chain.write_block(tmp, "Cu", 2, sha, rel, [cb], dft=dft,
+                              cp2k_version="2024.3",
+                              cp2k_build=cp2k_runner.CP2K_BUILD_CPU,
+                              cp2k_params=dict(cp2k_runner.CP2K_PARAMS))
+            coinbases.append(cb)
+
+        def make_tx(cb, fee):
+            tx = chain.make_transfer(
+                [{"txid": chain.txid_of(cb), "vout": 0}],
+                [{"value": chain.COINBASE_VALUE - fee, "address": addr}])
+            tid = chain.txid_of(tx)
+            for i in tx["inputs"]:
+                i["public_key"] = pub.hex()
+                i["signature"] = crypto.sign(seed, bytes.fromhex(tid)).hex()
+            tx["txid"] = chain.txid_of(tx)
+            return tx
+
+        def submit(tx):
+            return main.tx_submit(main.TxSubmit(tx=tx))
+
+        t100 = make_tx(coinbases[0], 100_000)
+        t200 = make_tx(coinbases[1], 200_000)
+        t300 = make_tx(coinbases[2], 300_000)
+        check("дешёвая tx принята", submit(t100).get("status") == "accepted")
+        check("средняя tx принята", submit(t200).get("status") == "accepted")
+        check("дорогая tx принята", submit(t300).get("status") == "accepted")
+
+        too_cheap = submit(make_tx(coinbases[3], 50_000))
+        check("полный мемпул не берёт tx с комиссией ниже минимальной",
+              too_cheap.get("status") == "rejected" and "полон" in str(too_cheap.get("reason")),
+              str(too_cheap))
+
+        t400 = make_tx(coinbases[3], 400_000)
+        check("дорогая tx вытесняет дешёвую", submit(t400).get("status") == "accepted")
+        check("дешёвая (100k) вытеснена",
+              t100["txid"] not in main.MEMPOOL and len(main.MEMPOOL) == 3,
+              f"в мемпуле {len(main.MEMPOOL)}")
+
+        low_replace = make_tx(coinbases[2], 250_000)
+        r = submit(low_replace)
+        check("конфликт дешевле существующего отклонён",
+              r.get("status") == "rejected" and "дороже" in str(r.get("reason")), str(r))
+        high_replace = make_tx(coinbases[2], 350_000)
+        check("конфликт дороже существующего заменяет его",
+              submit(high_replace).get("status") == "accepted"
+              and t300["txid"] not in main.MEMPOOL)
+
+        # отбор в блок: дорогие первыми, лимит переводов на блок
+        chain.MAX_TXS_PER_BLOCK = 1
+        utxo = chain.utxo_set(tmp)
+        included, fee = main._drain_mempool(utxo, 7, 1)
+        check("в блок попала самая дорогая tx", len(included) == 1
+              and included[0]["txid"] == t400["txid"],
+              f"включено {len(included)}")
+        check("остальные остались в мемпуле для следующего блока",
+              len(main.MEMPOOL) == 2, f"осталось {len(main.MEMPOOL)}")
+        check("комиссия блока посчитана", fee == 400_000, fee)
+    finally:
+        chain.MAX_TXS_PER_BLOCK = old_block
+        main.MEMPOOL_MAX_TX = old_max
+        main.MEMPOOL.clear()
+        if old_dir is not None:
+            main.CONFIG["output_dir"] = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def peer_tests():
     print("\n--- 23. Самая длинная цепочка (catch-up перед майнингом) ---")
     import types
@@ -1237,6 +1328,7 @@ def _run_tests():
     master_geometry_tests()
     build_tests()
     rfc8032_tests()
+    mempool_policy_tests()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print("\n" + "=" * 60)
