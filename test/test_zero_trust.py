@@ -591,7 +591,7 @@ def chain_tests():
               sha1 == sha2 and rel1 == rel2 == f"blobs/{sha1}.wfn")
 
         conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
-        wallet, _ = wallet_store.ensure_master(conn, "root")
+        wallet, _ = wallet_store.ensure_wallet(conn, "root")
         master = wallet.latest_key()["address"]
         worker = "b" * 64
         cp2k = {"cp2k_version": "2024.3",
@@ -768,27 +768,33 @@ def chain_tests():
 
 
 def wallet_tests():
-    print("\n--- 22. Кошельки мастера и воркера (SQLite) ---")
+    print("\n--- 22. Кошельки (без ролей: пароль = кошелёк) ---")
     tmp = tempfile.mkdtemp(prefix="wallet_test_")
     try:
         conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
-        m, created = wallet_store.ensure_master(conn, "root")
-        check("первый мастер создаётся с паролем root", created)
-        w, created_w = wallet_store.ensure_worker(conn, "worker_A", "root")
-        check("воркер создаётся в той же базе", created_w)
+        m, created = wallet_store.ensure_wallet(conn, "root")
+        check("кошелёк создаётся по паролю", created)
+        again, created2 = wallet_store.ensure_wallet(conn, "root")
+        check("повторный запуск находит тот же кошелёк", not created2)
+        check("адрес кошелька не изменился",
+              again.latest_key()["address"] == m.latest_key()["address"])
 
-        rows = {r["role"]: r for r in conn.execute("SELECT * FROM wallets").fetchall()}
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(wallets)")}
+        check("в кошельке нет роли и имени",
+              cols == {"id", "password_salt", "password_hash", "enc_salt", "created_at"})
+
+        w, created_w = wallet_store.ensure_wallet(conn, "worker")
+        check("другой пароль — другой кошелёк", created_w)
+        rows = conn.execute("SELECT * FROM wallets").fetchall()
         check("пароли с разными солями дают разные хэши",
-              rows["master"]["password_hash"] != rows["worker"]["password_hash"])
-        check("соли пароля разные",
-              rows["master"]["password_salt"] != rows["worker"]["password_salt"])
-        check("адреса мастера и воркера разные",
+              len({r["password_hash"] for r in rows}) == 2)
+        check("адреса разных кошельков разные",
               m.latest_key()["address"] != w.latest_key()["address"])
 
-        check("верный пароль открывает мастера",
-              wallet_store.unlock(conn, "master", "master", "root") is not None)
-        check("неверный пароль не открывает",
-              wallet_store.unlock(conn, "master", "master", "nope") is None)
+        check("верный пароль находит кошелёк",
+              len(wallet_store.find_by_password(conn, "root")) == 1)
+        check("неверный пароль не находит ничего",
+              wallet_store.find_by_password(conn, "nope") == [])
 
         addr = m.latest_key()["address"]
         sig = m.sign(addr, b"hello")
@@ -797,15 +803,15 @@ def wallet_tests():
 
         m.change_password("root", "newpass")
         check("старый пароль после смены не работает",
-              wallet_store.unlock(conn, "master", "master", "root") is None)
-        m2 = wallet_store.unlock(conn, "master", "master", "newpass")
+              wallet_store.find_by_password(conn, "root") == [])
+        m2 = wallet_store.WalletSet(wallet_store.find_by_password(conn, "newpass"))
         check("новый пароль работает, ключи на месте",
-              m2 is not None and m2.latest_key()["address"] == addr)
+              m2.latest_key()["address"] == addr)
         sig2 = m2.sign(addr, b"x")
         check("ключи перешифрованы и подпись валидна",
               crypto.verify(m2.public_for(addr), b"x", sig2))
-        check("воркер со своим паролем не затронут",
-              wallet_store.unlock(conn, "worker", "worker_A", "root") is not None)
+        check("другой кошелёк не затронут",
+              len(wallet_store.find_by_password(conn, "worker")) == 1)
 
         element_dir = os.path.join(tmp, "element")
         os.makedirs(element_dir, exist_ok=True)
@@ -814,37 +820,33 @@ def wallet_tests():
         check("wallet.py отвергает неверный пароль",
               wallet.show(conn, "bad", element_dir, 1) == 1)
 
-        # --- панель: «элемент = цепочка», «пароль = один кошелёк» ---
+        # --- элемент = цепочка; старые записи под одним паролем = один кошелёк ---
         import webwallet
 
         os.makedirs(os.path.join(tmp, "Cu", "blocks"), exist_ok=True)
         os.makedirs(os.path.join(tmp, "Fe", "blocks"), exist_ok=True)
-        wallet_store.ensure_worker(conn, "worker_B", "newpass")
-        wallet_store.ensure_worker(conn, "worker_C", "newpass")
-        by_pass = wallet_store.find_by_password(conn, "newpass")
-        merged = wallet.group_wallets(by_pass, role="worker")
-        check("несколько записей с одним паролем — один кошелёк",
-              len(merged) == 1 and len(merged["worker"]) == 2)
-        view = wallet.WalletView(merged["worker"])
+        wallet_store._create(conn, "newpass")   # так наплодили старые версии
+        dup = wallet_store.find_by_password(conn, "newpass")
+        check("несколько записей под одним паролем — один кошелёк", len(dup) == 2)
+        view = wallet_store.WalletSet(dup)
         check("кошелёк объединяет адреса всех записей",
               len(view.addresses()) == 2
               and view.addresses() == {k["address"] for k in view.keys()})
-        some_addr = sorted(view.addresses())[0]
+        some = sorted(view.addresses())[0]
         check("подпись адреса из любой записи проходит проверку",
-              crypto.verify(view.public_for(some_addr), b"y",
-                            view.sign(some_addr, b"y")))
+              crypto.verify(view.public_for(some), b"y", view.sign(some, b"y")))
 
-        info = webwallet.collect(tmp, "newpass", 1, role="worker", element="Cu")
+        info = webwallet.collect(tmp, "newpass", 1, element="Cu")
         check("панель показывает один кошелёк на пароль",
-              info.get("ok") and len(info["wallets"]) == 1
-              and len(info["wallets"][0]["addresses"]) == 2)
+              info.get("ok") and info.get("wallet")
+              and len(info["wallet"]["addresses"]) == 2)
         check("панель читает выбранную цепочку (элемент)",
               info.get("element") == "Cu")
         check("в каталоге видны обе цепочки (Cu и Fe)",
               {c["name"] for c in info["chains"]} >= {"Cu", "Fe"})
         check("чужой элемент (выход из каталога) отвергается",
               not webwallet.collect(tmp, "newpass", 1, element="../etc").get("ok"))
-        got = webwallet.new_address(tmp, "newpass", role="worker")
+        got = webwallet.new_address(tmp, "newpass")
         check("новый адрес добавляется в объединённый кошелёк",
               got.get("ok") and len(got.get("addresses") or []) == 3)
     finally:

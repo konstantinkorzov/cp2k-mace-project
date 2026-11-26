@@ -2700,8 +2700,7 @@ def admin_keys(token: str | None = None):
     keys = wallet.keys()
     current = wallet.latest_key()
     return {"current": current["id"] if current else None,
-            "count": len(keys), "keys": keys,
-            "wallet": {"role": wallet.role, "name": wallet.name}}
+            "count": len(keys), "keys": keys}
 
 
 @app.post("/admin/keys/new")
@@ -2818,20 +2817,22 @@ def _main_impl():
     _load_mempool()
     _load_template(CONFIG)
 
-    # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос
+    # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос.
+    # Кошелёк не «мастерский»: мастер просто пользуется им, как и воркер.
     conn = wallet_store.open_db(CONFIG["wallet_store_db"])
     CONFIG["wallet_conn"] = conn
     try:
-        wallet, created = wallet_store.ensure_master(conn, _master_password())
+        wallet, created = wallet_store.ensure_wallet(conn, _master_password())
     except wallet_store.WalletError as e:
         print(f"[Master] ✗ {e}")
         sys.exit(2)
     CONFIG["wallet"] = wallet
     if created:
-        print("[Master] Создан кошелёк мастера с паролем, заданным при запуске "
-              "(--password / MASTER_PASSWORD; для веб-панели — поле «Пароль кошелька»)")
+        print("[Master] ⚠ кошелёк с таким паролем не найден — создан НОВЫЙ (пустой). "
+              "Если это опечатка, монеты остались в старом кошельке")
     mkey = wallet.latest_key()
-    print(f"[Master] Ключ мастера #{mkey['id']}: адрес {mkey['address']}")
+    print(f"[Master] Кошелёк: адресов {len(wallet.keys())}, "
+          f"ключ #{mkey['id']}: {mkey['address']}")
     print(f"[Master] Подтверждений до доступности баланса: "
           f"{CONFIG.get('coinbase_confirmations')}")
 

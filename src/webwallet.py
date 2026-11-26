@@ -23,7 +23,7 @@ import requests
 
 import chain
 import wallet_store
-from wallet import WalletView, _element, _transactions, group_wallets
+from wallet import _element, _transactions
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ROOT = os.path.join(PROJECT_ROOT, "results")
@@ -186,85 +186,77 @@ def list_chains(root: str) -> dict:
 
 
 def collect(root: str, password: str, confirmations: int,
-            role: str | None = None, name: str | None = None,
             masters: list[str] | None = None,
             element: str | None = None) -> dict:
+    """
+    Кошелёк по паролю в выбранной цепочке.
+
+    Кошелёк — самостоятельная сущность: роли у него нет, поэтому здесь нет
+    ни role, ни name. Один пароль — один кошелёк (если старые базы наплодили
+    несколько записей под ним, они объединяются: общий баланс и история).
+    """
     root = _root(root)
     db_path = os.path.join(root, "keys.db")
     if not os.path.exists(db_path):
         return {"ok": False, "error": f"нет базы кошельков: {db_path}",
-                "root": root, "wallets": []}
+                "root": root, "wallet": None}
 
     try:
         element, element_dir = _chain_dir(root, element)
     except ValueError as e:
-        return {"ok": False, "error": str(e), "root": root, "wallets": []}
+        return {"ok": False, "error": str(e), "root": root, "wallet": None}
 
     conn = wallet_store.open_db(db_path)
     tip = (chain.next_seq(element_dir) - 1) if os.path.isdir(element_dir) else 0
     tip = max(0, tip)
 
-    # Пароль — это и есть кошелёк. Имена записей в базе (worker/smoke и т.п.)
-    # наружу не выводим: если один пароль открыл несколько записей одной роли,
-    # для владельца это один кошелёк с несколькими наборами адресов.
-    matched = wallet_store.find_by_password(conn, password)
-    groups = group_wallets(matched, role=role, name=name)
-    shown = {id(w) for ws in groups.values() for w in ws}
-    others = sorted({w.role for w in matched if id(w) not in shown})
-
-    if not groups:
-        hint = ("пароль не подходит ни к одному кошельку" if not matched
-                else f"для роли {role or 'любой'} кошельков нет; пароль открывает: "
-                     + ", ".join(sorted({w.role for w in matched})))
+    wallets = wallet_store.find_by_password(conn, password)
+    if not wallets:
         return {"ok": False, "root": root, "element": element, "height": tip,
-                "error": hint, "wallets": [], "role": role,
-                "also_roles": others,
-                "chains": list_chains(root)["chains"]}
+                "error": "пароль не подходит ни к одному кошельку (новый пароль "
+                         "создаёт новый пустой кошелёк)",
+                "wallet": None, "chains": list_chains(root)["chains"]}
 
-    out = []
+    view = wallet_store.WalletSet(wallets)
+    keys = view.keys()
+    addresses = view.addresses()
+
+    balances, txs = {}, []
     mempool = _mempool(masters, element)
     index = _outputs_index(element_dir) if mempool else {}
-    for wallet_role, wallets in groups.items():
-        keys = [k for w in wallets for k in w.keys()]
-        addresses = {k["address"] for k in keys}
-        balances, txs = {}, []
-        if addresses and os.path.isdir(element_dir):
-            try:
-                balances = chain.balances(element_dir, addresses, confirmations)
-            except Exception:  # noqa: BLE001
-                balances = {}
-            try:
-                txs = _transactions(element_dir, addresses)
-            except Exception:  # noqa: BLE001
-                txs = []
-            # неподтверждённые — сверху
-            txs = _mempool_rows(mempool, index, addresses) + txs
+    if addresses and os.path.isdir(element_dir):
+        try:
+            balances = chain.balances(element_dir, addresses, confirmations)
+        except Exception:  # noqa: BLE001
+            balances = {}
+        try:
+            txs = _transactions(element_dir, addresses)
+        except Exception:  # noqa: BLE001
+            txs = []
+        # неподтверждённые — сверху
+        txs = _mempool_rows(mempool, index, addresses) + txs
 
-        totals = {"available": 0.0, "pending": 0.0, "total": 0.0}
-        for b in balances.values():
-            for key in totals:
-                totals[key] += int(b.get(key) or 0)
+    totals = {"available": 0.0, "pending": 0.0, "total": 0.0}
+    for b in balances.values():
+        for key in totals:
+            totals[key] += int(b.get(key) or 0)
 
-        # Мемпул блокирует потраченные выходы и добавляет будущие поступления.
-        locked = sum(t["sent"] for t in txs if t.get("mempool"))
-        incoming = sum(t["received"] for t in txs if t.get("mempool"))
-        if locked or incoming:
-            totals["available"] = max(0.0, totals["available"] - locked)
-            totals["pending"] += incoming
-            totals["total"] = totals["available"] + totals["pending"]
+    # Мемпул блокирует потраченные выходы и добавляет будущие поступления.
+    locked = sum(t["sent"] for t in txs if t.get("mempool"))
+    incoming = sum(t["received"] for t in txs if t.get("mempool"))
+    if locked or incoming:
+        totals["available"] = max(0.0, totals["available"] - locked)
+        totals["pending"] += incoming
+        totals["total"] = totals["available"] + totals["pending"]
 
-        out.append({
-            "role": wallet_role,
-            "addresses": [{"address": k["address"],
-                           "created_at": k["created_at"]} for k in keys],
-            "balances": balances,
-            "totals": {k: int(v) for k, v in totals.items()},
-            "transactions": txs,
-        })
-
-    out.sort(key=lambda w: 0 if w["role"] == "master" else 1)
     return {"ok": True, "root": root, "element": element, "height": tip,
-            "role": role, "also_roles": others, "wallets": out,
+            "wallet": {
+                "addresses": [{"address": k["address"],
+                               "created_at": k["created_at"]} for k in keys],
+                "balances": balances,
+                "totals": {k: int(v) for k, v in totals.items()},
+                "transactions": txs,
+            },
             "chains": list_chains(root)["chains"],
             "masters": _masters_info(masters, element),
             "mempool_count": len(mempool)}
@@ -394,8 +386,8 @@ def locked_utxos(masters: list[str] | None,
 
 
 def send(root: str, password: str, to: str, amount: int, fee: int,
-         masters: list[str], confirmations: int, role: str | None,
-         name: str | None, element: str | None = None) -> dict:
+         masters: list[str], confirmations: int,
+         element: str | None = None) -> dict:
     root = _root(root)
     conn = wallet_store.open_db(os.path.join(root, "keys.db"))
     try:
@@ -405,14 +397,10 @@ def send(root: str, password: str, to: str, amount: int, fee: int,
     if not os.path.isdir(element_dir):
         return {"ok": False, "error": f"нет цепочки {element}: {element_dir}"}
 
-    groups = group_wallets(wallet_store.find_by_password(conn, password),
-                           role=role, name=name)
-    if len(groups) != 1:
-        return {"ok": False,
-                "error": f"пароль открывает {len(groups)} кошелька — укажите роль",
-                "roles": sorted(groups)}
-    wallet_role, wallets = next(iter(groups.items()))
-    wallet = WalletView(wallets)
+    wallets = wallet_store.find_by_password(conn, password)
+    if not wallets:
+        return {"ok": False, "error": "пароль не подходит ни к одному кошельку"}
+    wallet = wallet_store.WalletSet(wallets)
 
     tx = chain.build_wallet_transfer(wallet, element_dir, to, amount, fee=fee,
                                      confirmations=confirmations,
@@ -442,50 +430,40 @@ def send(root: str, password: str, to: str, amount: int, fee: int,
 
     return {"ok": bool(accepted_by), "txid": tx["txid"], "tx": tx,
             "accepted_by": accepted_by, "attempts": attempts,
-            "wallet": wallet_role, "element": element,
-            "from": sorted(wallet.addresses())}
+            "element": element, "from": sorted(wallet.addresses())}
 
 
-def change_password(root: str, old: str, new: str,
-                    role: str | None = None, name: str | None = None) -> dict:
+def change_password(root: str, old: str, new: str) -> dict:
     """
-    Меняет пароль кошелька целиком: все записи, которые открывал старый пароль
-    (для выбранной роли). Иначе после смены пароля половина адресов осталась бы
-    за старым — и «единый кошелёк» снова распался бы на части.
+    Меняет пароль кошелька целиком: все записи, которые открывал старый пароль.
+    Иначе после смены половина адресов осталась бы за старым — и «один кошелёк»
+    снова распался бы на части.
     """
     root = _root(root)
     conn = wallet_store.open_db(os.path.join(root, "keys.db"))
-    groups = group_wallets(wallet_store.find_by_password(conn, old),
-                           role=role, name=name)
-    if not groups:
+    wallets = wallet_store.find_by_password(conn, old)
+    if not wallets:
         return {"ok": False, "error": "старый пароль не подходит ни к одному кошельку"}
-    changed = 0
-    for wallets in groups.values():
-        for w in wallets:
-            w.change_password(old, new)
-            changed += 1
-    return {"ok": True, "changed": changed, "roles": sorted(groups)}
+    keys = 0
+    for w in wallets:
+        keys += len(w.keys())
+        w.change_password(old, new)
+    return {"ok": True, "changed": len(wallets), "keys": keys}
 
 
-def new_address(root: str, password: str, role: str | None = None,
-                name: str | None = None) -> dict:
+def new_address(root: str, password: str) -> dict:
     """Создаёт новый ключ (адрес) в кошельке, который открыт паролем."""
     conn = wallet_store.open_db(os.path.join(root, "keys.db"))
-    groups = group_wallets(wallet_store.find_by_password(conn, password),
-                           role=role, name=name)
-    if len(groups) != 1:
-        return {"ok": False,
-                "error": f"пароль открывает {len(groups)} кошелька — укажите роль",
-                "roles": sorted(groups)}
-    wallet_role, wallets = next(iter(groups.items()))
-    target = sorted(wallets, key=lambda w: w.id)[0]
-    key = target.add_key()
+    wallets = wallet_store.find_by_password(conn, password)
+    if not wallets:
+        return {"ok": False, "error": "пароль не подходит ни к одному кошельку"}
+    view = wallet_store.WalletSet(wallets)
+    key = view.add_key()
     return {
         "ok": True,
-        "role": wallet_role,
         "address": key["address"],
         "key_id": key["id"],
-        "addresses": [k["address"] for w in wallets for k in w.keys()],
+        "addresses": [k["address"] for k in view.keys()],
     }
 
 
@@ -496,9 +474,6 @@ def main() -> int:
     ap.add_argument("--password", default=None)
     ap.add_argument("--password-env", default="WEBUI_WALLET_PASSWORD")
     ap.add_argument("--results-root", default=DEFAULT_ROOT)
-    ap.add_argument("--role", choices=["master", "worker"], default=None)
-    ap.add_argument("--name", default=None,
-                    help="служебная метка записи (обычно не нужна)")
     ap.add_argument("--element", "--system", dest="element", default=None,
                     help="элемент/система: цепочка results/<element> "
                          "(по умолчанию system.name из config.json)")
@@ -523,8 +498,7 @@ def main() -> int:
     if args.action == "info":
         masters = [m for m in (args.master or []) if m]
         result = collect(args.results_root, password, confirmations,
-                         role=args.role, name=args.name, masters=masters,
-                         element=args.element)
+                         masters=masters, element=args.element)
     elif args.action == "tx":
         if not args.txid:
             print(json.dumps({"ok": False, "error": "нужен --txid"}, ensure_ascii=False))
@@ -533,7 +507,7 @@ def main() -> int:
                             masters=[m for m in (args.master or []) if m],
                             element=args.element)
     elif args.action == "newkey":
-        result = new_address(args.results_root, password, args.role, args.name)
+        result = new_address(args.results_root, password)
     elif args.action == "send":
         if not args.to or args.amount <= 0:
             print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},
@@ -542,15 +516,13 @@ def main() -> int:
         masters = [m for m in (args.master or [os.environ.get(
             "MASTER_URL", "http://127.0.0.1:8000")]) if m]
         result = send(args.results_root, password, args.to, args.amount,
-                      args.fee, masters, confirmations, args.role, args.name,
-                      element=args.element)
+                      args.fee, masters, confirmations, element=args.element)
     else:
         if not args.change_to:
             print(json.dumps({"ok": False, "error": "нужен --change-to"},
                              ensure_ascii=False))
             return 2
-        result = change_password(args.results_root, password, args.change_to,
-                                 args.role, args.name)
+        result = change_password(args.results_root, password, args.change_to)
 
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("ok") else 1

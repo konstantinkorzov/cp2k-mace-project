@@ -341,8 +341,6 @@ async function onWalletInfo(req, res) {
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'info', '--results-root', root];
-        if (body.role) args.push('--role', String(body.role));
-        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         for (const url of (body.masters || [])) {
             if (url) args.push('--master', String(url));
@@ -382,8 +380,6 @@ async function onWalletSend(req, res) {
         if (body.fee !== undefined && body.fee !== null && body.fee !== '') {
             args.push('--fee', String(body.fee));
         }
-        if (body.role) args.push('--role', String(body.role));
-        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const masters = (body.masters || []).map((m) => String(m).trim()).filter(Boolean);
         for (const url of masters) args.push('--master', url);
@@ -401,8 +397,6 @@ async function onWalletNewKey(req, res) {
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
         const args = ['src/webwallet.py', 'newkey',
             '--results-root', walletRoot(body)];
-        if (body.role) args.push('--role', String(body.role));
-        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const out = await runPython(
             args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
@@ -421,8 +415,6 @@ async function onWalletPasswd(req, res) {
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'passwd', '--results-root', root,
             '--change-to', String(body.newPassword)];
-        if (body.role) args.push('--role', String(body.role));
-        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const out = await runPython(args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
         res.json(out);

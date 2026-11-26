@@ -136,7 +136,7 @@
 
 <header>
   <h1>CP2K + MACE</h1>
-  <span class="hint">мастер · воркер · MACE · кошельки — в одном окне</span>
+  <span class="hint">мастер · воркер · MACE · кошелёк — в одном окне</span>
   <div id="statusline">
     <span id="st-masters">мастеров: —</span>
     <span id="st-workers">воркеров: —</span>
@@ -152,8 +152,7 @@
   <button data-tab="master" class="active">Мастер</button>
   <button data-tab="worker">Воркер</button>
   <button data-tab="mace">MACE</button>
-  <button data-tab="wallet1">Кошелёк 1</button>
-  <button data-tab="wallet2">Кошелёк 2</button>
+  <button data-tab="wallet">Кошелёк</button>
 </nav>
 
 <main>
@@ -347,8 +346,7 @@
 </section>
 
 <!-- ==================== КОШЕЛЬКИ ==================== -->
-<section class="tab" id="tab-wallet1"></section>
-<section class="tab" id="tab-wallet2"></section>
+<section class="tab" id="tab-wallet"></section>
 
 </main>
 
@@ -391,7 +389,7 @@ $$('nav.tabs button').forEach((btn) => {
     $$('nav.tabs button').forEach((b) => b.classList.toggle('active', b === btn));
     $$('section.tab').forEach((s) => s.classList.toggle('active', s.id === 'tab-' + activeTab));
     if (activeTab === 'worker') { refreshNetwork(); refreshCp2k(); }
-    if (activeTab.startsWith('wallet')) { refreshChains(activeTab); refreshWallet(activeTab); }
+    if (activeTab === 'wallet') { refreshChains(); refreshWallet(); }
   });
 });
 
@@ -767,43 +765,39 @@ $('#btn-mace-start').addEventListener('click', async () => {
   }
 });
 
-/* ==================== кошельки ==================== */
+/* ==================== кошелёк ==================== */
 
-const wallets = {
-  wallet1: { state: null, password: 'master' },
-  wallet2: { state: null, password: 'worker' },
-};
+let walletState = null;
 
-function buildWalletTab(tab) {
-  const el = document.getElementById('tab-' + tab);
+function buildWalletTab() {
+  const el = document.getElementById('tab-wallet');
   if (!el || el.dataset.built) return;
   el.dataset.built = '1';
-  const isMaster = tab === 'wallet1';
   el.innerHTML = `
     <div class="grid">
       <div>
         <div class="card">
-          <h2>${isMaster ? 'Кошелёк мастера' : 'Кошелёк воркера'}
-            <span class="muted" style="font-weight:400;font-size:12px">роль: ${isMaster ? 'master' : 'worker'}</span></h2>
+          <h2>Кошелёк <span class="muted" style="font-weight:400;font-size:12px">пароль открывает его</span></h2>
           <p class="muted" style="margin-top:-4px">
-            Пароль — это кошелёк: все его адреса показываются одним балансом и
-            одной историей. Система (элемент) — отдельная цепочка, как отдельный
-            металл: у меди и железа свои монеты, свой UTXO и своя высота.
+            Кошелёк — самостоятельная сущность: им пользуется и мастер, и воркер,
+            роль ему не принадлежит. Пароль — это кошелёк (все его адреса дают один
+            баланс и одну историю). Система (элемент) — отдельная цепочка, как
+            отдельный металл: у меди и железа свои монеты, UTXO и высота.
           </p>
           <div class="row">
             <div>
               <label>Пароль</label>
-              <input type="password" id="${tab}-password" value="${isMaster ? 'master' : 'worker'}" />
+              <input type="password" id="w-password" />
             </div>
             <div>
               <label>Каталог результатов</label>
-              <select id="${tab}-root"></select>
+              <select id="w-root"></select>
             </div>
           </div>
           <div class="row">
             <div>
               <label>Система (элемент)</label>
-              <select id="${tab}-chain"></select>
+              <select id="w-chain"></select>
             </div>
             <div style="flex:2 1 260px">
               <p class="muted" style="margin:2px 0 0">
@@ -813,34 +807,34 @@ function buildWalletTab(tab) {
             </div>
           </div>
           <div class="actions">
-            <button class="btn" id="${tab}-open">Открыть</button>
-            <span class="muted" id="${tab}-msg"></span>
+            <button class="btn" id="w-open">Открыть</button>
+            <span class="muted" id="w-msg"></span>
           </div>
           <details style="margin-top:10px">
             <summary>Сменить пароль кошелька</summary>
             <div class="row" style="margin-top:8px">
-              <div><label>Новый пароль</label><input type="password" id="${tab}-newpass" /></div>
-              <div style="flex:0 0 auto"><button class="btn secondary" id="${tab}-chpass">Сменить</button></div>
+              <div><label>Новый пароль</label><input type="password" id="w-newpass" /></div>
+              <div style="flex:0 0 auto"><button class="btn secondary" id="w-chpass">Сменить</button></div>
             </div>
-            <p class="muted">Пароль меняется для всего кошелька этой роли:
-            все его адреса и балансы остаются на месте.</p>
+            <p class="muted">Пароль меняется для всего кошелька: все его адреса
+            и балансы остаются на месте.</p>
           </details>
         </div>
 
-        <div class="card" id="${tab}-send-card" style="display:none">
+        <div class="card" id="w-send-card" style="display:none">
           <h2>Перевести монеты</h2>
           <div class="row">
-            <div><label>Адрес получателя</label><input type="text" id="${tab}-to" /></div>
-            <div><label>Сумма</label><input type="number" id="${tab}-amount" step="1" min="1" placeholder="целые монеты" /></div>
-            <div><label>Комиссия</label><input type="number" id="${tab}-fee" step="1" value="100000" /></div>
+            <div><label>Адрес получателя</label><input type="text" id="w-to" /></div>
+            <div><label>Сумма</label><input type="number" id="w-amount" step="1" min="1" placeholder="целые монеты" /></div>
+            <div><label>Комиссия</label><input type="number" id="w-fee" step="1" value="100000" /></div>
           </div>
           <div style="margin-top:10px">
             <label>Мастера (транзакция уйдёт всем известным)</label>
-            <div id="${tab}-masters" class="chips"></div>
+            <div id="w-masters" class="chips"></div>
           </div>
           <div class="actions">
-            <button class="btn" id="${tab}-send">Отправить всем</button>
-            <span class="muted" id="${tab}-send-msg"></span>
+            <button class="btn" id="w-send">Отправить всем</button>
+            <span class="muted" id="w-send-msg"></span>
           </div>
         </div>
       </div>
@@ -848,110 +842,76 @@ function buildWalletTab(tab) {
       <div>
         <div class="card">
           <h2>Содержимое</h2>
-          <div id="${tab}-content" class="muted">нажмите «Открыть»</div>
+          <div id="w-content" class="muted">нажмите «Открыть»</div>
         </div>
 
-        <div class="card" id="${tab}-tx-card" style="display:none">
+        <div class="card" id="w-tx-card" style="display:none">
           <h2>Транзакция</h2>
-          <div id="${tab}-tx"></div>
+          <div id="w-tx"></div>
         </div>
       </div>
     </div>`;
 
-  document.getElementById(tab + '-open').addEventListener('click', async () => {
-    const password = document.getElementById(tab + '-password').value;
-    const root = document.getElementById(tab + '-root').value;
-    wallets[tab].password = password;
-    const msg = document.getElementById(tab + '-msg');
-    msg.textContent = 'читаю…';
-    const data = await api('/api/wallet/info', {
-      password, resultsRoot: root || null, role: isMaster ? 'master' : 'worker',
-      element: document.getElementById(tab + '-chain').value || null,
-      masters: walletMasters(),
-    });
-    if (!data.ok) {
-      msg.innerHTML = `<span class="err">${esc(data.error || 'ошибка')}</span>`;
-      document.getElementById(tab + '-content').innerHTML =
-        '<span class="muted">кошелёк не открыт</span>';
-      return;
-    }
-    msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
-      + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0}</span>`
-      + ` <span class="muted">· обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`
-      + ((data.also_roles || []).length
-        ? ` <span class="muted">(этот пароль открывает также: ${esc(data.also_roles.join(', '))} —
-           в своей вкладке)</span>`
-        : '');
-    document.getElementById(tab + '-send-card').style.display = 'block';
-    wallets[tab].state = data;
-    renderWallet(tab, data);
-  });
+  $('#w-open').addEventListener('click', openWallet);
+  $('#w-chain').addEventListener('change', () => { if (walletState) refreshWallet(); });
+  $('#w-root').addEventListener('change', refreshChains);
+  $('#w-chpass').addEventListener('click', changePassword);
+  $('#w-send').addEventListener('click', sendCoins);
 
-  document.getElementById(tab + '-chain').addEventListener('change', () => {
-    if (wallets[tab].state) refreshWallet(tab);
-  });
-  document.getElementById(tab + '-root').addEventListener('change', () => {
-    refreshChains(tab);
-  });
-
-  document.getElementById(tab + '-content').addEventListener('click', (ev) => {
+  $('#w-content').addEventListener('click', async (ev) => {
+    const add = ev.target.closest('[data-newkey]');
+    if (add) { await newAddress(); return; }
     const row = ev.target.closest('tr[data-txid]');
-    if (row) showTxDetails(tab, row.dataset.txid);
-  });
-
-  document.getElementById(tab + '-chpass').addEventListener('click', async () => {
-    const password = document.getElementById(tab + '-password').value;
-    const newPassword = document.getElementById(tab + '-newpass').value;
-    if (!newPassword) return;
-    const r = await api('/api/wallet/passwd', {
-      password, newPassword, role: isMaster ? 'master' : 'worker',
-      resultsRoot: document.getElementById(tab + '-root').value || null,
-    });
-    const msg = document.getElementById(tab + '-msg');
-    msg.innerHTML = r.ok
-      ? `<span class="ok">пароль изменён (${r.changed} записей) — обновите поле пароля</span>`
-      : `<span class="err">${esc(r.error)}</span>`;
-  });
-
-  document.getElementById(tab + '-send').addEventListener('click', async () => {
-    const btn = document.getElementById(tab + '-send');
-    const msg = document.getElementById(tab + '-send-msg');
-    const password = document.getElementById(tab + '-password').value;
-    const masters = walletMasters();
-    btn.disabled = true;
-    msg.textContent = 'отправляю всем мастерам…';
-    const r = await api('/api/wallet/send', {
-      password,
-      resultsRoot: document.getElementById(tab + '-root').value || null,
-      to: document.getElementById(tab + '-to').value.trim(),
-      amount: document.getElementById(tab + '-amount').value,
-      fee: document.getElementById(tab + '-fee').value,
-      masters,
-      role: isMaster ? 'master' : 'worker',
-    });
-    btn.disabled = false;
-    msg.innerHTML = r.ok
-      ? `<span class="ok">tx ${esc(r.txid.slice(0, 16))}… принята ${esc((r.accepted_by || []).join(', '))}</span>`
-      : `<span class="err">${esc(r.error || 'мастер не принял транзакцию')}</span>`;
-    if (r.ok) refreshWallet(tab);
+    if (row) showTxDetails(row.dataset.txid);
   });
 }
 
-function renderWallet(tab, data) {
-  const box = document.getElementById(tab + '-content');
-  if (!data.wallets || !data.wallets.length) {
-    box.innerHTML = '<span class="muted">пусто</span>';
+async function openWallet() {
+  const password = document.getElementById('w-password').value;
+  const root = document.getElementById('w-root').value;
+  const msg = document.getElementById('w-msg');
+  msg.textContent = 'читаю…';
+  const data = await api('/api/wallet/info', {
+    password, resultsRoot: root || null,
+    element: document.getElementById('w-chain').value || null,
+    masters: walletMasters(),
+  });
+  if (!data.ok) {
+    walletState = null;
+    document.getElementById('w-send-card').style.display = 'none';
+    document.getElementById('w-content').innerHTML = '<span class="muted">кошелёк не открыт</span>';
+    msg.innerHTML = `<span class="err">${esc(data.error || 'ошибка')}</span>`;
     return;
   }
-  box.innerHTML = data.wallets.map((w) => {
-    const addrs = w.addresses.map((a) => `
-      <div class="mono muted" style="font-size:11.5px">${esc(a.address)}</div>`).join('');
-    const txs = (w.transactions || []).slice()
-      .sort((a, b) => {
-        if (Boolean(a.mempool) !== Boolean(b.mempool)) return a.mempool ? -1 : 1;
-        return (b.block || 0) - (a.block || 0);
-      })
-      .map((t) => {
+  walletState = data;
+  document.getElementById('w-send-card').style.display = 'block';
+  if (data.chains) applyChains(data.chains, data.element);
+  renderWallet(data);
+  msg.innerHTML = walletStatus(data);
+}
+
+function walletStatus(data) {
+  return `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
+    + ` <span class="muted">мастеров: ${(data.masters || []).length},`
+    + ` в мемпуле: ${data.mempool_count || 0},`
+    + ` адресов: ${data.wallet ? data.wallet.addresses.length : 0}</span>`;
+}
+
+function renderWallet(data) {
+  const box = document.getElementById('w-content');
+  const w = data.wallet;
+  if (!w) {
+    box.innerHTML = '<span class="muted">адресов нет</span>';
+    return;
+  }
+  const addrs = (w.addresses || []).map((a) => `
+    <div class="mono muted" style="font-size:11.5px">${esc(a.address)}</div>`).join('');
+  const txs = (w.transactions || []).slice()
+    .sort((a, b) => {
+      if (Boolean(a.mempool) !== Boolean(b.mempool)) return a.mempool ? -1 : 1;
+      return (b.block || 0) - (a.block || 0);
+    })
+    .map((t) => {
       const pending = Boolean(t.mempool);
       const net = (t.received || 0) - (t.sent || 0);
       const amount = (net >= 0 ? '+' : '−') + Math.abs(net);
@@ -969,28 +929,27 @@ function renderWallet(tab, data) {
       </tr>`;
     }).join('');
 
-    return `
-      <div class="proc">
-        <div class="head">
-          <b>${w.role === 'master' ? 'мастер' : 'воркер'}</b>
-          <span class="mono muted">${esc(data.element)}</span>
-          <span class="muted">адресов: ${w.addresses.length}</span>
-          <button class="btn secondary" style="margin-left:auto;padding:4px 10px;font-size:12px"
-                  data-newkey="1" data-role="${esc(w.role)}">＋ адрес</button>
-          <span class="pill ok">доступно ${w.totals.available.toFixed(2)}</span>
-          <span class="pill warn">pending ${w.totals.pending.toFixed(2)}</span>
-          <span class="pill off">всего ${w.totals.total.toFixed(2)}</span>
-        </div>
-        <h3>Адреса</h3>
-        ${addrs || '<span class="muted">нет</span>'}
-        <h3>Транзакции</h3>
-        ${txs ? `<table class="tbl">
-          <thead><tr><th>Блок</th><th>Тип</th><th>Сумма</th><th>Комиссия</th>
-          <th>Подтв.</th><th>Txid</th></tr></thead>
-          <tbody>${txs}</tbody></table>`
-        : '<span class="muted">транзакций пока нет</span>'}
-      </div>`;
-  }).join('');
+  box.innerHTML = `
+    <div class="proc">
+      <div class="head">
+        <b>кошелёк</b>
+        <span class="mono muted">${esc(data.element)}</span>
+        <span class="muted">адресов: ${w.addresses.length}</span>
+        <button class="btn secondary" style="margin-left:auto;padding:4px 10px;font-size:12px"
+                data-newkey="1">＋ адрес</button>
+        <span class="pill ok">доступно ${w.totals.available.toFixed(2)}</span>
+        <span class="pill warn">pending ${w.totals.pending.toFixed(2)}</span>
+        <span class="pill off">всего ${w.totals.total.toFixed(2)}</span>
+      </div>
+      <h3>Адреса</h3>
+      ${addrs || '<span class="muted">нет</span>'}
+      <h3>Транзакции</h3>
+      ${txs ? `<table class="tbl">
+        <thead><tr><th>Блок</th><th>Тип</th><th>Сумма</th><th>Комиссия</th>
+        <th>Подтв.</th><th>Txid</th></tr></thead>
+        <tbody>${txs}</tbody></table>`
+      : '<span class="muted">транзакций пока нет</span>'}
+    </div>`;
 }
 
 function shortAddr(a) {
@@ -998,16 +957,16 @@ function shortAddr(a) {
   return a.length > 20 ? a.slice(0, 10) + '…' + a.slice(-6) : a;
 }
 
-async function showTxDetails(tab, txid) {
-  const card = document.getElementById(tab + '-tx-card');
-  const box = document.getElementById(tab + '-tx');
+async function showTxDetails(txid) {
+  const card = document.getElementById('w-tx-card');
+  const box = document.getElementById('w-tx');
   card.style.display = 'block';
   box.innerHTML = '<span class="muted">читаю блок…</span>';
   card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
   const data = await api('/api/wallet/tx', {
-    txid, resultsRoot: document.getElementById(tab + '-root').value || null,
-    element: document.getElementById(tab + '-chain').value || null,
+    txid, resultsRoot: document.getElementById('w-root').value || null,
+    element: document.getElementById('w-chain').value || null,
     masters: walletMasters(),
   });
   if (!data.ok) {
@@ -1039,40 +998,96 @@ async function showTxDetails(tab, txid) {
     <h3>Куда — выходы (${data.total_out})</h3>
     ${outs || '<span class="muted">нет выходов</span>'}
     <div class="actions">
-      <button class="btn secondary" id="${tab}-raw-btn">Полная транзакция из блока</button>
-      <button class="btn secondary" id="${tab}-close">Закрыть</button>
+      <button class="btn secondary" id="w-raw-btn">Полная транзакция из блока</button>
+      <button class="btn secondary" id="w-close">Закрыть</button>
     </div>
-    <pre class="log short" id="${tab}-raw" style="display:none">${esc(JSON.stringify(data.raw, null, 2))}</pre>`;
+    <pre class="log short" id="w-raw" style="display:none">${esc(JSON.stringify(data.raw, null, 2))}</pre>`;
 
-  const raw = document.getElementById(tab + '-raw');
-  document.getElementById(tab + '-raw-btn').addEventListener('click', () => {
+  const raw = document.getElementById('w-raw');
+  document.getElementById('w-raw-btn').addEventListener('click', () => {
     raw.style.display = raw.style.display === 'none' ? 'block' : 'none';
   });
-  document.getElementById(tab + '-close').addEventListener('click', () => {
+  document.getElementById('w-close').addEventListener('click', () => {
     card.style.display = 'none';
   });
 }
 
-async function refreshWallet(tab) {
-  const st = wallets[tab];
-  if (!st || !st.state) return;
+async function refreshWallet() {
+  if (!walletState) return;
   const data = await api('/api/wallet/info', {
-    password: document.getElementById(tab + '-password').value,
-    resultsRoot: document.getElementById(tab + '-root').value || null,
-    role: tab === 'wallet1' ? 'master' : 'worker',
-    element: document.getElementById(tab + '-chain').value || null,
+    password: document.getElementById('w-password').value,
+    resultsRoot: document.getElementById('w-root').value || null,
+    element: document.getElementById('w-chain').value || null,
     masters: walletMasters(),
   });
-  if (data.ok) {
-    st.state = data;
-    if (data.chains) applyChains(tab, data.chains, data.element);
-    renderWallet(tab, data);
-    const msg = document.getElementById(tab + '-msg');
-    if (msg) {
-      msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
-        + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0} · обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`;
-    }
+  const msg = document.getElementById('w-msg');
+  if (!data.ok) {
+    // Пароль сменили (или каталог другой) — прежний кошелёк больше не открыт.
+    walletState = null;
+    document.getElementById('w-send-card').style.display = 'none';
+    document.getElementById('w-content').innerHTML = '<span class="muted">кошелёк не открыт</span>';
+    if (msg) msg.innerHTML = `<span class="err">${esc(data.error || 'ошибка')}</span>`;
+    return;
   }
+  walletState = data;
+  if (data.chains) applyChains(data.chains, data.element);
+  renderWallet(data);
+  if (msg) {
+    msg.innerHTML = walletStatus(data)
+      + ` <span class="muted">· обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`;
+  }
+}
+
+async function newAddress() {
+  const password = document.getElementById('w-password').value;
+  const msg = document.getElementById('w-msg');
+  if (!password) { msg.innerHTML = '<span class="err">нужен пароль кошелька</span>'; return; }
+  msg.textContent = 'генерирую адрес…';
+  const r = await api('/api/wallet/newkey', {
+    password,
+    resultsRoot: document.getElementById('w-root').value || null,
+    element: document.getElementById('w-chain').value || null,
+  });
+  if (r.ok) {
+    msg.innerHTML = `<span class="ok">новый адрес: <span class="mono">${esc(r.address)}</span></span>`;
+    refreshWallet();
+  } else {
+    msg.innerHTML = `<span class="err">${esc(r.error || 'не удалось создать адрес')}</span>`;
+  }
+}
+
+async function changePassword() {
+  const password = document.getElementById('w-password').value;
+  const newPassword = document.getElementById('w-newpass').value;
+  if (!newPassword) return;
+  const r = await api('/api/wallet/passwd', {
+    password, newPassword, resultsRoot: document.getElementById('w-root').value || null,
+  });
+  const msg = document.getElementById('w-msg');
+  msg.innerHTML = r.ok
+    ? `<span class="ok">пароль изменён (${r.changed} записей, ${r.keys} ключей) — обновите поле пароля</span>`
+    : `<span class="err">${esc(r.error)}</span>`;
+}
+
+async function sendCoins() {
+  const password = document.getElementById('w-password').value;
+  const msg = document.getElementById('w-send-msg');
+  const to = document.getElementById('w-to').value.trim();
+  const amount = Number(document.getElementById('w-amount').value);
+  const fee = Number(document.getElementById('w-fee').value || 0);
+  if (!password) { msg.innerHTML = '<span class="err">нужен пароль кошелька</span>'; return; }
+  if (!to || !(amount > 0)) { msg.innerHTML = '<span class="err">нужны адрес и сумма</span>'; return; }
+  msg.textContent = 'отправляю…';
+  const r = await api('/api/wallet/send', {
+    password, to, amount, fee,
+    resultsRoot: document.getElementById('w-root').value || null,
+    element: document.getElementById('w-chain').value || null,
+    masters: walletMasters(),
+  });
+  msg.innerHTML = r.ok
+    ? `<span class="ok">принята мастерами: ${esc((r.accepted_by || []).join(', '))}</span>`
+    : `<span class="err">${esc(r.error || 'не принята')}</span>`;
+  if (r.ok) refreshWallet();
 }
 
 function blocksWord(n) {
@@ -1083,21 +1098,21 @@ function blocksWord(n) {
   return 'блоков';
 }
 
-async function refreshChains(tab) {
-  const sel = document.getElementById(tab + '-chain');
+async function refreshChains() {
+  const sel = document.getElementById('w-chain');
   if (!sel) return;
   const data = await api('/api/wallet/chains', {
-    resultsRoot: document.getElementById(tab + '-root').value || null,
+    resultsRoot: document.getElementById('w-root').value || null,
   });
   if (!data.ok) {
     sel.innerHTML = '<option value="">нет цепочек</option>';
     return;
   }
-  applyChains(tab, data.chains || [], data.element);
+  applyChains(data.chains || [], data.element);
 }
 
-function applyChains(tab, chains, current) {
-  const sel = document.getElementById(tab + '-chain');
+function applyChains(chains, current) {
+  const sel = document.getElementById('w-chain');
   if (!sel) return;
   const keep = sel.value || current || '';
   sel.innerHTML = (chains || []).map((c) =>
@@ -1116,18 +1131,16 @@ function walletMasters() {
 }
 
 function fillWalletRoots(dirs) {
-  for (const tab of ['wallet1', 'wallet2']) {
-    const sel = document.getElementById(tab + '-root');
-    if (!sel) continue;
+  const sel = document.getElementById('w-root');
+  if (sel) {
     const cur = sel.value;
     sel.innerHTML = dirs.map((d) =>
       `<option value="${esc(d)}">${esc(d.replace(overview.root + '/', ''))}</option>`).join('');
     if (cur) sel.value = cur;
   }
   // список мастеров для отправки tx: свои + обнаруженные вне панели
-  for (const tab of ['wallet1', 'wallet2']) {
-    const box = document.getElementById(tab + '-masters');
-    if (!box) continue;
+  const box = document.getElementById('w-masters');
+  if (box) {
     const urls = walletMasters();
     box.innerHTML = urls.length
       ? urls.map((u) => `<span class="chip">${esc(u)}</span>`).join('')
@@ -1229,36 +1242,8 @@ async function saveConfigForm(which) {
 
 /* ==================== инициализация ==================== */
 
-buildWalletTab('wallet1');
-buildWalletTab('wallet2');
-
-// новый адрес в конкретном кошельке (карточки рендерятся заново — делегируем)
-['wallet1', 'wallet2'].forEach((tab) => {
-  const box = document.getElementById(tab + '-content');
-  if (!box) return;
-  box.addEventListener('click', async (ev) => {
-    const btn = ev.target.closest('[data-newkey]');
-    if (!btn) return;
-    const password = document.getElementById(tab + '-password').value;
-    const msg = document.getElementById(tab + '-msg');
-    if (!password) { msg.innerHTML = '<span class="err">нужен пароль кошелька</span>'; return; }
-    msg.textContent = 'генерирую адрес…';
-    const r = await api('/api/wallet/newkey', {
-      password,
-      resultsRoot: document.getElementById(tab + '-root').value || null,
-      role: btn.dataset.role,
-      element: document.getElementById(tab + '-chain').value || null,
-    });
-    if (r.ok) {
-      msg.innerHTML = `<span class="ok">новый адрес: <span class="mono">${esc(r.address)}</span></span>`;
-      refreshWallet(tab);
-    } else {
-      msg.innerHTML = `<span class="err">${esc(r.error || 'не удалось создать адрес')}</span>`;
-    }
-  });
-});
-$('#wallet1-password').value = 'master';
-$('#wallet2-password').value = 'worker';
+buildWalletTab();
+$('#w-password').value = 'root';
 
 const _origFillDirs = fillDirSelects;
 fillDirSelects = function (dirs) {
@@ -1267,10 +1252,8 @@ fillDirSelects = function (dirs) {
 
 refreshOverview().then(() => {
   fillWalletRoots(overview.dirs);
-  $('#wallet1-root').value = overview.dirs[0] || '';
-  $('#wallet2-root').value = overview.dirs[0] || '';
-  refreshChains('wallet1');
-  refreshChains('wallet2');
+  $('#w-root').value = overview.dirs[0] || '';
+  refreshChains();
 });
 
 // подсказываем порт мастера из настроек (config.json → port)
@@ -1285,8 +1268,7 @@ refreshNetwork();
 // Кошелёк — независимый клиент: пока вкладка открыта, он сам периодически
 // опрашивает известных мастеров (балансы, подтверждения, мемпул).
 setInterval(() => {
-  const tab = activeTab === 'wallet1' ? 'wallet1' : (activeTab === 'wallet2' ? 'wallet2' : null);
-  if (tab && wallets[tab].state) refreshWallet(tab);
+  if (activeTab === 'wallet' && walletState) refreshWallet();
 }, 5000);
 
 // список мастеров тоже обновляем — адреса могут появиться через gossip
