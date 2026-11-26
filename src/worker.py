@@ -135,7 +135,7 @@ def _worker_password(arg: str | None) -> str | None:
     return None
 
 
-def run_task(task: dict, cfg: dict, logger):
+def run_task(task: dict, cfg: dict, logger, verbose: bool | None = None):
     """
     Считает ВЫДАННУЮ мастером геометрию и собирает payload.
 
@@ -161,6 +161,10 @@ def run_task(task: dict, cfg: dict, logger):
         species = [cfg["element"]] * n_atoms
 
     cfg = dict(cfg)
+    # Флаг панели переопределяет verbose из задания (это настройка конкретного
+    # запуска воркера, а не мастера).
+    if verbose is not None:
+        cfg["verbose_cp2k"] = bool(verbose)
     cfg["progress"] = logger.info
     cfg["species"] = species
 
@@ -384,6 +388,10 @@ def main():
                         help="пароль кошелька воркера (иначе WORKER_PASSWORD или запрос)")
     parser.add_argument("--master", action="append", default=None,
                         help="URL мастера (можно несколько); первый — основной")
+    parser.add_argument("--verbose", dest="verbose", action="store_true", default=None,
+                        help="подробный лог CP2K (по умолчанию — как передал мастер)")
+    parser.add_argument("--no-verbose", dest="verbose", action="store_false",
+                        help="не печатать шаги SCF")
     args = parser.parse_args()
 
     # Отпечаток сборки CP2K: считать чужим билдом бессмысленно — мастер всё
@@ -495,7 +503,7 @@ def main():
                 logger.info(f"Получено задание {struct_id}: элемент {cfg['element']} "
                             f"({cfg['potential']}), n={n_atoms}, dim={dim}")
 
-                success, data = run_task(task, cfg, logger)
+                success, data = run_task(task, cfg, logger, verbose=args.verbose)
 
                 if success:
                     logger.info(f"Результат {struct_id} готов: отправляю -RESTART.wfn и геометрию мастеру")

@@ -245,25 +245,19 @@
           </div>
         </div>
 
+        <div class="checks" style="margin-top:10px">
+          <label class="cfg-bool" style="display:flex; gap:8px; align-items:center">
+            <input type="checkbox" id="w-verbose" checked />
+            <span>Подробный лог CP2K (шаги SCF)</span>
+          </label>
+          <div class="muted" style="margin-left:24px">действует только для этого запуска</div>
+        </div>
+
         <div class="actions">
           <button class="btn" id="btn-worker-start">Запустить воркера</button>
           <span id="w-msg" class="muted"></span>
         </div>
       </div>
-
-      <details class="card" id="cfg-worker-box">
-        <summary><b>Настройки</b> <span class="muted">что воркер получает от мастера</span></summary>
-        <p class="muted" style="margin:8px 0 10px">
-          Воркер не читает файлы сам: мастер передаёт ему эти значения в задании.
-          Остальные параметры (очередь, кошелёк, блокчейн) — во вкладке «Мастер».
-        </p>
-        <div id="cfg-worker" class="cfg-form"><span class="muted">откройте блок, чтобы прочитать</span></div>
-        <div class="actions">
-          <button class="btn" id="cfg-worker-save">Сохранить</button>
-          <button class="btn secondary" id="cfg-worker-reload">Перечитать</button>
-          <span class="muted" id="cfg-worker-msg"></span>
-        </div>
-      </details>
 
       <div class="card">
         <h2>Воркеры</h2>
@@ -721,6 +715,7 @@ $('#btn-worker-start').addEventListener('click', async () => {
   const r = await api('/api/worker/start', {
     name: $('#w-name').value.trim() || null,
     masters,
+    verbose: $('#w-verbose').checked,
   });
   btn.disabled = false;
   if (r.ok) {
@@ -1083,9 +1078,7 @@ function fillWalletRoots(dirs) {
 
 /* ==================== настройки (src/config.json) ==================== */
 
-// Мастер передаёт воркеру только эти ключи (см. task_cfg_payload в src/main.py)
-const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k'];
-// Эти ключи относятся только к воркеру — в настройках мастера их не показываем
+// Эти ключи в настройках мастера не показываем
 const HIDDEN_IN_MASTER = ['port', 'coinbase_confirmations'];
 
 function configField(key, entry) {
@@ -1119,9 +1112,7 @@ async function loadConfigForm(which) {
   }
   const cfg = data.config || {};
   box.dataset.json = JSON.stringify(cfg);
-  const keys = Object.keys(cfg).filter((k) => (which === 'master'
-    ? !HIDDEN_IN_MASTER.includes(k)
-    : WORKER_CONFIG_KEYS.includes(k)));
+  const keys = Object.keys(cfg).filter((k) => !HIDDEN_IN_MASTER.includes(k));
   box.innerHTML = keys.map((k) => configField(k, cfg[k])).join('')
     || '<span class="muted">нет полей</span>';
   if (msg) msg.textContent = '';
@@ -1165,7 +1156,7 @@ async function saveConfigForm(which) {
   }
 }
 
-['master', 'worker'].forEach((which) => {
+['master'].forEach((which) => {
   const details = document.getElementById('cfg-' + which + '-box');
   if (!details) return;
   details.addEventListener('toggle', () => {

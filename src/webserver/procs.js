@@ -201,6 +201,9 @@ async function startWorker(opts = {}) {
 
     const args = ['src/worker.py', '--name', name];
     for (const url of masters) args.push('--master', url);
+    if (opts.verbose === true) args.push('--verbose');
+    else if (opts.verbose === false) args.push('--no-verbose');
+    rec.verbose = opts.verbose;
 
     start(rec, 'python3', args, { WORKER_PASSWORD: password, WORKER_MASTERS: masters.join(',') });
     return publicRecord(rec);
