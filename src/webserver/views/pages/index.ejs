@@ -27,6 +27,17 @@
   }
   header h1 { font-size: 18px; margin: 0; font-weight: 600; }
   header .hint { color: #9fb0c0; font-size: 12px; }
+  header .auth { display: flex; gap: 10px; align-items: center; }
+  header .auth a {
+    color: #cbd7e3; text-decoration: none; font-size: 12px; line-height: 1;
+    padding: 6px 11px; border: 1px solid rgba(203, 215, 227, .28);
+    border-radius: 999px; transition: background .15s, color .15s, border-color .15s;
+  }
+  header .auth a:hover {
+    color: #fff; background: rgba(99, 179, 237, .16);
+    border-color: rgba(99, 179, 237, .6);
+  }
+  header .auth a:focus-visible { outline: 2px solid #63b3ed; outline-offset: 2px; }
   #statusline { margin-left: auto; font-size: 12px; color: #cbd7e3; display: flex; gap: 14px; }
   nav.tabs { display: flex; gap: 2px; padding: 0 20px; background: #1e2c3a; }
   nav.tabs button {
@@ -124,15 +135,16 @@
 <body>
 
 <header>
-      <div class="muted" style="margin-left:auto;font-size:12px;display:flex;gap:12px">
-        <a href="/password">сменить пароль</a><a href="/logout">выйти</a>
-      </div>
   <h1>CP2K + MACE</h1>
   <span class="hint">мастер · воркер · MACE · кошельки — в одном окне</span>
   <div id="statusline">
     <span id="st-masters">мастеров: —</span>
     <span id="st-workers">воркеров: —</span>
     <span id="st-height">высота: —</span>
+  </div>
+  <div class="auth">
+    <a href="/password">сменить пароль</a>
+    <a href="/logout">выйти</a>
   </div>
 </header>
 
