@@ -29,6 +29,27 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "results", "keys.db")
 
 
+def _save_confirmations(value: int) -> None:
+    """Пишет coinbase_confirmations в src/config.json, сохраняя владельца файла."""
+    path = os.path.join(PROJECT_ROOT, "src", "config.json")
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    entry = raw.get("coinbase_confirmations")
+    if isinstance(entry, dict) and "value" in entry:
+        entry["value"] = int(value)
+    else:
+        raw["coinbase_confirmations"] = {"value": int(value)}
+    st = os.stat(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
 def _element() -> str:
     try:
         with open(os.path.join(PROJECT_ROOT, "src", "config.json"), encoding="utf-8") as f:
@@ -182,12 +203,25 @@ def main():
     ap.add_argument("--name", default=None)
     ap.add_argument("--confirmations", type=int, default=None,
                     help="подтверждений до доступности баланса (по умолчанию из config.json)")
+    ap.add_argument("--set-confirmations", type=int, default=None,
+                    help="сохранить число подтверждений в config.json "
+                         "(для мастеров применится при следующем запуске)")
     ap.add_argument("--send-to", default=None, help="адрес получателя")
     ap.add_argument("--amount", type=int, default=None, help="сумма перевода (целые монеты)")
     ap.add_argument("--fee", type=int, default=chain.TX_FEE, help="комиссия (целые монеты)")
     ap.add_argument("--master", action="append", default=None,
                     help="URL мастера для отправки tx (можно несколько)")
     args = ap.parse_args()
+
+    if args.set_confirmations is not None:
+        value = int(args.set_confirmations)
+        if value < 0:
+            print("✗ --set-confirmations не может быть отрицательным", file=sys.stderr)
+            sys.exit(2)
+        _save_confirmations(value)
+        print(f"✓ coinbase_confirmations = {value} "
+              f"(применится к следующему запуску мастера)")
+        return
 
     password = args.password
     if not password:

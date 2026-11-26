@@ -51,6 +51,6 @@
   },
   "coinbase_confirmations": {
     "value": 1,
-    "help": "Сколько блоков должно пройти, чтобы выход стал доступен для траты (coinbase maturity). Меняется через master-cli config set."
+    "help": "Сколько блоков должно пройти, чтобы выход стал доступен для траты (coinbase maturity). Настройка кошелька: python3 src/wallet.py --set-confirmations N (применится к следующему запуску мастера)."
   }
 }

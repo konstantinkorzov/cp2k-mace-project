@@ -91,7 +91,7 @@ docker exec -it cp2k-mace-cpu python3 src/worker.py \
 
 | Вкладка | Что делает |
 |---|---|
-| **Мастер** | Запуск/остановка мастера; порт и каталог — «авто» (свободный порт с 8000, отдельный `results-*`), очередь, высота цепочки, пиры (добавить/удалить), выпадающий блок «Настройки» (`src/config.json`). |
+| **Мастер** | Запуск/остановка; порт — «авто» (свободный с 8000) или явно; каталог результатов выбирает код (`results`, затем `results-<порт>`), пароль кошелька — по умолчанию `master`; очередь, высота цепочки, пиры (добавить/удалить), «Настройки» (`src/config.json`). |
 | **Воркер** | Запуск/остановка; имя = кошелёк; список мастеров галочками (панель + пиры); живой лог SCF и лог CP2K; настройки воркера. |
 | **MACE** | Запуск `mace_pipeline/run_mace.py` и его лог. |
 | **Кошелёк 1 / 2** | Две независимые вкладки: пароль решает, чей кошелёк открыть (`master` / `worker`). Адреса, балансы, транзакции с подтверждениями и мемпулом, детали по клику, перевод **всем известным мастерам**. |
@@ -302,7 +302,7 @@ tx_root, nonce, dft_sha256, geom_version, template, block_id`) с
 | `restart_max_mb` | лимит размера принятого `-RESTART.wfn`, МБ (для 55+ атомов — 512) |
 | `cp2k_timeout_sec` | таймаут одного прогона CP2K, секунды (по умолчанию 1 ч; для димера хватает, для десятков атомов увеличьте) |
 | `task_timeout_sec` | жёсткий предел удержания задачи (2 ч) — предохранитель; обычно задача возвращается через 3 минуты после пропажи heartbeat |
-| `coinbase_confirmations` | через сколько блоков доступны новые монеты |
+| `coinbase_confirmations` | через сколько блоков доступны новые монеты (настройка кошелька: `wallet.py --set-confirmations N`) |
 
 > ⚠️ **Чего в config.json нет и не должно быть.** Расписание размеров
 > (`start_atoms`, `base_blocks`, `exponent`, `max_atoms`) и чередование
@@ -404,7 +404,6 @@ python3 src/master-cli.py queue           # что в очереди
 python3 src/master-cli.py workers
 python3 src/master-cli.py config list
 python3 src/master-cli.py config set verbose_cp2k false
-python3 src/master-cli.py config set coinbase_confirmations 2
 python3 src/master-cli.py pause | resume
 python3 src/master-cli.py keys list | keys new
 python3 src/master-cli.py balances
@@ -414,14 +413,19 @@ python3 src/master-cli.py passwd
 python3 src/master-cli.py sync
 ```
 
-Меняемые на лету: `verbose_cp2k`, `restart_max_mb`, `atom_diameter`,
-`coinbase_confirmations`. Остальное — при следующем запуске.
+Меняемые на лету: `verbose_cp2k`, `restart_max_mb`, `atom_diameter`.
+`coinbase_confirmations` — настройка **кошелька**, не мастера:
+`python3 src/wallet.py --set-confirmations N` (применится к следующему запуску
+мастера). Остальное — при следующем запуске.
 
 ### wallet.py и webwallet.py
 
 ```bash
 # кошелёк по паролю: роль, адреса, балансы, транзакции с подтверждениями
 python3 src/wallet.py --password root
+
+# настройка кошелька: сколько блоков ждать до доступности монет
+python3 src/wallet.py --set-confirmations 2
 
 # JSON-версия (та же логика; её использует веб-панель)
 python3 src/webwallet.py info --password root --role master \

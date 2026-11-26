@@ -165,26 +165,15 @@
       <div class="card">
         <h2>Запустить мастера</h2>
         <p class="muted" style="margin-top:-4px">
-          Пустые порт и папка — «авто»: панель сама найдёт свободный порт (с 8000)
-          и отдельный каталог результатов, чтобы мастера не конфликтовали.
+          Пустой порт — «авто»: панель найдёт свободный (с 8000) и отдельный
+          каталог результатов (results, затем results-&lt;порт&gt;). Пиры и прочие
+          параметры — в «Настройках» ниже (src/config.json).
         </p>
         <div class="row">
           <div>
             <label>Порт (пусто = авто)</label>
             <input type="number" id="m-port" placeholder="авто" min="1" max="65535" />
           </div>
-          <div>
-            <label>Каталог результатов (пусто = авто)</label>
-            <input type="text" id="m-dir" placeholder="results" />
-          </div>
-          <div>
-            <label>Пароль кошелька</label>
-            <input type="password" id="m-password" value="master" />
-          </div>
-        </div>
-        <div style="margin-top:10px">
-          <label>Пиры (по одному URL в строке, необязательно)</label>
-          <textarea id="m-peers" placeholder="http://127.0.0.1:8001"></textarea>
         </div>
         <div class="actions">
           <button class="btn" id="btn-master-start">Запустить мастера</button>
@@ -239,10 +228,6 @@
           <div>
             <label>Имя (имя кошелька)</label>
             <input type="text" id="w-name" placeholder="авто: worker1, worker2…" />
-          </div>
-          <div>
-            <label>Пароль кошелька</label>
-            <input type="password" id="w-password" value="worker" />
           </div>
         </div>
 
@@ -657,12 +642,8 @@ $('#btn-master-start').addEventListener('click', async () => {
   const btn = $('#btn-master-start');
   btn.disabled = true;
   $('#m-msg').textContent = 'запускаю…';
-  const peers = $('#m-peers').value.split(/[\s,;]+/).filter(Boolean);
   const r = await api('/api/master/start', {
     port: $('#m-port').value || null,
-    dir: $('#m-dir').value.trim() || null,
-    password: $('#m-password').value || 'master',
-    peers,
   });
   btn.disabled = false;
   if (r.ok) {
@@ -739,7 +720,6 @@ $('#btn-worker-start').addEventListener('click', async () => {
   $('#w-msg').textContent = 'запускаю…';
   const r = await api('/api/worker/start', {
     name: $('#w-name').value.trim() || null,
-    password: $('#w-password').value || 'worker',
     masters,
   });
   btn.disabled = false;
@@ -1106,7 +1086,8 @@ function fillWalletRoots(dirs) {
 // Мастер передаёт воркеру только эти ключи (см. task_cfg_payload в src/main.py)
 const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k', 'worker_port'];
 // Эти ключи относятся только к воркеру — в настройках мастера их не показываем
-const HIDDEN_IN_MASTER = ['worker_server', 'worker_port'];
+const HIDDEN_IN_MASTER = ['worker_server', 'worker_port', 'port',
+                       'coinbase_confirmations'];
 
 function configField(key, entry) {
   const wrapped = entry && typeof entry === 'object' && 'value' in entry;

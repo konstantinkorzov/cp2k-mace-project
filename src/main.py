@@ -2522,7 +2522,8 @@ ADMIN_SETTINGS = {
     "verbose_cp2k": bool,
     "restart_max_mb": int,
     "atom_diameter": float,
-    "coinbase_confirmations": int,
+    # coinbase_confirmations — настройка кошелька (wallet.py --set-confirmations),
+    # не мастера: из админ-API убрана.
 }
 
 
