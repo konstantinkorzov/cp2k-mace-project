@@ -58,7 +58,7 @@ def make_dft(n_atoms=2, energy=-42.0):
 
 CP2K = {"cp2k_version": "2024.3",
         "cp2k_build": cp2k_runner.CP2K_BUILD_CPU,
-        "cp2k_params": {"cutoff": 400}}
+        "cp2k_params": dict(cp2k_runner.CP2K_PARAMS)}
 
 
 def write_block(element_dir, txs, dft=None, sha=None, rel=None, n_atoms=2):
@@ -107,7 +107,7 @@ def test_coinbase_overpay():
     d = new_element()
     try:
         _, _, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 10 ** 6)
+        cb = chain.make_coinbase(1, addr, 10 ** 9)
         write_block(d, [cb])
         v = chain.verify_chain(d, "Cu")
         check("coinbase 1 000 000 вместо 50+комиссии", not v["ok"], attack=True)
@@ -120,12 +120,12 @@ def test_negative_output_inflation():
     d = new_element()
     try:
         seed, pub, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 50.0)
+        cb = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
         write_block(d, [cb])
         tx = sign_tx(transfer([(chain.txid_of(cb), 0)],
-                              [{"value": -1_000_000.0, "address": addr},
-                               {"value": 1_000_050.0, "address": addr}]), seed, pub)
-        write_block(d, [chain.make_coinbase(2, addr, 50.0), tx])
+                              [{"value": -1_000_000, "address": addr},
+                               {"value": chain.COINBASE_VALUE + 1_000_000, "address": addr}]), seed, pub)
+        write_block(d, [chain.make_coinbase(2, addr, chain.COINBASE_VALUE), tx])
         v = chain.verify_chain(d, "Cu")
         check("отрицательный выход (эмиссия 1 000 000)", not v["ok"],
               str(v["problems"][:2]), attack=True)
@@ -137,12 +137,12 @@ def test_nan_output():
     d = new_element()
     try:
         seed, pub, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 50.0)
+        cb = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
         write_block(d, [cb])
         tx = sign_tx(transfer([(chain.txid_of(cb), 0)],
                               [{"value": float("nan"), "address": addr},
-                               {"value": 50.0, "address": addr}]), seed, pub)
-        write_block(d, [chain.make_coinbase(2, addr, 50.0), tx])
+                               {"value": chain.COINBASE_VALUE, "address": addr}]), seed, pub)
+        write_block(d, [chain.make_coinbase(2, addr, chain.COINBASE_VALUE), tx])
         v = chain.verify_chain(d, "Cu")
         check("NaN в сумме выхода", not v["ok"], str(v["problems"][:2]), attack=True)
     finally:
@@ -154,10 +154,10 @@ def test_coinbase_maturity_policy():
     d = new_element()
     try:
         seed, pub, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 50.0)
+        cb = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
         write_block(d, [cb])
         tx = sign_tx(transfer([(chain.txid_of(cb), 0)],
-                              [{"value": 40.0, "address": addr}]), seed, pub)
+                              [{"value": 40_000_000, "address": addr}]), seed, pub)
         ok, probs = chain.validate_tx(tx, d, height=1, confirmations=1)
         check("трата coinbase в том же блоке (height=1)", not ok,
               str(probs[:2]), attack=True)
@@ -173,13 +173,13 @@ def test_double_spend_same_block():
     d = new_element()
     try:
         seed, pub, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 50.0)
+        cb = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
         write_block(d, [cb])
         t1 = sign_tx(transfer([(chain.txid_of(cb), 0)],
-                              [{"value": 49.9, "address": addr}]), seed, pub)
+                              [{"value": 49_900_000, "address": addr}]), seed, pub)
         t2 = sign_tx(transfer([(chain.txid_of(cb), 0)],
-                              [{"value": 49.8, "address": addr}]), seed, pub)
-        write_block(d, [chain.make_coinbase(2, addr, 50.0), t1, t2])
+                              [{"value": 49_800_000, "address": addr}]), seed, pub)
+        write_block(d, [chain.make_coinbase(2, addr, chain.COINBASE_VALUE), t1, t2])
         v = chain.verify_chain(d, "Cu")
         check("двойная трата одного входа в блоке", not v["ok"],
               str(v["problems"][:2]), attack=True)
@@ -195,7 +195,7 @@ def test_wrong_key_signature():
         cb = chain.make_coinbase(1, addr_a, 50.0)
         write_block(d, [cb])
         tx = sign_tx(transfer([(chain.txid_of(cb), 0)],
-                              [{"value": 40.0, "address": addr_a}]), seed_b, pub_b)
+                              [{"value": 40_000_000, "address": addr_a}]), seed_b, pub_b)
         write_block(d, [chain.make_coinbase(2, addr_a, 50.0), tx])
         v = chain.verify_chain(d, "Cu")
         check("подпись чужим ключом", not v["ok"], str(v["problems"][:2]), attack=True)
@@ -207,12 +207,12 @@ def test_tampered_tx_after_signature():
     d = new_element()
     try:
         seed, pub, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 50.0)
+        cb = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
         write_block(d, [cb])
         tx = sign_tx(transfer([(chain.txid_of(cb), 0)],
-                              [{"value": 40.0, "address": addr}]), seed, pub)
-        tx["outputs"][0]["value"] = 49.9        # подменили сумму после подписи
-        write_block(d, [chain.make_coinbase(2, addr, 50.0), tx])
+                              [{"value": 40_000_000, "address": addr}]), seed, pub)
+        tx["outputs"][0]["value"] = 49_900_000        # подменили сумму после подписи
+        write_block(d, [chain.make_coinbase(2, addr, chain.COINBASE_VALUE), tx])
         v = chain.verify_chain(d, "Cu")
         check("подмена выхода после подписи (txid)", not v["ok"],
               str(v["problems"][:2]), attack=True)
@@ -244,7 +244,7 @@ def test_duplicate_seq_different_n():
     d = new_element()
     try:
         seed, pub, addr = keypair()
-        cb = chain.make_coinbase(1, addr, 50.0)
+        cb = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
         p1 = write_block(d, [cb])
         dup = os.path.join(os.path.dirname(p1), "000001_Cu_3.zip")
         shutil.copyfile(p1, dup)

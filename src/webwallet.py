@@ -74,7 +74,7 @@ def _mempool_rows(txs: dict, index: dict, addresses: set[str]) -> list[dict]:
     """Неподтверждённые транзакции, затрагивающие адреса кошелька."""
     rows = []
     for tid, tx in txs.items():
-        received = sum(float(o.get("value") or 0.0)
+        received = sum(int(o.get("value") or 0)
                        for o in tx.get("outputs", [])
                        if o.get("address") in addresses)
         sent = 0.0
@@ -90,11 +90,11 @@ def _mempool_rows(txs: dict, index: dict, addresses: set[str]) -> list[dict]:
                 sent += value
         if not received and not sent:
             continue
-        total_out = sum(float(o.get("value") or 0.0) for o in tx.get("outputs", []))
+        total_out = sum(int(o.get("value") or 0) for o in tx.get("outputs", []))
         rows.append({
             "block": None, "type": tx.get("type"), "txid": tid,
-            "received": round(received, 8), "sent": round(sent, 8),
-            "fee": round(max(0.0, total_in - total_out), 8),
+            "received": int(received), "sent": int(sent),
+            "fee": int(max(0, total_in - total_out)),
             "confirmations": 0, "mempool": True,
         })
     rows.sort(key=lambda r: r["txid"])
@@ -170,7 +170,7 @@ def collect(root: str, password: str, confirmations: int,
             txs = _mempool_rows(mempool, index, addresses) + txs
         for b in balances.values():
             for key in totals:
-                totals[key] += float(b.get(key) or 0.0)
+                totals[key] += int(b.get(key) or 0)
 
         # Мемпул блокирует потраченные выходы и добавляет будущие поступления.
         locked = sum(t["sent"] for t in txs if t.get("mempool"))
@@ -185,7 +185,7 @@ def collect(root: str, password: str, confirmations: int,
             "addresses": [{"address": k["address"], "created_at": k["created_at"]}
                           for k in w.keys()],
             "balances": balances,
-            "totals": {k: round(v, 8) for k, v in totals.items()},
+            "totals": {k: int(v) for k, v in totals.items()},
             "transactions": txs,
         })
 
@@ -206,7 +206,7 @@ def _outputs_index(element_dir: str) -> dict:
         for tx in txs:
             tid = tx.get("txid") or chain.txid_of(tx)
             for n, out in enumerate(tx.get("outputs", [])):
-                index[(tid, n)] = (out.get("address"), float(out.get("value") or 0.0))
+                index[(tid, n)] = (out.get("address"), int(out.get("value") or 0))
     return index
 
 
@@ -227,13 +227,13 @@ def _tx_payload(tx: dict, index: dict, block: int | None,
                        "vout": i.get("vout")})
 
     outputs = [{"vout": n, "address": o.get("address"),
-                "value": float(o.get("value") or 0.0)}
+                "value": int(o.get("value") or 0)}
                for n, o in enumerate(tx.get("outputs", []))]
     total_out = sum(o["value"] for o in outputs)
 
     fee = None
     if tx.get("type") != "coinbase" and total_in:
-        fee = round(total_in - total_out, 8)
+        fee = int(total_in - total_out)
 
     return {
         "ok": True, "block": block, "confirmations": confirmations,
@@ -241,7 +241,7 @@ def _tx_payload(tx: dict, index: dict, block: int | None,
         "type": tx.get("type"),
         "txid": tx.get("txid") or chain.txid_of(tx),
         "fee": fee, "inputs": inputs, "outputs": outputs,
-        "total_in": round(total_in, 8), "total_out": round(total_out, 8),
+        "total_in": int(total_in), "total_out": int(total_out),
         "raw": {k: v for k, v in tx.items() if k != "_file"},
     }
 
@@ -282,13 +282,13 @@ def tx_details(root: str, txid: str, masters: list[str] | None = None) -> dict:
                                "vout": i.get("vout")})
 
             outputs = [{"vout": n, "address": o.get("address"),
-                        "value": float(o.get("value") or 0.0)}
+                        "value": int(o.get("value") or 0)}
                        for n, o in enumerate(tx.get("outputs", []))]
             total_out = sum(o["value"] for o in outputs)
 
             fee = None
             if tx.get("type") != "coinbase" and total_in:
-                fee = round(total_in - total_out, 8)
+                fee = int(total_in - total_out)
 
             return _tx_payload(tx, index, b["seq"], max(0, tip - b["seq"] + 1))
 
@@ -314,7 +314,7 @@ def locked_utxos(masters: list[str] | None) -> set[tuple[str, int]]:
     return locked
 
 
-def send(root: str, password: str, to: str, amount: float, fee: float,
+def send(root: str, password: str, to: str, amount: int, fee: int,
          masters: list[str], confirmations: int, role: str | None,
          name: str | None) -> dict:
     root = _root(root)
@@ -386,8 +386,8 @@ def main() -> int:
     ap.add_argument("--name", default=None)
     ap.add_argument("--confirmations", type=int, default=None)
     ap.add_argument("--to", default=None)
-    ap.add_argument("--amount", type=float, default=0.0)
-    ap.add_argument("--fee", type=float, default=chain.TX_FEE)
+    ap.add_argument("--amount", type=int, default=0)
+    ap.add_argument("--fee", type=int, default=chain.TX_FEE)
     ap.add_argument("--change-to", default=None)
     ap.add_argument("--txid", default=None)
     ap.add_argument("--master", action="append", default=None)

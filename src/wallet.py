@@ -77,7 +77,7 @@ def _transactions(element_dir: str, addresses: set[str]) -> list[dict]:
                 total_in = sum(_output_value(element_dir, i["txid"], int(i["vout"]))
                                for i in tx.get("inputs", []) if not i.get("coinbase"))
                 total_out = sum(o["value"] for o in tx.get("outputs", []))
-                fee = round(total_in - total_out, 8)
+                fee = int(total_in - total_out)
             if received or sent:
                 rows.append({
                     "block": b["seq"], "type": tx.get("type"), "txid": tid,
@@ -91,7 +91,7 @@ def _transactions(element_dir: str, addresses: set[str]) -> list[dict]:
 _value_cache: dict = {}
 
 
-def _output_value(element_dir: str, txid: str, vout: int) -> float:
+def _output_value(element_dir: str, txid: str, vout: int) -> int:
     key = (txid, vout)
     if not _value_cache:
         for b in chain.list_blocks(element_dir):
@@ -99,7 +99,7 @@ def _output_value(element_dir: str, txid: str, vout: int) -> float:
                 for tx in chain.read_block_txs(b["path"]):
                     tid = tx.get("txid") or chain.txid_of(tx)
                     for i, o in enumerate(tx.get("outputs", [])):
-                        _value_cache[(tid, i)] = float(o["value"])
+                        _value_cache[(tid, i)] = int(o["value"])
             except Exception:  # noqa: BLE001
                 continue
     return _value_cache.get(key, 0.0)
@@ -143,7 +143,7 @@ def show(conn, password: str, element_dir: str, confirmations: int) -> int:
     return 0
 
 
-def send_coins(wallet, element_dir: str, to: str, amount: float, fee: float,
+def send_coins(wallet, element_dir: str, to: str, amount: int, fee: int,
                masters: list[str], confirmations: int) -> int:
     tx = chain.build_wallet_transfer(wallet, element_dir, to, amount, fee=fee,
                                      confirmations=confirmations)
@@ -183,8 +183,8 @@ def main():
     ap.add_argument("--confirmations", type=int, default=None,
                     help="подтверждений до доступности баланса (по умолчанию из config.json)")
     ap.add_argument("--send-to", default=None, help="адрес получателя")
-    ap.add_argument("--amount", type=float, default=None, help="сумма перевода")
-    ap.add_argument("--fee", type=float, default=chain.TX_FEE, help="комиссия")
+    ap.add_argument("--amount", type=int, default=None, help="сумма перевода (целые монеты)")
+    ap.add_argument("--fee", type=int, default=chain.TX_FEE, help="комиссия (целые монеты)")
     ap.add_argument("--master", action="append", default=None,
                     help="URL мастера для отправки tx (можно несколько)")
     args = ap.parse_args()

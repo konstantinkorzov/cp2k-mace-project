@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Вход — CP2K + MACE</title>
+<style>
+  :root { --bg:#f4f6f9; --card:#fff; --line:#dfe4ea; --ink:#1f2933; --muted:#6b7785;
+          --accent:#2b6cb0; --red:#c53030; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--ink);
+         font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  form { width:340px; background:var(--card); border:1px solid var(--line); border-radius:10px;
+         padding:22px; box-shadow:0 2px 10px rgba(16,24,40,.06); }
+  h1 { font-size:16px; margin:0 0 14px; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  input { width:100%; padding:9px 10px; border:1px solid var(--line); border-radius:8px;
+          font:inherit; background:#fff; }
+  input:focus { outline:2px solid rgba(43,108,176,.25); border-color:var(--accent); }
+  button { margin-top:14px; width:100%; padding:9px 12px; border:0; border-radius:8px;
+           background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button:hover { filter:brightness(1.05); }
+  .err { background:#fff5f5; border:1px solid #fed7d7; color:var(--red);
+         border-radius:8px; padding:8px 10px; font-size:12.5px; margin-bottom:6px; }
+  .ok { background:#f0fff4; border:1px solid #c6f6d5; color:#2f855a;
+        border-radius:8px; padding:8px 10px; font-size:12.5px; margin-bottom:6px; }
+  .muted { color:var(--muted); font-size:11.5px; margin:12px 0 0; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>CP2K + MACE — панель</h1>
+  <% if (error) { %><div class="err"><%= error %></div><% } %>
+  <label for="password">Пароль администратора</label>
+  <input id="password" type="password" name="password" autofocus
+         autocomplete="current-password" required />
+  <button type="submit">Войти</button>
+  <p class="muted">Пароль задаётся при первом запуске (файл
+    <code>results/webui_admin_password.txt</code>) и меняется на странице «Сменить пароль».</p>
+</form>
+</body>
+</html>

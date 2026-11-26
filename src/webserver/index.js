@@ -6,6 +6,7 @@ const g_constants = require('./constants');
 const https = require('https');
 const http = require('http');
 const express = require('express');
+const auth = require('./auth');
 
 const app = express();
 
@@ -26,14 +27,21 @@ app.locals.paths = {
     LOG_FILE, PID_FILE, STATUS_FILE, ARCHIVE_FILE,
 };
 
-// статика
-app.use(express.static(path.join(__dirname, 'static_pages')));
-
-// body parser для JSON
+// body parser: JSON для API, urlencoded для формы входа
 app.use(express.json({ limit: '8mb' }));
+app.use(express.urlencoded({ extended: false, limit: '16kb' }));
 
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
+
+// Аутентификация панели: без входа доступны только /login и /favicon.ico.
+// Пароль (scrypt-хэш) лежит в results/webui.db, см. src/webadmin.py.
+auth.init();
+auth.register(app);
+app.use(auth.middleware);
+
+// статика — уже после проверки сессии
+app.use(express.static(path.join(__dirname, 'static_pages')));
 
 app.use((err, req, res, next) => {
     console.error('Express error:', err);

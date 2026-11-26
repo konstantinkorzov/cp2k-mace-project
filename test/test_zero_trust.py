@@ -49,9 +49,10 @@ def check(name, ok, extra=""):
 STUB_FILES = {
     "fastapi.py": '''
 class HTTPException(Exception):
-    def __init__(self, status_code=500, detail=""):
+    def __init__(self, status_code=500, detail="", headers=None):
         self.status_code = status_code
         self.detail = detail
+        self.headers = headers or {}
         super().__init__(detail)
 
 
@@ -583,7 +584,7 @@ def chain_tests():
         worker = "b" * 64
         cp2k = {"cp2k_version": "2024.3",
                 "cp2k_build": cp2k_runner.CP2K_BUILD_CPU,
-                "cp2k_params": {"cutoff": 400, "eps_scf": 1e-6}}
+                "cp2k_params": dict(cp2k_runner.CP2K_PARAMS)}
 
         dft = {"energy_ev": -42.0, "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
                "geometry": [[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]]}
@@ -611,7 +612,8 @@ def chain_tests():
         check("первый блок: prev = нули", h1["prev_sha256"] == chain.ZERO_HASH)
         check("wfn в блок не кладётся, только ссылка",
               not any(n.endswith(".wfn") for n in names) and h1["state_path"] == rel1)
-        check("coinbase — 50 монет", sum(o["value"] for o in tx1["outputs"]) == 50.0)
+        check("coinbase — 50 000 000 монет",
+              sum(o["value"] for o in tx1["outputs"]) == chain.COINBASE_VALUE)
 
         no_reward = chain.build_transfer(tmp, {master}, worker, master,
                                          chain.REWARD_VALUE, 1, height=1)
@@ -621,12 +623,12 @@ def chain_tests():
                                       chain.REWARD_VALUE, 1, height=2,
                                       fee=chain.TX_FEE)
         check("перевод 25 воркеру собирается", reward is not None
-              and any(o["address"] == worker and o["value"] == 25.0
+              and any(o["address"] == worker and o["value"] == chain.REWARD_VALUE
                       for o in reward["outputs"]))
 
         utxo = chain.utxo_set(tmp)
         fee = chain.tx_fee(reward, utxo)
-        check("комиссия = входы − выходы", abs(fee - chain.TX_FEE) < 1e-9, fee)
+        check("комиссия = входы − выходы", fee == chain.TX_FEE, fee)
         chain.sign_transaction(reward, wallet, utxo)
         check("входы подписаны Ed25519",
               all(i.get("signature") and i.get("public_key") for i in reward["inputs"]))
@@ -640,15 +642,17 @@ def chain_tests():
             cb_tx = json.loads(z.read("tx-0000-coinbase.json"))
         check("второй блок: prev = sha256(первого)",
               h2["prev_sha256"] == chain.sha256_file(p1))
-        check("coinbase = 50 + комиссия",
-              abs(sum(o["value"] for o in cb_tx["outputs"]) - (50.0 + fee)) < 1e-9)
+        check("coinbase = 50 000 000 + комиссия",
+              sum(o["value"] for o in cb_tx["outputs"]) == chain.COINBASE_VALUE + fee)
 
         v = chain.verify_chain(tmp, "Cu")
         check("цепочка целая", v["ok"], v["problems"])
 
         bal = chain.balances(tmp, None, 1)
-        check("воркеру доступно 25", bal[worker]["available"] == 25.0, bal.get(worker))
-        check("у мастера всего 75", bal[master]["total"] == 75.0, bal.get(master))
+        check("воркеру доступно 25 000 000", bal[worker]["available"] == chain.REWARD_VALUE,
+              bal.get(worker))
+        check("у мастера 75 000 000", bal[master]["total"] == chain.COINBASE_VALUE + chain.REWARD_VALUE,
+              bal.get(master))
 
         # --- подпись обязательна ---
         wfn2 = os.path.join(tmp2, "state.wfn")
@@ -1146,6 +1150,9 @@ def run():
     # Цепочка блоков проверяется отдельно (chain_tests); в приёмочных тестах
     # блоки не пишем, чтобы не трогать боевые results/.
     main._write_chain_block = lambda *a, **k: None
+    # Rate limit (5 с на выдачу/сдачу) — политика HTTP-слоя; в юнит-тестах
+    # он мешает, поэтому выключаем и проверяем отдельно.
+    main.RATE_LIMIT_SEC = 0
 
     # Все файловые артефакты тестов — во временном каталоге, боевые results/ не трогаем
     scratch = tempfile.mkdtemp(prefix="test_results_")

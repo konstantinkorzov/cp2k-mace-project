@@ -124,6 +124,9 @@
 <body>
 
 <header>
+      <div class="muted" style="margin-left:auto;font-size:12px;display:flex;gap:12px">
+        <a href="/password">сменить пароль</a><a href="/logout">выйти</a>
+      </div>
   <h1>CP2K + MACE</h1>
   <span class="hint">мастер · воркер · MACE · кошельки — в одном окне</span>
   <div id="statusline">
@@ -829,8 +832,8 @@ function buildWalletTab(tab) {
           <h2>Перевести монеты</h2>
           <div class="row">
             <div><label>Адрес получателя</label><input type="text" id="${tab}-to" /></div>
-            <div><label>Сумма</label><input type="number" id="${tab}-amount" step="0.1" min="0" /></div>
-            <div><label>Комиссия</label><input type="number" id="${tab}-fee" step="0.01" value="0.1" /></div>
+            <div><label>Сумма</label><input type="number" id="${tab}-amount" step="1" min="1" placeholder="целые монеты" /></div>
+            <div><label>Комиссия</label><input type="number" id="${tab}-fee" step="1" value="100000" /></div>
           </div>
           <div style="margin-top:10px">
             <label>Мастера (транзакция уйдёт всем известным)</label>
@@ -943,16 +946,16 @@ function renderWallet(tab, data) {
       .map((t) => {
       const pending = Boolean(t.mempool);
       const net = (t.received || 0) - (t.sent || 0);
-      const amount = (net >= 0 ? '+' : '−') + Math.abs(net).toFixed(4);
+      const amount = (net >= 0 ? '+' : '−') + Math.abs(net);
       const cls = net > 0 ? 'ok' : (net < 0 ? 'err' : '');
       const hint = (t.received && t.sent)
-        ? `приход ${t.received.toFixed(4)}, расход ${t.sent.toFixed(4)} — нажмите для деталей`
+        ? `приход ${t.received}, расход ${t.sent} — нажмите для деталей`
         : 'нажмите, чтобы посмотреть входы и выходы';
       return `<tr class="tx-row" data-txid="${esc(t.txid)}" title="${esc(hint)}">
         <td class="num">${pending ? '<span class="pill warn">мемпул</span>' : t.block}</td>
         <td>${esc(t.type)}</td>
         <td class="num ${cls}">${amount}</td>
-        <td class="num">${t.fee ? t.fee.toFixed(6) : '—'}</td>
+        <td class="num">${t.fee || '—'}</td>
         <td class="num">${pending ? 0 : t.confirmations}</td>
         <td class="mono" title="${esc(t.txid)}">${esc(t.txid.slice(0, 12))}…</td>
       </tr>`;
@@ -1007,7 +1010,7 @@ async function showTxDetails(tab, txid) {
     .join('');
 
   const outs = (data.outputs || []).map((o) =>
-    `<div class="mono">+ ${o.value.toFixed(6)} на ${esc(shortAddr(o.address))}</div>`).join('');
+    `<div class="mono">+ ${o.value} на ${esc(shortAddr(o.address))}</div>`).join('');
 
   box.innerHTML = `
     <div class="kv">

@@ -895,13 +895,13 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
         if not ok:
             drop.append(tid)
             continue
-        total_in = 0.0
+        total_in = 0
         for i in tx["inputs"]:
-            total_in += utxo.pop((i["txid"], int(i["vout"])))["value"]
+            total_in += int(utxo.pop((i["txid"], int(i["vout"])))["value"])
         for vout, o in enumerate(tx["outputs"]):
-            utxo[(tid, vout)] = {"value": float(o["value"]),
+            utxo[(tid, vout)] = {"value": int(o["value"]),
                                  "address": o["address"], "height": height}
-        fee_total += total_in - sum(float(o["value"]) for o in tx["outputs"])
+        fee_total += total_in - sum(int(o["value"]) for o in tx["outputs"])
         included.append(tx)
         drop.append(tid)
     if drop:
@@ -909,7 +909,7 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
             for tid in drop:
                 MEMPOOL.pop(tid, None)
         _save_mempool()
-    return included, round(fee_total, 8)
+    return included, int(fee_total)
 
 
 def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | None:
@@ -981,7 +981,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
                 utxo.pop((i["txid"], int(i["vout"])), None)
             rtid = reward.get("txid") or chain_mod.txid_of(reward)
             for vout, o in enumerate(reward["outputs"]):
-                utxo[(rtid, vout)] = {"value": float(o["value"]),
+                utxo[(rtid, vout)] = {"value": int(o["value"]),
                                       "address": o["address"], "height": seq}
 
     mem_txs, mem_fee = _drain_mempool(utxo, seq, confirmations)
@@ -1026,17 +1026,17 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     )
 
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
-          f"coinbase {chain_mod.COINBASE_VALUE + fee + mem_fee:g} → {latest['address'][:12]}…")
+          f"coinbase {chain_mod.COINBASE_VALUE + fee + mem_fee:d} → {latest['address'][:12]}…")
     _announce_to_peers(seq)
     _sync_stage("свой блок")
     if mem_txs:
         print(f"[Master] 📦 в блок включено транзакций из мемпула: {len(mem_txs)} "
               f"(комиссия {mem_fee:g})")
     if reward:
-        print(f"[Master] 💰 награда {chain_mod.REWARD_VALUE:g} → {worker_address[:12]}…, "
+        print(f"[Master] 💰 награда {chain_mod.REWARD_VALUE:d} → {worker_address[:12]}…, "
               f"комиссия {fee:g} (входов: {len(reward['inputs'])})")
     else:
-        print(f"[Master] ⚠ награда {chain_mod.REWARD_VALUE:g} не выплачена: "
+        print(f"[Master] ⚠ награда {chain_mod.REWARD_VALUE:d} не выплачена: "
               f"нет подтверждённых средств (conf={confirmations})")
     return path
 
@@ -1166,7 +1166,9 @@ def _admin_allowed(host: str) -> bool:
     atom_diameter — параметр консенсуса), ставить паузу, добавлять пиров и
     запускать тяжёлую перекачку цепочки.
     """
-    return bool(ADMIN_TOKEN) or (host or "") in ("127.0.0.1", "::1", "localhost")
+    # Токен не нужен: админка — только изнутри узла (localhost).
+    # Для этого и middleware ниже; внешние вызовы не проходят никогда.
+    return (host or "") in ("127.0.0.1", "::1", "localhost")
 
 
 @app.middleware("http")
@@ -1515,6 +1517,7 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
         if not pending_tasks:
             return {"status": "empty", "message": "Нет доступных задач"}
 
+        _rate_limit("task", worker_id)
         task = pending_tasks.pop(0)
         struct_id = task["struct_id"]
 
@@ -1581,6 +1584,36 @@ def heartbeat(worker_id: str):
         }
 
 
+# Rate limit: одну задачу воркеру и один результат от воркера — не чаще
+# раза в 5 секунд. Защищает от флуда без потери смысла (задача считается
+# минутами, поэтому честный воркер этот лимит не замечает).
+RATE_LIMIT_SEC = 5
+_RATE_LOCK = threading.Lock()
+_RATE: dict[tuple[str, str], float] = {}
+
+
+def _rate_limit(kind: str, key: str, min_interval: float | None = None):
+    min_interval = RATE_LIMIT_SEC if min_interval is None else float(min_interval)
+    if min_interval <= 0:
+        return
+    now = time.time()
+    with _RATE_LOCK:
+        prev = _RATE.get((kind, key), 0.0)
+        wait = min_interval - (now - prev)
+        if wait > 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"{kind}: не чаще раза в {min_interval:g} с",
+                headers={"Retry-After": str(int(wait) + 1)})
+        _RATE[(kind, key)] = now
+
+
+def reset_rate_limits():
+    """Сбросить лимиты (тесты и ручная диагностика)."""
+    with _RATE_LOCK:
+        _RATE.clear()
+
+
 STRUCT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 
 
@@ -1608,6 +1641,7 @@ def submit_result(result: TaskResult):
     w_id = result.worker_id
     if not isinstance(sid, str) or not STRUCT_ID_RE.match(sid):
         return {"status": "rejected", "reason": "недопустимый struct_id"}
+    _rate_limit("submit", str(w_id))
 
     # ---------- готовый результат от воркера (задание было у другого мастера) ----------
     if result.ready:
@@ -1790,6 +1824,11 @@ def _fetch_blob(peer: str, sha: str) -> bytes | None:
         return None
 
 
+def _expected_n_atoms(seq: int) -> int:
+    """Размер кластера для высоты seq по расписанию (консенсус)."""
+    return int(stage_for_height(max(0, int(seq) - 1), CONFIG)["n_atoms"])
+
+
 def _accept_peer_block(peer: str, seq: int, head: str,
                        block_bytes: bytes) -> tuple[bool, list[str]]:
     """Проверяет чужой блок локально: структура/подписи, затем DFT-пересчёт."""
@@ -1810,6 +1849,15 @@ def _accept_peer_block(peer: str, seq: int, head: str,
         sha = header.get("state_sha256")
         if not sha or not re.fullmatch(r"[0-9a-f]{64}", str(sha)):
             return False, ["нет/некорректный state_sha256"]
+
+        # Имя блока строим только из КОНСЕНСУСНОГО n_atoms для этой высоты:
+        # чужой n_atoms давал второе имя с тем же seq и ломал цепочку.
+        expected_n = _expected_n_atoms(seq)
+        if int(header.get("n_atoms", -1)) != expected_n:
+            return False, [f"n_atoms {header.get('n_atoms')} != {expected_n} "
+                           f"(этап для высоты {seq})"]
+        if any(b["seq"] == seq for b in chain_mod.list_blocks(element_dir)):
+            return False, [f"блок с seq {seq} уже есть"]
 
         blob = _fetch_blob(peer, sha)
         if blob is None:
@@ -1854,7 +1902,7 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                                f"пересчёт {float(mine):.6f} {unit}"]
 
         dst = os.path.join(blocks_dir,
-                           chain_mod.block_name(seq, CONFIG["element"], n_atoms))
+                           chain_mod.block_name(seq, CONFIG["element"], expected_n))
         shutil.move(path, dst)
         print(f"[Peer] ✓ блок {seq} от {peer}: DFT-пересчёт сошёлся "
               f"(E={res['energy_ev']:.6f} eV), блок записан")
@@ -2216,9 +2264,9 @@ ADMIN_SETTINGS = {
 }
 
 
-def _check_admin(token: str | None):
-    if ADMIN_TOKEN and token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="Неверный admin-token")
+def _check_admin(token: str | None = None):
+    """Совместимость: доступ уже ограничен middleware (только localhost)."""
+    return None
 
 
 def _persist_config_value(key: str, value):

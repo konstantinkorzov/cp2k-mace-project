@@ -22,7 +22,6 @@ results/<element>/blobs/<sha256>.wfn, а в заголовке — ссылка.
 
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -38,9 +37,13 @@ BLOCK_RE = re.compile(r"^(\d{6})_([A-Za-z]{1,3})_(\d+)\.zip$")
 HEADER_NAME = "header.json"
 DFT_NAME = "dft.json"
 
-COINBASE_VALUE = 50.0
-REWARD_VALUE = 25.0
-TX_FEE = 0.1                     # комиссия за перевод (как в Bitcoin: входы − выходы)
+# Деньги — ТОЛЬКО ЦЕЛЫЕ. Единица = 1 монета, эмиссия 50 000 000 за блок.
+# Bitcoin-подобная схема (1 BTC = 1e8 сатоши), но без дробей вообще: float в
+# консенсусе даёт расхождения при суммировании и позволяет обходить проверки
+# (NaN/округление). Любая сумма обязана быть int.
+COINBASE_VALUE = 50_000_000
+REWARD_VALUE = 25_000_000
+TX_FEE = 100_000                 # комиссия за перевод (входы − выходы), int
 DEFAULT_CONFIRMATIONS = 1
 # Зрелость coinbase — КОНСЕНСУС (не настройка): coinbase-выход блока N можно
 # тратить только в блоке N + COINBASE_MATURITY. Bitcoin держит 100; здесь 1 —
@@ -124,19 +127,19 @@ def tx_fee(tx: dict, utxo: dict) -> float:
     """Комиссия = сумма входов − сумма выходов (для не-coinbase)."""
     if tx.get("type") == "coinbase":
         return 0.0
-    total_in = sum(utxo[(i["txid"], int(i["vout"]))]["value"]
+    total_in = sum(int(utxo[(i["txid"], int(i["vout"]))]["value"])
                    for i in tx.get("inputs", []))
-    total_out = sum(float(o["value"]) for o in tx.get("outputs", []))
-    return round(total_in - total_out, 8)
+    total_out = sum_outputs(tx)
+    return total_in - total_out
 
 
-def make_coinbase(height: int, address: str, value: float = COINBASE_VALUE) -> dict:
+def make_coinbase(height: int, address: str, value: int = COINBASE_VALUE) -> dict:
     return {
         "version": 1,
         "type": "coinbase",
         "height": int(height),
         "inputs": [{"coinbase": f"block-{int(height):06d}"}],
-        "outputs": [{"value": float(value), "address": address}],
+        "outputs": [{"value": int(value), "address": address}],
     }
 
 
@@ -145,7 +148,7 @@ def make_transfer(inputs: list[dict], outputs: list[dict]) -> dict:
         "version": 1,
         "type": "transfer",
         "inputs": [{"txid": i["txid"], "vout": int(i["vout"])} for i in inputs],
-        "outputs": [{"value": float(o["value"]), "address": o["address"]} for o in outputs],
+        "outputs": [{"value": int(o["value"]), "address": o["address"]} for o in outputs],
     }
 
 
@@ -165,17 +168,25 @@ def invalid_outputs(tx: dict) -> list[str]:
         if not isinstance(out, dict):
             problems.append(f"выход {vout}: не объект")
             continue
-        try:
-            value = float(out.get("value"))
-        except (TypeError, ValueError):
-            problems.append(f"выход {vout}: сумма не число")
-            continue
-        if not math.isfinite(value) or value <= 0:
-            problems.append(f"выход {vout}: сумма {value!r} не конечная положительная")
+        value = out.get("value")
+        if type(value) is not int:
+            problems.append(f"выход {vout}: сумма {value!r} — не целое число")
+        elif value <= 0:
+            problems.append(f"выход {vout}: сумма {value} должна быть > 0")
         addr = out.get("address")
         if not isinstance(addr, str) or not addr or len(addr) > 128:
             problems.append(f"выход {vout}: нет корректного адреса")
     return problems
+
+
+def sum_outputs(tx: dict) -> int:
+    """Сумма выходов, устойчивая к мусору: не-int считается 0 (блок всё равно
+    будет отклонён invalid_outputs, но здесь нельзя падать на NaN)."""
+    total = 0
+    for out in tx.get("outputs") or []:
+        if isinstance(out, dict) and type(out.get("value")) is int:
+            total += out["value"]
+    return total
 
 
 def list_blocks(element_dir: str) -> list[dict]:
@@ -241,7 +252,7 @@ def utxo_set(element_dir: str) -> dict:
                     utxo.pop((i.get("txid"), int(i.get("vout", -1))), None)
             for vout, out in enumerate(tx.get("outputs", [])):
                 utxo[(txid, vout)] = {
-                    "value": float(out["value"]),
+                    "value": out["value"] if type(out.get("value")) is int else 0,
                     "address": out["address"],
                     "height": b["seq"],
                     "coinbase": tx.get("type") == "coinbase",
@@ -266,10 +277,10 @@ def available_utxos(element_dir: str, addresses: set[str],
 
 
 def build_transfer(element_dir: str, from_addresses: set[str], to_address: str,
-                   change_address: str, value: float = REWARD_VALUE,
+                   change_address: str, value: int = REWARD_VALUE,
                    confirmations: int = DEFAULT_CONFIRMATIONS,
                    height: int | None = None,
-                   fee: float = TX_FEE,
+                   fee: int = TX_FEE,
                    exclude: set[tuple[str, int]] | None = None) -> dict | None:
     """
     Собирает перевод `value` монет на `to_address` с подтверждённых выходов
@@ -291,12 +302,12 @@ def build_transfer(element_dir: str, from_addresses: set[str], to_address: str,
         total += u["value"]
         if total + 1e-9 >= value + fee:
             break
-    if total + 1e-9 < value + fee:
+    if total < value + fee:
         return None
 
-    outputs = [{"value": round(value, 8), "address": to_address}]
-    change = round(total - value - fee, 8)
-    if change > 1e-9:
+    outputs = [{"value": int(value), "address": to_address}]
+    change = int(total - value - fee)
+    if change > 0:
         outputs.append({"value": change, "address": change_address})
     return make_transfer(chosen, outputs)
 
@@ -353,7 +364,7 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
     if not outputs:
         problems.append("нет выходов")
     problems.extend(invalid_outputs(tx))
-    total_out = sum(float(o.get("value", 0)) for o in outputs)
+    total_out = sum_outputs(tx)
     if total_out <= 0:
         problems.append("нулевая сумма выходов")
     if total_in + 1e-8 < total_out:
@@ -362,7 +373,7 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
 
 
 def build_wallet_transfer(wallet, element_dir: str, to_address: str,
-                          value: float, fee: float = TX_FEE,
+                          value: int, fee: int = TX_FEE,
                           confirmations: int = DEFAULT_CONFIRMATIONS,
                           height: int | None = None,
                           exclude: set[tuple[str, int]] | None = None) -> dict | None:
@@ -487,6 +498,90 @@ def _parse_iso(value: str) -> bool:
         return False
 
 
+# ---------- Схема заголовка блока (консенсус) ----------
+# Ровно этот набор полей и эти типы. Любое отклонение — не наш блок:
+# лишнее поле меняет байты zip, но не проверяется больше нигде, а его
+# отсутствие ломает парсеры у пиров.
+HEADER_FIELDS = frozenset({
+    "version", "seq", "element", "n_atoms", "prev_sha256", "created_at",
+    "state_sha256", "state_path", "cp2k_version", "cp2k_build", "cp2k_params",
+})
+REQUIRED_CP2K_PARAMS = ("cutoff", "rel_cutoff", "eps_default", "eps_scf",
+                        "max_scf", "min_cell_size", "max_cell_size", "box_padding")
+ELEMENT_RE = re.compile(r"^[A-Za-z]{1,3}$")
+
+
+def validate_header(header: dict, *, expected_seq: int | None = None,
+                    expected_element: str | None = None,
+                    expected_n_atoms: int | None = None) -> list[str]:
+    """Строгая проверка header.json. Возвращает список проблем."""
+    problems: list[str] = []
+    if not isinstance(header, dict):
+        return ["header не объект"]
+
+    keys = set(header)
+    if keys != HEADER_FIELDS:
+        missing = sorted(HEADER_FIELDS - keys)
+        extra = sorted(keys - HEADER_FIELDS)
+        problems.append(f"набор полей заголовка нарушен: нет {missing}, лишние {extra}")
+
+    if type(header.get("version")) is not int or header["version"] != BLOCK_VERSION:
+        problems.append(f"version {header.get('version')!r} != {BLOCK_VERSION}")
+    seq = header.get("seq")
+    if type(seq) is not int or seq < 1:
+        problems.append(f"seq {seq!r} — не целое >= 1")
+    elif expected_seq is not None and seq != expected_seq:
+        problems.append(f"seq {seq} != ожидаемого {expected_seq}")
+
+    element = header.get("element")
+    if not isinstance(element, str) or not ELEMENT_RE.match(element):
+        problems.append(f"element {element!r} не соответствует ^[A-Za-z]{{1,3}}$")
+    elif expected_element is not None and element != expected_element:
+        problems.append(f"элемент блока {element} != {expected_element}")
+
+    n_atoms = header.get("n_atoms")
+    if type(n_atoms) is not int or not 1 <= n_atoms <= 10_000:
+        problems.append(f"n_atoms {n_atoms!r} — не целое 1..10000")
+    elif expected_n_atoms is not None and n_atoms != expected_n_atoms:
+        problems.append(f"n_atoms {n_atoms} != ожидаемого {expected_n_atoms}")
+
+    prev = header.get("prev_sha256")
+    if not isinstance(prev, str) or not SHA_RE.match(prev):
+        problems.append("prev_sha256 — не 64 hex")
+
+    if not _parse_iso(header.get("created_at") or ""):
+        problems.append("created_at не ISO 8601 UTC")
+
+    sha = header.get("state_sha256")
+    if not isinstance(sha, str) or not SHA_RE.match(sha):
+        problems.append("state_sha256 — не 64 hex")
+    rel = header.get("state_path")
+    if not isinstance(rel, str) or not STATE_PATH_RE.match(rel):
+        problems.append("state_path — не blobs/<64hex>.wfn")
+
+    version = header.get("cp2k_version")
+    if not isinstance(version, str) or not version.strip():
+        problems.append("cp2k_version — пустая строка")
+
+    build = header.get("cp2k_build")
+    if not isinstance(build, str):
+        problems.append("cp2k_build — не строка")
+
+    params = header.get("cp2k_params")
+    if not isinstance(params, dict) or not params:
+        problems.append("cp2k_params — не непустой объект")
+    else:
+        miss = [k for k in REQUIRED_CP2K_PARAMS if k not in params]
+        if miss:
+            problems.append(f"cp2k_params: нет ключей {miss}")
+        bad = [k for k, v in params.items()
+               if not isinstance(v, (int, float, str, bool)) or isinstance(v, float) and not v == v]
+        if bad:
+            problems.append(f"cp2k_params: недопустимые значения {bad}")
+
+    return problems
+
+
 def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
     """Возвращает (header, dft, txs, имена файлов) из zip-блока."""
     with zipfile.ZipFile(path) as z:
@@ -547,22 +642,22 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
             elif not crypto.verify(pub, bytes.fromhex(tid), sig):
                 problems.append(f"{label}: вход {key}: неверная подпись")
 
-        total_out = sum(o["value"] for o in tx.get("outputs", []))
-        if total_in + 1e-8 < total_out:
+        total_out = sum_outputs(tx)
+        if total_in < total_out:
             problems.append(f"{label}: сумма входов {total_in} < суммы выходов {total_out}")
         block_fee += max(0.0, total_in - total_out)
 
     if coinbases:
-        cb_value = sum(o["value"] for o in coinbases[0].get("outputs", []))
-        if cb_value > COINBASE_VALUE + block_fee + 1e-8:
+        cb_value = sum(int(o["value"]) for o in coinbases[0].get("outputs", []))
+        if cb_value > COINBASE_VALUE + block_fee:
             problems.append(
-                f"{label}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee:.8f}")
+                f"{label}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee}")
 
     if add_outputs:
         for tx in txs:
             tid = tx.get("txid") or txid_of(tx)
             for vout, out in enumerate(tx.get("outputs", [])):
-                utxo[(tid, vout)] = {"value": float(out["value"]),
+                utxo[(tid, vout)] = {"value": out["value"] if type(out.get("value")) is int else 0,
                                      "address": out["address"],
                                      "height": height or 0,
                                      "coinbase": tx.get("type") == "coinbase"}
@@ -584,21 +679,11 @@ def verify_block(element_dir: str, block_path: str,
                 "header": {}, "dft": {}, "txs": []}
 
     element = os.path.basename(os.path.normpath(element_dir))
-    seq = int(header.get("seq", -1))
-    if expected_seq is not None and seq != expected_seq:
-        problems.append(f"seq {seq} != ожидаемого {expected_seq}")
-    if header.get("element") != element:
-        problems.append(f"элемент блока {header.get('element')} != {element}")
+    problems.extend(validate_header(header, expected_seq=expected_seq,
+                                    expected_element=element))
     if expected_prev is not None and header.get("prev_sha256") != expected_prev:
         problems.append("prev_sha256 не совпадает с головой локальной цепочки")
-    if header.get("version") != BLOCK_VERSION:
-        problems.append(f"version {header.get('version')} != {BLOCK_VERSION}")
-    if not _parse_iso(header.get("created_at", "")):
-        problems.append("created_at не ISO 8601")
-    if not header.get("cp2k_version") or not isinstance(header.get("cp2k_params"), dict):
-        problems.append("нет cp2k_version/cp2k_params")
-    if header.get("cp2k_build") is not None and not isinstance(header.get("cp2k_build"), str):
-        problems.append("cp2k_build должен быть строкой")
+    seq = header.get("seq") if type(header.get("seq")) is int else -1
 
     n_atoms = int(header.get("n_atoms", -1))
     sha = header.get("state_sha256")
@@ -674,22 +759,11 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             continue
 
         if header:
-            if header.get("version") != BLOCK_VERSION:
-                problems.append(f"{b['name']}: version {header.get('version')} != {BLOCK_VERSION}")
+            problems.extend(f"{b['name']}: {p}" for p in validate_header(
+                header, expected_seq=b["seq"], expected_element=b["element"],
+                expected_n_atoms=b["n_atoms"]))
             if header.get("prev_sha256") != expected_prev:
                 problems.append(f"{b['name']}: prev_sha256 не совпадает с предыдущим блоком")
-            if int(header.get("seq", -1)) != b["seq"]:
-                problems.append(f"{b['name']}: seq в заголовке != имени файла")
-            if header.get("element") != b["element"]:
-                problems.append(f"{b['name']}: элемент в заголовке != имени файла")
-            if int(header.get("n_atoms", -1)) != b["n_atoms"]:
-                problems.append(f"{b['name']}: число атомов в заголовке != имени файла")
-            if not _parse_iso(header.get("created_at", "")):
-                problems.append(f"{b['name']}: created_at не ISO 8601")
-            if not header.get("cp2k_version"):
-                problems.append(f"{b['name']}: нет cp2k_version")
-            if not isinstance(header.get("cp2k_params"), dict) or not header.get("cp2k_params"):
-                problems.append(f"{b['name']}: нет cp2k_params")
 
             if not dft or dft.get("energy_ev") is None:
                 problems.append(f"{b['name']}: нет dft.json/energy_ev")
@@ -758,23 +832,23 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
                 elif not crypto.verify(pub, bytes.fromhex(tid), sig):
                     problems.append(f"{b['name']}: вход {key}: неверная подпись")
 
-            total_out = sum(o["value"] for o in tx.get("outputs", []))
-            if total_in + 1e-8 < total_out:
+            total_out = sum_outputs(tx)
+            if total_in < total_out:
                 problems.append(f"{b['name']}: сумма входов {total_in} < суммы выходов {total_out}")
             block_fee += max(0.0, total_in - total_out)
 
         # coinbase может забрать субсидию + комиссии блока (как в Bitcoin)
         if coinbases:
-            cb_value = sum(o["value"] for o in coinbases[0].get("outputs", []))
-            if cb_value > COINBASE_VALUE + block_fee + 1e-8:
+            cb_value = sum(int(o["value"]) for o in coinbases[0].get("outputs", []))
+            if cb_value > COINBASE_VALUE + block_fee:
                 problems.append(
-                    f"{b['name']}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee:.8f}")
+                    f"{b['name']}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee}")
 
         # добавляем все выходы блока в UTXO
         for tx in txs:
             tid = tx.get("txid") or txid_of(tx)
             for vout, out in enumerate(tx.get("outputs", [])):
-                utxo[(tid, vout)] = {"value": float(out["value"]), "address": out["address"],
+                utxo[(tid, vout)] = {"value": out["value"] if type(out.get("value")) is int else 0, "address": out["address"],
                                      "height": b["seq"], "coinbase": tx.get("type") == "coinbase"}
 
         expected_prev = b["sha256"]
@@ -793,11 +867,11 @@ def balances(element_dir: str, addresses: set[str] | None = None,
         if addresses is not None and addr not in addresses:
             continue
         rec = result.setdefault(addr, {"available": 0.0, "pending": 0.0, "total": 0.0})
-        rec["total"] = round(rec["total"] + info["value"], 8)
+        rec["total"] += int(info["value"])
         if info["height"] + max(0, confirmations) <= height:
-            rec["available"] = round(rec["available"] + info["value"], 8)
+            rec["available"] += int(info["value"])
         else:
-            rec["pending"] = round(rec["pending"] + info["value"], 8)
+            rec["pending"] += int(info["value"])
     return result
 
 
