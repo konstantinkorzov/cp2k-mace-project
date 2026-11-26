@@ -376,9 +376,32 @@ def change_password(root: str, old: str, new: str,
     return {"ok": True, "wallet": f"{wallets[0].role}/{wallets[0].name}"}
 
 
+def new_address(root: str, password: str, role: str | None = None,
+                name: str | None = None) -> dict:
+    """Создаёт новый ключ (адрес) в кошельке, который открыт паролем."""
+    conn = wallet_store.open_db(os.path.join(root, "keys.db"))
+    wallets = wallet_store.find_by_password(conn, password)
+    targets = [w for w in wallets
+               if (role is None or w.role == role)
+               and (name is None or w.name == name)]
+    if len(targets) != 1:
+        return {"ok": False,
+                "error": f"подходящих кошельков: {len(targets)} — уточните роль/имя"}
+    wallet = targets[0]
+    key = wallet.add_key()
+    return {
+        "ok": True,
+        "role": wallet.role,
+        "name": wallet.name,
+        "address": key["address"],
+        "key_id": key["id"],
+        "addresses": [k["address"] for k in wallet.keys()],
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="JSON-кошелёк для веб-панели")
-    ap.add_argument("action", choices=["info", "send", "passwd", "tx"])
+    ap.add_argument("action", choices=["info", "send", "passwd", "tx", "newkey"])
     ap.add_argument("--password", default=None)
     ap.add_argument("--password-env", default="WEBUI_WALLET_PASSWORD")
     ap.add_argument("--results-root", default=DEFAULT_ROOT)
@@ -407,6 +430,8 @@ def main() -> int:
             return 2
         result = tx_details(args.results_root, args.txid,
                             masters=[m for m in (args.master or []) if m])
+    elif args.action == "newkey":
+        result = new_address(args.results_root, password, args.role, args.name)
     elif args.action == "send":
         if not args.to or args.amount <= 0:
             print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},

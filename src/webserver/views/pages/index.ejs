@@ -952,6 +952,9 @@ function renderWallet(tab, data) {
       <div class="proc">
         <div class="head">
           <b>${esc(w.role)} / ${esc(w.name)}</b>
+          <button class="btn secondary" style="margin-left:auto;padding:4px 10px;font-size:12px"
+                  data-newkey="1" data-role="${esc(w.role)}"
+                  data-name="${esc(w.name)}">＋ адрес</button>
           <span class="pill ok">доступно ${w.totals.available.toFixed(2)}</span>
           <span class="pill warn">pending ${w.totals.pending.toFixed(2)}</span>
           <span class="pill off">всего ${w.totals.total.toFixed(2)}</span>
@@ -1172,6 +1175,32 @@ async function saveConfigForm(which) {
 
 buildWalletTab('wallet1');
 buildWalletTab('wallet2');
+
+// новый адрес в конкретном кошельке (карточки рендерятся заново — делегируем)
+['wallet1', 'wallet2'].forEach((tab) => {
+  const box = document.getElementById(tab + '-content');
+  if (!box) return;
+  box.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('[data-newkey]');
+    if (!btn) return;
+    const password = document.getElementById(tab + '-password').value;
+    const msg = document.getElementById(tab + '-msg');
+    if (!password) { msg.innerHTML = '<span class="err">нужен пароль кошелька</span>'; return; }
+    msg.textContent = 'генерирую адрес…';
+    const r = await api('/api/wallet/newkey', {
+      password,
+      resultsRoot: document.getElementById(tab + '-root').value || null,
+      role: btn.dataset.role,
+      name: btn.dataset.name || null,
+    });
+    if (r.ok) {
+      msg.innerHTML = `<span class="ok">новый адрес: <span class="mono">${esc(r.address)}</span></span>`;
+      refreshWallet(tab);
+    } else {
+      msg.innerHTML = `<span class="err">${esc(r.error || 'не удалось создать адрес')}</span>`;
+    }
+  });
+});
 $('#wallet1-password').value = 'master';
 $('#wallet2-password').value = 'worker';
 

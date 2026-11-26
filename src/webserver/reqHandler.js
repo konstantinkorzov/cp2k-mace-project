@@ -109,6 +109,7 @@ exports.handle = function (app) {
     app.post('/api/wallet/info', onWalletInfo);
     app.post('/api/wallet/send', onWalletSend);
     app.post('/api/wallet/passwd', onWalletPasswd);
+    app.post('/api/wallet/newkey', onWalletNewKey);
     app.post('/api/wallet/tx', onWalletTx);
 
     // MACE
@@ -372,6 +373,22 @@ async function onWalletSend(req, res) {
         for (const url of masters) args.push('--master', url);
 
         const out = await runPython(args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 90000);
+        res.json(out);
+    } catch (e) {
+        bad(res, 500, String(e));
+    }
+}
+
+async function onWalletNewKey(req, res) {
+    try {
+        const body = req.body || {};
+        if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
+        const args = ['src/webwallet.py', 'newkey',
+            '--results-root', walletRoot(body)];
+        if (body.role) args.push('--role', String(body.role));
+        if (body.name) args.push('--name', String(body.name));
+        const out = await runPython(
+            args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
         res.json(out);
     } catch (e) {
         bad(res, 500, String(e));
