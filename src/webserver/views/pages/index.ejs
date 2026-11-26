@@ -391,7 +391,7 @@ $$('nav.tabs button').forEach((btn) => {
     $$('nav.tabs button').forEach((b) => b.classList.toggle('active', b === btn));
     $$('section.tab').forEach((s) => s.classList.toggle('active', s.id === 'tab-' + activeTab));
     if (activeTab === 'worker') { refreshNetwork(); refreshCp2k(); }
-    if (activeTab.startsWith('wallet')) refreshWallet(activeTab);
+    if (activeTab.startsWith('wallet')) { refreshChains(activeTab); refreshWallet(activeTab); }
   });
 });
 
@@ -786,9 +786,9 @@ function buildWalletTab(tab) {
           <h2>${isMaster ? 'Кошелёк мастера' : 'Кошелёк воркера'}
             <span class="muted" style="font-weight:400;font-size:12px">роль: ${isMaster ? 'master' : 'worker'}</span></h2>
           <p class="muted" style="margin-top:-4px">
-            Пароль определяет, чей кошелёк открыть: <code>master</code> — мастер,
-            <code>worker</code> — воркеры. Кошельки лежат в общей базе выбранного
-            каталога результатов.
+            Пароль — это кошелёк: все его адреса показываются одним балансом и
+            одной историей. Система (элемент) — отдельная цепочка, как отдельный
+            металл: у меди и железа свои монеты, свой UTXO и своя высота.
           </p>
           <div class="row">
             <div>
@@ -798,6 +798,18 @@ function buildWalletTab(tab) {
             <div>
               <label>Каталог результатов</label>
               <select id="${tab}-root"></select>
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>Система (элемент)</label>
+              <select id="${tab}-chain"></select>
+            </div>
+            <div style="flex:2 1 260px">
+              <p class="muted" style="margin:2px 0 0">
+                Монеты одной цепочки не тратятся в другой: у каждого элемента
+                свой генезис и свой баланс.
+              </p>
             </div>
           </div>
           <div class="actions">
@@ -810,8 +822,8 @@ function buildWalletTab(tab) {
               <div><label>Новый пароль</label><input type="password" id="${tab}-newpass" /></div>
               <div style="flex:0 0 auto"><button class="btn secondary" id="${tab}-chpass">Сменить</button></div>
             </div>
-            <p class="muted">Нужно указать новый пароль для единственного кошелька,
-            который подходит под текущий (иначе — роль/имя через CLI).</p>
+            <p class="muted">Пароль меняется для всего кошелька этой роли:
+            все его адреса и балансы остаются на месте.</p>
           </details>
         </div>
 
@@ -854,6 +866,7 @@ function buildWalletTab(tab) {
     msg.textContent = 'читаю…';
     const data = await api('/api/wallet/info', {
       password, resultsRoot: root || null, role: isMaster ? 'master' : 'worker',
+      element: document.getElementById(tab + '-chain').value || null,
       masters: walletMasters(),
     });
     if (!data.ok) {
@@ -865,13 +878,20 @@ function buildWalletTab(tab) {
     msg.innerHTML = `<span class="ok">${esc(data.element)} · высота ${data.height}</span>`
       + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0}</span>`
       + ` <span class="muted">· обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`
-      + ((data.also_matched || []).length
-        ? ` <span class="muted">(этот же пароль есть у: ${esc(data.also_matched.join(', '))} —
-           они показаны в своей вкладке)</span>`
+      + ((data.also_roles || []).length
+        ? ` <span class="muted">(этот пароль открывает также: ${esc(data.also_roles.join(', '))} —
+           в своей вкладке)</span>`
         : '');
     document.getElementById(tab + '-send-card').style.display = 'block';
     wallets[tab].state = data;
     renderWallet(tab, data);
+  });
+
+  document.getElementById(tab + '-chain').addEventListener('change', () => {
+    if (wallets[tab].state) refreshWallet(tab);
+  });
+  document.getElementById(tab + '-root').addEventListener('change', () => {
+    refreshChains(tab);
   });
 
   document.getElementById(tab + '-content').addEventListener('click', (ev) => {
@@ -884,11 +904,12 @@ function buildWalletTab(tab) {
     const newPassword = document.getElementById(tab + '-newpass').value;
     if (!newPassword) return;
     const r = await api('/api/wallet/passwd', {
-      password, newPassword, resultsRoot: document.getElementById(tab + '-root').value || null,
+      password, newPassword, role: isMaster ? 'master' : 'worker',
+      resultsRoot: document.getElementById(tab + '-root').value || null,
     });
     const msg = document.getElementById(tab + '-msg');
     msg.innerHTML = r.ok
-      ? `<span class="ok">пароль ${esc(r.wallet)} изменён — обновите поле пароля</span>`
+      ? `<span class="ok">пароль изменён (${r.changed} записей) — обновите поле пароля</span>`
       : `<span class="err">${esc(r.error)}</span>`;
   });
 
@@ -951,10 +972,11 @@ function renderWallet(tab, data) {
     return `
       <div class="proc">
         <div class="head">
-          <b>${esc(w.role)} / ${esc(w.name)}</b>
+          <b>${w.role === 'master' ? 'мастер' : 'воркер'}</b>
+          <span class="mono muted">${esc(data.element)}</span>
+          <span class="muted">адресов: ${w.addresses.length}</span>
           <button class="btn secondary" style="margin-left:auto;padding:4px 10px;font-size:12px"
-                  data-newkey="1" data-role="${esc(w.role)}"
-                  data-name="${esc(w.name)}">＋ адрес</button>
+                  data-newkey="1" data-role="${esc(w.role)}">＋ адрес</button>
           <span class="pill ok">доступно ${w.totals.available.toFixed(2)}</span>
           <span class="pill warn">pending ${w.totals.pending.toFixed(2)}</span>
           <span class="pill off">всего ${w.totals.total.toFixed(2)}</span>
@@ -985,6 +1007,7 @@ async function showTxDetails(tab, txid) {
 
   const data = await api('/api/wallet/tx', {
     txid, resultsRoot: document.getElementById(tab + '-root').value || null,
+    element: document.getElementById(tab + '-chain').value || null,
     masters: walletMasters(),
   });
   if (!data.ok) {
@@ -1037,10 +1060,12 @@ async function refreshWallet(tab) {
     password: document.getElementById(tab + '-password').value,
     resultsRoot: document.getElementById(tab + '-root').value || null,
     role: tab === 'wallet1' ? 'master' : 'worker',
+    element: document.getElementById(tab + '-chain').value || null,
     masters: walletMasters(),
   });
   if (data.ok) {
     st.state = data;
+    if (data.chains) applyChains(tab, data.chains, data.element);
     renderWallet(tab, data);
     const msg = document.getElementById(tab + '-msg');
     if (msg) {
@@ -1048,6 +1073,37 @@ async function refreshWallet(tab) {
         + ` <span class="muted">мастеров: ${(data.masters || []).length}, в мемпуле: ${data.mempool_count || 0} · обновлено ${new Date().toLocaleTimeString('ru-RU')}</span>`;
     }
   }
+}
+
+function blocksWord(n) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return 'блоков';
+  if (b === 1) return 'блок';
+  if (b >= 2 && b <= 4) return 'блока';
+  return 'блоков';
+}
+
+async function refreshChains(tab) {
+  const sel = document.getElementById(tab + '-chain');
+  if (!sel) return;
+  const data = await api('/api/wallet/chains', {
+    resultsRoot: document.getElementById(tab + '-root').value || null,
+  });
+  if (!data.ok) {
+    sel.innerHTML = '<option value="">нет цепочек</option>';
+    return;
+  }
+  applyChains(tab, data.chains || [], data.element);
+}
+
+function applyChains(tab, chains, current) {
+  const sel = document.getElementById(tab + '-chain');
+  if (!sel) return;
+  const keep = sel.value || current || '';
+  sel.innerHTML = (chains || []).map((c) =>
+    `<option value="${esc(c.name)}">${esc(c.name)} — ${c.height} ${blocksWord(c.height)}</option>`)
+    .join('') || '<option value="">нет цепочек</option>';
+  if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
 }
 
 function walletMasters() {
@@ -1191,7 +1247,7 @@ buildWalletTab('wallet2');
       password,
       resultsRoot: document.getElementById(tab + '-root').value || null,
       role: btn.dataset.role,
-      name: btn.dataset.name || null,
+      element: document.getElementById(tab + '-chain').value || null,
     });
     if (r.ok) {
       msg.innerHTML = `<span class="ok">новый адрес: <span class="mono">${esc(r.address)}</span></span>`;
@@ -1213,6 +1269,8 @@ refreshOverview().then(() => {
   fillWalletRoots(overview.dirs);
   $('#wallet1-root').value = overview.dirs[0] || '';
   $('#wallet2-root').value = overview.dirs[0] || '';
+  refreshChains('wallet1');
+  refreshChains('wallet2');
 });
 
 // подсказываем порт мастера из настроек (config.json → port)

@@ -107,6 +107,7 @@ exports.handle = function (app) {
 
     // кошелёк
     app.post('/api/wallet/info', onWalletInfo);
+    app.post('/api/wallet/chains', onWalletChains);
     app.post('/api/wallet/send', onWalletSend);
     app.post('/api/wallet/passwd', onWalletPasswd);
     app.post('/api/wallet/newkey', onWalletNewKey);
@@ -342,12 +343,26 @@ async function onWalletInfo(req, res) {
         const args = ['src/webwallet.py', 'info', '--results-root', root];
         if (body.role) args.push('--role', String(body.role));
         if (body.name) args.push('--name', String(body.name));
+        if (body.element) args.push('--element', String(body.element));
         for (const url of (body.masters || [])) {
             if (url) args.push('--master', String(url));
         }
         const out = await runPython(
             args,
             { WEBUI_WALLET_PASSWORD: String(body.password) }, 20000);
+        res.json(out);
+    } catch (e) {
+        bad(res, 500, String(e));
+    }
+}
+
+async function onWalletChains(req, res) {
+    // Какие элементы (системы) вообще есть в этом каталоге результатов: у
+    // каждого своя цепочка — в кошельке это как разные металлы.
+    try {
+        const body = req.body || {};
+        const out = await runPython(
+            ['src/webwallet.py', 'chains', '--results-root', walletRoot(body)], {}, 20000);
         res.json(out);
     } catch (e) {
         bad(res, 500, String(e));
@@ -369,6 +384,7 @@ async function onWalletSend(req, res) {
         }
         if (body.role) args.push('--role', String(body.role));
         if (body.name) args.push('--name', String(body.name));
+        if (body.element) args.push('--element', String(body.element));
         const masters = (body.masters || []).map((m) => String(m).trim()).filter(Boolean);
         for (const url of masters) args.push('--master', url);
 
@@ -387,6 +403,7 @@ async function onWalletNewKey(req, res) {
             '--results-root', walletRoot(body)];
         if (body.role) args.push('--role', String(body.role));
         if (body.name) args.push('--name', String(body.name));
+        if (body.element) args.push('--element', String(body.element));
         const out = await runPython(
             args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
         res.json(out);
@@ -406,6 +423,7 @@ async function onWalletPasswd(req, res) {
             '--change-to', String(body.newPassword)];
         if (body.role) args.push('--role', String(body.role));
         if (body.name) args.push('--name', String(body.name));
+        if (body.element) args.push('--element', String(body.element));
         const out = await runPython(args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
         res.json(out);
     } catch (e) {
@@ -420,6 +438,7 @@ async function onWalletTx(req, res) {
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'tx', '--results-root', root,
             '--txid', String(body.txid)];
+        if (body.element) args.push('--element', String(body.element));
         for (const url of (body.masters || [])) {
             if (url) args.push('--master', String(url));
         }

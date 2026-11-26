@@ -95,7 +95,7 @@ def prepare_env():
     # реальные модули проекта
     for f in ("main.py", "cp2k_runner.py", "structure_generator.py", "worker.py",
               "config_loader.py", "archive_maker.py", "identity.py", "chain.py",
-              "crypto.py", "wallet_store.py", "wallet.py"):
+              "crypto.py", "wallet_store.py", "wallet.py", "webwallet.py"):
         shutil.copy(os.path.join(SRC, f), os.path.join(ENV, f))
 
     # реальный config.json проекта (формат {"value":..., "help":...})
@@ -813,6 +813,40 @@ def wallet_tests():
               wallet.show(conn, "newpass", element_dir, 1) == 0)
         check("wallet.py отвергает неверный пароль",
               wallet.show(conn, "bad", element_dir, 1) == 1)
+
+        # --- панель: «элемент = цепочка», «пароль = один кошелёк» ---
+        import webwallet
+
+        os.makedirs(os.path.join(tmp, "Cu", "blocks"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "Fe", "blocks"), exist_ok=True)
+        wallet_store.ensure_worker(conn, "worker_B", "newpass")
+        wallet_store.ensure_worker(conn, "worker_C", "newpass")
+        by_pass = wallet_store.find_by_password(conn, "newpass")
+        merged = wallet.group_wallets(by_pass, role="worker")
+        check("несколько записей с одним паролем — один кошелёк",
+              len(merged) == 1 and len(merged["worker"]) == 2)
+        view = wallet.WalletView(merged["worker"])
+        check("кошелёк объединяет адреса всех записей",
+              len(view.addresses()) == 2
+              and view.addresses() == {k["address"] for k in view.keys()})
+        some_addr = sorted(view.addresses())[0]
+        check("подпись адреса из любой записи проходит проверку",
+              crypto.verify(view.public_for(some_addr), b"y",
+                            view.sign(some_addr, b"y")))
+
+        info = webwallet.collect(tmp, "newpass", 1, role="worker", element="Cu")
+        check("панель показывает один кошелёк на пароль",
+              info.get("ok") and len(info["wallets"]) == 1
+              and len(info["wallets"][0]["addresses"]) == 2)
+        check("панель читает выбранную цепочку (элемент)",
+              info.get("element") == "Cu")
+        check("в каталоге видны обе цепочки (Cu и Fe)",
+              {c["name"] for c in info["chains"]} >= {"Cu", "Fe"})
+        check("чужой элемент (выход из каталога) отвергается",
+              not webwallet.collect(tmp, "newpass", 1, element="../etc").get("ok"))
+        got = webwallet.new_address(tmp, "newpass", role="worker")
+        check("новый адрес добавляется в объединённый кошелёк",
+              got.get("ok") and len(got.get("addresses") or []) == 3)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
