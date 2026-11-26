@@ -538,6 +538,40 @@ def cp2k_version(cfg: dict) -> str:
     return "unknown"
 
 
+# ---------- Отпечаток сборки CP2K (консенсус) ----------
+# Строка вида "cp2k/cp2k:<tag>@sha256:<digest>" — та сборка, которой считает
+# сеть. Другой билд (MPI/флаги/ядра) — другая арифметика и другой формат лога,
+# поэтому отпечаток пишется в header.json и проверяется при старте.
+# Менять этот список = менять версию протокола (старые блоки без поля читаются).
+CP2K_BUILD_CPU = ("cp2k/cp2k:2024.3_mpich_generic_psmp"
+                  "@sha256:979e011c2ea15a2a56eae16b5f3a2d214142bb74fe644bfb302d366dddc2a443")
+CP2K_BUILD_GPU = ("cp2k/cp2k:2024.3_mpich_generic_cuda_P100_psmp"
+                  "@sha256:e18b06ef11df6593b88f4cc35e52678b80e9edebfc56de70e7bc5e3215625d3d")
+CP2K_BUILD_EXPECTED = (CP2K_BUILD_CPU, CP2K_BUILD_GPU)
+
+
+def cp2k_build(cfg: dict | None = None) -> str:
+    """Отпечаток сборки CP2K: CP2K_BUILD из образа (см. Dockerfile).
+
+    Если переменной нет (запуск мимо образа или старый образ) — возвращаем
+    версию с пометкой: блок запишет её как есть, а мастер предупредит.
+    """
+    env = os.environ.get("CP2K_BUILD", "").strip()
+    if env:
+        return env
+    return f"{cp2k_version(cfg or {})} (build не указан)"
+
+
+def cp2k_build_identified(build: str) -> bool:
+    """Сборка опознана: в образе был задан CP2K_BUILD с digest."""
+    return "@sha256:" in str(build or "")
+
+
+def cp2k_build_allowed(build: str) -> bool:
+    """Сборка входит в список сетевых (CPU или GPU образ того же релиза)."""
+    return str(build or "") in CP2K_BUILD_EXPECTED
+
+
 def parse_homo_lumo(outfile: str, hartree_to_ev: float):
     """
     Ищет строки вида:

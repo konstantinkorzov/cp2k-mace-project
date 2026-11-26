@@ -580,7 +580,9 @@ def chain_tests():
         wallet, _ = wallet_store.ensure_master(conn, "root")
         master = wallet.latest_key()["address"]
         worker = "b" * 64
-        cp2k = {"cp2k_version": "2024.3", "cp2k_params": {"cutoff": 400, "eps_scf": 1e-6}}
+        cp2k = {"cp2k_version": "2024.3",
+                "cp2k_build": cp2k_runner.CP2K_BUILD_CPU,
+                "cp2k_params": {"cutoff": 400, "eps_scf": 1e-6}}
 
         dft = {"energy_ev": -42.0, "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
                "geometry": [[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]]}
@@ -596,8 +598,10 @@ def chain_tests():
 
         expected = {"version", "seq", "element", "n_atoms", "prev_sha256",
                     "created_at", "state_sha256", "state_path",
-                    "cp2k_version", "cp2k_params"}
+                    "cp2k_version", "cp2k_build", "cp2k_params"}
         check("в заголовке только нужные поля", set(h1) == expected, sorted(h1))
+        check("отпечаток сборки CP2K попал в заголовок",
+              h1.get("cp2k_build") == cp2k_runner.CP2K_BUILD_CPU, h1.get("cp2k_build"))
         check("version = 1", h1["version"] == 1)
         check("created_at — ISO 8601 UTC",
               datetime.strptime(h1["created_at"], "%Y-%m-%dT%H:%M:%SZ") is not None)
@@ -1019,6 +1023,22 @@ def master_geometry_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def build_tests():
+    print("\n--- 28. Пины сборки CP2K (Dockerfile/Makefile ↔ константы) ---")
+    with open(os.path.join(PROJECT_ROOT, "Dockerfile"), encoding="utf-8") as f:
+        dockerfile = f.read()
+    with open(os.path.join(PROJECT_ROOT, "Makefile"), encoding="utf-8") as f:
+        makefile = f.read()
+    check("CPU-сборка закреплена в Dockerfile",
+          cp2k_runner.CP2K_BUILD_CPU in dockerfile)
+    check("GPU-сборка закреплена в Makefile",
+          cp2k_runner.CP2K_BUILD_GPU in makefile)
+    check("обе сборки содержат digest",
+          all("@sha256:" in b for b in cp2k_runner.CP2K_BUILD_EXPECTED))
+    check("отпечаток неизвестной сборки не пропускается",
+          not cp2k_runner.cp2k_build_allowed("cp2k/cp2k:2024.3_other@sha256:deadbeef"))
+
+
 def peer_tests():
     print("\n--- 23. Самая длинная цепочка (catch-up перед майнингом) ---")
     import types
@@ -1159,6 +1179,7 @@ def _run_tests():
     busy_tests()
     lease_tests()
     master_geometry_tests()
+    build_tests()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print("\n" + "=" * 60)

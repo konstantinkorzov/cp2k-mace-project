@@ -1,6 +1,15 @@
-# Берем официальный образ CP2K
-ARG CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_psmp
+# Базовая сборка CP2K — пин по digest, а не по плавающему тегу: тег могут
+# пересобрать, и тогда у узлов сети окажутся разные бинарники (другая
+# арифметика и другой формат лога). Digest меняется только вместе с версией
+# протокола: см. CP2K_BUILD_EXPECTED в src/cp2k_runner.py.
+ARG CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_psmp@sha256:979e011c2ea15a2a56eae16b5f3a2d214142bb74fe644bfb302d366dddc2a443
 FROM ${CP2K_IMAGE}
+
+# ARG не переживает FROM — объявляем снова, чтобы подставить в ENV.
+# CP2K_BUILD уезжает в header.json каждого блока: по нему видно, какой
+# именно сборкой посчитан кадр.
+ARG CP2K_IMAGE
+ENV CP2K_BUILD=${CP2K_IMAGE}
 
 # Устанавливаем Python и pip (без mc, чтобы не ломать кэш)
 RUN apt-get update && apt-get install -y \

@@ -27,7 +27,7 @@ build: build-cpu build-gpu
 # Сборка только CPU-версии (для локальной проверки)
 build-cpu:
 	docker buildx build \
-		--build-arg CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_psmp \
+		--build-arg CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_psmp@sha256:979e011c2ea15a2a56eae16b5f3a2d214142bb74fe644bfb302d366dddc2a443 \
 		--load \
 		--cache-to type=local,dest=$(CACHE_DIR_CPU),mode=max \
 		--cache-from type=local,src=$(CACHE_DIR_CPU) \
@@ -36,7 +36,7 @@ build-cpu:
 # Сборка только GPU-версии (для сервера)
 build-gpu:
 	docker buildx build \
-		--build-arg CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_cuda_P100_psmp \
+		--build-arg CP2K_IMAGE=cp2k/cp2k:2024.3_mpich_generic_cuda_P100_psmp@sha256:e18b06ef11df6593b88f4cc35e52678b80e9edebfc56de70e7bc5e3215625d3d \
 		--load \
 		--cache-to type=local,dest=$(CACHE_DIR_GPU),mode=max \
 		--cache-from type=local,src=$(CACHE_DIR_GPU) \

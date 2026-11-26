@@ -366,6 +366,20 @@ def main():
                         help="URL мастера (можно несколько); первый — основной")
     args = parser.parse_args()
 
+    # Отпечаток сборки CP2K: считать чужим билдом бессмысленно — мастер всё
+    # равно отбросит состояние (другая арифметика/формат), а часы уже потрачены.
+    build = cp2k_runner.cp2k_build(cfg_defaults)
+    if cp2k_runner.cp2k_build_allowed(build):
+        print(f"CP2K build: {build}")
+    elif cp2k_runner.cp2k_build_identified(build):
+        print(f"✗ CP2K {build} не входит в сборки сети:")
+        for allowed in cp2k_runner.CP2K_BUILD_EXPECTED:
+            print(f"  • {allowed}")
+        print("  Пересоберите образ из актуального Dockerfile (pin по digest).")
+        sys.exit(4)
+    else:
+        print("⚠ CP2K_BUILD не задан — сборка не проверена (старый образ или запуск мимо образа)")
+
     base_url = f"http://{args.server}:{args.port}"
     masters = _masters_list(base_url, args.master)
     base_url = masters[0]

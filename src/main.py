@@ -1020,6 +1020,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     path = chain_mod.write_block(
         CONFIG["output_dir"], CONFIG["element"], n_atoms, state_sha, state_rel, txs,
         cp2k_version=CONFIG.get("cp2k_version", "unknown"),
+        cp2k_build=CONFIG.get("cp2k_build", ""),
         cp2k_params=cp2k_runner.CP2K_PARAMS,
         dft=dft,
     )
@@ -2482,7 +2483,22 @@ def _main_impl():
     print(f"[Master] Цепочка блоков: {chk['blocks']} блок(ов), целая")
 
     CONFIG["cp2k_version"] = cp2k_runner.cp2k_version(CONFIG)
+    CONFIG["cp2k_build"] = cp2k_runner.cp2k_build(CONFIG)
     print(f"[Master] CP2K {CONFIG['cp2k_version']}")
+    if cp2k_runner.cp2k_build_allowed(CONFIG["cp2k_build"]):
+        print(f"[Master] CP2K build: {CONFIG['cp2k_build']}")
+    elif cp2k_runner.cp2k_build_identified(CONFIG["cp2k_build"]):
+        # Сборка опознана, но не та, которой считает сеть: другой MPI/флаги —
+        # другая арифметика и другой формат лога, блоки такого мастера пиры
+        # не примут. Лучше не стартовать, чем считать мусор.
+        print(f"[Master] ✗ CP2K {CONFIG['cp2k_build']} не входит в сборки сети:")
+        for allowed in cp2k_runner.CP2K_BUILD_EXPECTED:
+            print(f"  • {allowed}")
+        print("[Master]   пересоберите образ из актуального Dockerfile (pin по digest)")
+        sys.exit(4)
+    else:
+        print("[Master] ⚠ CP2K_BUILD не задан (старый образ или запуск мимо образа): "
+              "в блоке будет «build не указан»")
     if CONFIG["peers"]:
         print(f"[Master] Пиры: {', '.join(CONFIG['peers'])}")
         threading.Thread(target=catch_up_chain, daemon=True).start()

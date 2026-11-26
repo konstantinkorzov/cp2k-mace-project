@@ -391,6 +391,7 @@ def write_block(element_dir: str, element: str, n_atoms: int,
                 state_sha256: str, state_path: str,
                 transactions: list[dict],
                 cp2k_version: str = "",
+                cp2k_build: str = "",
                 cp2k_params: dict | None = None,
                 dft: dict | None = None) -> str:
     """
@@ -421,6 +422,8 @@ def write_block(element_dir: str, element: str, n_atoms: int,
         "state_sha256": state_sha256,
         "state_path": state_path,
         "cp2k_version": cp2k_version,
+        # отпечаток сборки (образ@digest); у старых блоков поля нет
+        "cp2k_build": cp2k_build,
         "cp2k_params": cp2k_params or {},
     }
 
@@ -549,6 +552,8 @@ def verify_block(element_dir: str, block_path: str,
         problems.append("created_at не ISO 8601")
     if not header.get("cp2k_version") or not isinstance(header.get("cp2k_params"), dict):
         problems.append("нет cp2k_version/cp2k_params")
+    if header.get("cp2k_build") is not None and not isinstance(header.get("cp2k_build"), str):
+        problems.append("cp2k_build должен быть строкой")
 
     n_atoms = int(header.get("n_atoms", -1))
     sha = header.get("state_sha256")
