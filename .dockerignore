@@ -20,3 +20,5 @@ test/_test_env/
 *.Identifier
 .buildx-cache-cpu/
 .buildx-cache-gpu/
+*.pem
+*.key
