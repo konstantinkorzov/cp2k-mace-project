@@ -1084,10 +1084,9 @@ function fillWalletRoots(dirs) {
 /* ==================== настройки (src/config.json) ==================== */
 
 // Мастер передаёт воркеру только эти ключи (см. task_cfg_payload в src/main.py)
-const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k', 'worker_port'];
+const WORKER_CONFIG_KEYS = ['element', 'atom_diameter', 'verbose_cp2k'];
 // Эти ключи относятся только к воркеру — в настройках мастера их не показываем
-const HIDDEN_IN_MASTER = ['worker_server', 'worker_port', 'port',
-                       'coinbase_confirmations'];
+const HIDDEN_IN_MASTER = ['port', 'coinbase_confirmations'];
 
 function configField(key, entry) {
   const wrapped = entry && typeof entry === 'object' && 'value' in entry;

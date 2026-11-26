@@ -369,8 +369,10 @@ def main():
     # Автоматически считываем переменные окружения, переданные через Docker (или fallback на дефолты)
     cfg_defaults = _config_defaults()
     default_server = os.environ.get("MASTER_HOST", "host.docker.internal")
-    default_port = int(os.environ.get("MASTER_PORT")
-                       or cfg_defaults.get("worker_port") or 8000)
+    # Воркер — клиент и порт не слушает; это порт МАСТЕРА по умолчанию.
+    # Для CLI без --master: MASTER_PORT или 8000. В панели адрес мастера
+    # задаётся целиком (host:port), поэтому отдельный ключ не нужен.
+    default_port = int(os.environ.get("MASTER_PORT") or 8000)
 
     parser = argparse.ArgumentParser(description="Запуск воркера CP2K")
     parser.add_argument("--port", type=int, default=default_port, help="Порт сервера main.py")
