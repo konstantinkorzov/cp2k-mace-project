@@ -21,6 +21,7 @@ results/<element>/blobs/<sha256>.wfn, а в заголовке — ссылка.
 """
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -29,9 +30,11 @@ import time
 import zipfile
 from datetime import datetime
 
+import numpy as np
+
 import crypto
 
-BLOCK_VERSION = 1
+BLOCK_VERSION = 2
 ZERO_HASH = "0" * 64
 BLOCK_RE = re.compile(r"^(\d{6})_([A-Za-z]{1,3})_(\d+)\.zip$")
 HEADER_NAME = "header.json"
@@ -200,6 +203,81 @@ def sum_outputs(tx: dict) -> int:
     return total
 
 
+def merkle_root(leaves: list[bytes]) -> str:
+    """Merkle-корень с доменным разделением листьев и узлов."""
+    if not leaves:
+        return hashlib.sha256(b"cp2k-merkle-empty").hexdigest()
+    level = [hashlib.sha256(b"\x00" + leaf).digest() for leaf in leaves]
+    while len(level) > 1:
+        if len(level) % 2:
+            level.append(level[-1])
+        level = [hashlib.sha256(b"\x01" + level[i] + level[i + 1]).digest()
+                 for i in range(0, len(level), 2)]
+    return level[0].hex()
+
+
+def tx_root_of(txs: list[dict]) -> str:
+    return merkle_root([bytes.fromhex(tx.get("txid") or txid_of(tx)) for tx in txs])
+
+
+def dft_sha256(dft: dict) -> str:
+    return hashlib.sha256(b"cp2k-dft-v1\x00" + canonical_json(dft or {})).hexdigest()
+
+
+def geometry_seed(prev_id: str, nonce: int) -> int:
+    """Seed геометрии: зависит от содержимого предыдущего блока и nonce.
+
+    Правка любого поля блока N меняет block_id(N), а значит и seed(N+1):
+    старый wfn для N+1 перестаёт соответствовать геометрии, и его нужно
+    пересчитывать. Переписать K блоков = K прогонов DFT.
+    """
+    h = hashlib.sha256(b"cp2k-geom-v1\x00"
+                       + bytes.fromhex(prev_id or ZERO_HASH)
+                       + int(nonce).to_bytes(8, "little")).digest()
+    return int.from_bytes(h, "big")
+
+
+def block_id_of(header: dict) -> str:
+    body = {k: v for k, v in header.items() if k != "block_id"}
+    return hashlib.sha256(b"cp2k-block-v2\x00" + canonical_json(body)).hexdigest()
+
+
+def expected_geometry(header: dict) -> np.ndarray:
+    """Какая геометрия обязана быть у блока при его prev_id/nonce/параметрах."""
+    import structure_generator
+
+    cfg = {"atom_diameter": float(header.get("atom_diameter") or 2.0),
+           "composition": {str(header.get("element")): 1}}
+    template = None
+    if header.get("template"):
+        template = {"frames": [{
+            "symbols": [str(header.get("element"))] * int(header["n_atoms"]),
+            "coords": np.asarray(header["template"], dtype=float),
+        }]}
+    return structure_generator.generate_for_seed(
+        geometry_seed(str(header["prev_id"]), int(header["nonce"])),
+        int(header["n_atoms"]), int(header["dim"]), cfg, template)
+
+
+_BLOCK_ID_CACHE: dict[tuple, str] = {}
+
+
+def _block_id_of_file(path: str) -> str:
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key in _BLOCK_ID_CACHE:
+        return _BLOCK_ID_CACHE[key]
+    try:
+        with zipfile.ZipFile(path) as z:
+            header = (json.loads(z.read(HEADER_NAME).decode("utf-8"))
+                      if HEADER_NAME in set(z.namelist()) else {})
+        bid = str(header.get("block_id") or "")
+    except Exception:  # noqa: BLE001
+        bid = ""
+    _BLOCK_ID_CACHE[key] = bid
+    return bid
+
+
 def list_blocks(element_dir: str) -> list[dict]:
     d = blocks_dir(element_dir)
     if not os.path.isdir(d):
@@ -212,7 +290,8 @@ def list_blocks(element_dir: str) -> list[dict]:
         path = os.path.join(d, name)
         out.append({"seq": int(m.group(1)), "element": m.group(2),
                     "n_atoms": int(m.group(3)), "path": path, "name": name,
-                    "sha256": sha256_file(path)})
+                    "sha256": sha256_file(path),
+                    "block_id": _block_id_of_file(path)})
     out.sort(key=lambda b: b["seq"])
     return out
 
@@ -223,11 +302,12 @@ def next_seq(element_dir: str) -> int:
 
 
 def previous_hash(element_dir: str, seq: int) -> str:
+    """block_id предыдущего блока (для seq=1 — нули)."""
     if seq <= 1:
         return ZERO_HASH
     for b in list_blocks(element_dir):
         if b["seq"] == seq - 1:
-            return b["sha256"]
+            return b["block_id"]
     raise ValueError(f"Нет блока {seq - 1} — цепочка разорвана")
 
 
@@ -452,23 +532,26 @@ def write_block(element_dir: str, element: str, n_atoms: int,
                 cp2k_version: str = "",
                 cp2k_build: str = "",
                 cp2k_params: dict | None = None,
-                dft: dict | None = None) -> str:
-    """
-    Создаёт следующий блок цепочки элемента.
+                dft: dict | None = None,
+                nonce: int = 0,
+                dim: int = 3,
+                atom_diameter: float = 2.0,
+                geom_version: int | None = None,
+                template: list | None = None) -> str:
+    """Создаёт следующий блок цепочки элемента (протокол v2).
 
-    :param state_sha256: sha256 файла состояния (лежит в blobs/)
-    :param state_path: относительный путь 'blobs/<sha>.wfn'
-    :param transactions: список транзакций (coinbase первой)
-    :param cp2k_version: версия CP2K, которой считал мастер
-    :param cp2k_params: CP2K_PARAMS (CUTOFF, EPS_SCF, ячейка и т.д.)
-    :param dft: числа мастера (energy_ev, forces_ev_ang, geometry, ...) —
-                по ним другой мастер сможет пересчитать блок
-    :return: путь к zip
+    block_id — канонический хэш заголовка (включая tx_root, wfn_sha, dft_sha,
+    prev_id). Геометрия блока обязана быть функцией (prev_id, nonce).
     """
+    import structure_generator
+
+    if geom_version is None:
+        geom_version = structure_generator.GEOM_VERSION
+
     d = blocks_dir(element_dir)
     os.makedirs(d, exist_ok=True)
     seq = next_seq(element_dir)
-    prev = previous_hash(element_dir, seq)
+    prev_id = previous_hash(element_dir, seq)
     path = os.path.join(d, block_name(seq, element, n_atoms))
 
     header = {
@@ -476,15 +559,29 @@ def write_block(element_dir: str, element: str, n_atoms: int,
         "seq": seq,
         "element": element,
         "n_atoms": int(n_atoms),
-        "prev_sha256": prev,
+        "dim": int(dim),
+        "atom_diameter": float(atom_diameter),
+        "prev_id": prev_id,
         "created_at": now_iso(),
         "state_sha256": state_sha256,
         "state_path": state_path,
         "cp2k_version": cp2k_version,
-        # отпечаток сборки (образ@digest); у старых блоков поля нет
         "cp2k_build": cp2k_build,
         "cp2k_params": cp2k_params or {},
+        "tx_root": tx_root_of(transactions),
+        "nonce": int(nonce),
+        "dft_sha256": dft_sha256(dft or {}),
+        "geom_version": int(geom_version),
+        "template": template,
     }
+    header["block_id"] = block_id_of(header)
+
+    # Дешёвая проверка на месте: геометрия должна следовать из prev_id+nonce.
+    if dft is not None:
+        expect = expected_geometry(header)
+        got = np.asarray(dft.get("geometry"), dtype=float)
+        if got.shape != expect.shape or not np.allclose(got, expect, atol=1e-6, rtol=0.0):
+            raise ValueError("geometry не соответствует seed(prev_id, nonce)")
 
     tmp = path + ".tmp"
     with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -497,6 +594,7 @@ def write_block(element_dir: str, element: str, n_atoms: int,
             fname = f"tx-{idx:04d}-{tx.get('type', 'tx')}.json"
             z.writestr(fname, json.dumps(tx, ensure_ascii=False, indent=2))
     os.replace(tmp, path)
+    _BLOCK_ID_CACHE.clear()
     return path
 
 
@@ -509,23 +607,28 @@ def _parse_iso(value: str) -> bool:
         return False
 
 
-# ---------- Схема заголовка блока (консенсус) ----------
-# Ровно этот набор полей и эти типы. Любое отклонение — не наш блок:
-# лишнее поле меняет байты zip, но не проверяется больше нигде, а его
-# отсутствие ломает парсеры у пиров.
+# ---------- Схема заголовка блока v2 (консенсус) ----------
 HEADER_FIELDS = frozenset({
-    "version", "seq", "element", "n_atoms", "prev_sha256", "created_at",
-    "state_sha256", "state_path", "cp2k_version", "cp2k_build", "cp2k_params",
+    "version", "seq", "element", "n_atoms", "dim", "atom_diameter", "prev_id",
+    "created_at", "state_sha256", "state_path", "cp2k_version", "cp2k_build",
+    "cp2k_params", "tx_root", "nonce", "dft_sha256", "geom_version", "template",
+    "block_id",
 })
 REQUIRED_CP2K_PARAMS = ("cutoff", "rel_cutoff", "eps_default", "eps_scf",
                         "max_scf", "min_cell_size", "max_cell_size", "box_padding")
 ELEMENT_RE = re.compile(r"^[A-Za-z]{1,3}$")
+MAX_NONCE = 2 ** 64 - 1
+
+
+def _is_number(value) -> bool:
+    return (type(value) is int or type(value) is float) and \
+           not (isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))))
 
 
 def validate_header(header: dict, *, expected_seq: int | None = None,
                     expected_element: str | None = None,
                     expected_n_atoms: int | None = None) -> list[str]:
-    """Строгая проверка header.json. Возвращает список проблем."""
+    """Строгая проверка header.json v2. Возвращает список проблем."""
     problems: list[str] = []
     if not isinstance(header, dict):
         return ["header не объект"]
@@ -538,6 +641,7 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
 
     if type(header.get("version")) is not int or header["version"] != BLOCK_VERSION:
         problems.append(f"version {header.get('version')!r} != {BLOCK_VERSION}")
+
     seq = header.get("seq")
     if type(seq) is not int or seq < 1:
         problems.append(f"seq {seq!r} — не целое >= 1")
@@ -556,9 +660,14 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
     elif expected_n_atoms is not None and n_atoms != expected_n_atoms:
         problems.append(f"n_atoms {n_atoms} != ожидаемого {expected_n_atoms}")
 
-    prev = header.get("prev_sha256")
+    if type(header.get("dim")) is not int or header["dim"] not in (1, 2, 3):
+        problems.append(f"dim {header.get('dim')!r} — не 1/2/3")
+    if not _is_number(header.get("atom_diameter")) or float(header["atom_diameter"]) <= 0:
+        problems.append("atom_diameter — не положительное число")
+
+    prev = header.get("prev_id")
     if not isinstance(prev, str) or not SHA_RE.match(prev):
-        problems.append("prev_sha256 — не 64 hex")
+        problems.append("prev_id — не 64 hex")
 
     if not _parse_iso(header.get("created_at") or ""):
         problems.append("created_at не ISO 8601 UTC")
@@ -573,11 +682,9 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
     version = header.get("cp2k_version")
     if not isinstance(version, str) or not version.strip():
         problems.append("cp2k_version — пустая строка")
-
     build = header.get("cp2k_build")
     if not isinstance(build, str):
         problems.append("cp2k_build — не строка")
-
     params = header.get("cp2k_params")
     if not isinstance(params, dict) or not params:
         problems.append("cp2k_params — не непустой объект")
@@ -585,17 +692,48 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
         miss = [k for k in REQUIRED_CP2K_PARAMS if k not in params]
         if miss:
             problems.append(f"cp2k_params: нет ключей {miss}")
-        bad = [k for k, v in params.items()
-               if not isinstance(v, (int, float, str, bool)) or isinstance(v, float) and not v == v]
-        if bad:
-            problems.append(f"cp2k_params: недопустимые значения {bad}")
+
+    tx_root = header.get("tx_root")
+    if not isinstance(tx_root, str) or not SHA_RE.match(tx_root):
+        problems.append("tx_root — не 64 hex")
+
+    nonce = header.get("nonce")
+    if type(nonce) is not int or not 0 <= nonce <= MAX_NONCE:
+        problems.append(f"nonce {nonce!r} — не целое 0..2^64-1")
+
+    dsha = header.get("dft_sha256")
+    if not isinstance(dsha, str) or not SHA_RE.match(dsha):
+        problems.append("dft_sha256 — не 64 hex")
+
+    if type(header.get("geom_version")) is not int:
+        problems.append("geom_version — не целое")
+
+    template = header.get("template")
+    if template is not None:
+        if not isinstance(template, list) or len(template) != (n_atoms if type(n_atoms) is int else -1):
+            problems.append("template: не список координат длины n_atoms")
+        else:
+            bad = [p for p in template
+                   if not isinstance(p, list) or len(p) != 3 or not all(_is_number(x) for x in p)]
+            if bad:
+                problems.append("template: координаты не [x,y,z] числа")
+
+    bid = header.get("block_id")
+    if not isinstance(bid, str) or not SHA_RE.match(bid):
+        problems.append("block_id — не 64 hex")
+    else:
+        try:
+            if block_id_of(header) != bid:
+                problems.append("block_id не совпадает с содержимым заголовка")
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"block_id не вычисляется: {e}")
 
     return problems
 
 
-def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
-    """Возвращает (header, dft, txs, имена файлов) из zip-блока."""
-    with zipfile.ZipFile(path) as z:
+def read_block_bytes(data: bytes) -> tuple[dict, dict, list[dict], set]:
+    """Разбирает zip-блок из памяти (для пиров и тестов)."""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
         names = set(z.namelist())
         header = json.loads(z.read(HEADER_NAME).decode("utf-8")) if HEADER_NAME in names else {}
         dft = json.loads(z.read(DFT_NAME).decode("utf-8")) if DFT_NAME in names else {}
@@ -606,6 +744,12 @@ def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
                 tx["_file"] = name
                 txs.append(tx)
     return header, dft, txs, names
+
+
+def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
+    """Возвращает (header, dft, txs, имена файлов) из zip-блока."""
+    with open(path, "rb") as f:
+        return read_block_bytes(f.read())
 
 
 def _check_txs(txs: list[dict], utxo: dict, label: str,
@@ -682,8 +826,9 @@ def verify_block(element_dir: str, block_path: str,
                  expected_seq: int | None = None,
                  expected_prev: str | None = None) -> dict:
     """
-    Проверяет ОДИН скачанный блок против локальной цепочки, ничего не записывая.
-    Возвращает {ok, problems, header, dft, txs}.
+    Проверяет ОДИН скачанный блок, ничего не записывая:
+    схема/block_id, prev_id, tx_root, dft_sha, воспроизводимость геометрии,
+    blob, транзакции.
     """
     problems = []
     try:
@@ -695,8 +840,8 @@ def verify_block(element_dir: str, block_path: str,
     element = os.path.basename(os.path.normpath(element_dir))
     problems.extend(validate_header(header, expected_seq=expected_seq,
                                     expected_element=element))
-    if expected_prev is not None and header.get("prev_sha256") != expected_prev:
-        problems.append("prev_sha256 не совпадает с головой локальной цепочки")
+    if expected_prev is not None and header.get("prev_id") != expected_prev:
+        problems.append("prev_id не совпадает с головой локальной цепочки")
     seq = header.get("seq") if type(header.get("seq")) is int else -1
 
     n_atoms = int(header.get("n_atoms", -1))
@@ -714,6 +859,9 @@ def verify_block(element_dir: str, block_path: str,
         elif sha256_file(blob) != sha:
             problems.append("sha256 файла состояния не совпадает")
 
+    if tx_root_of(txs) != header.get("tx_root"):
+        problems.append("tx_root не совпадает с транзакциями блока")
+
     if not dft:
         problems.append("нет dft.json — блок нельзя пересчитать")
     else:
@@ -725,6 +873,15 @@ def verify_block(element_dir: str, block_path: str,
             problems.append("dft.json: forces не соответствуют n_atoms")
         if dft.get("energy_ev") is None:
             problems.append("dft.json: нет energy_ev")
+        if dft_sha256(dft) != header.get("dft_sha256"):
+            problems.append("dft_sha256 не совпадает с dft.json")
+        try:
+            expect = expected_geometry(header)
+            got = np.asarray(geom, dtype=float)
+            if got.shape != expect.shape or not np.allclose(got, expect, atol=1e-6, rtol=0.0):
+                problems.append("геометрия не следует из seed(prev_id, nonce)")
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"геометрию нельзя воспроизвести: {e}")
 
     utxo = utxo_set(element_dir)
     for key in list(utxo):
@@ -740,9 +897,10 @@ def verify_block(element_dir: str, block_path: str,
 
 def verify_chain(element_dir: str, element: str | None = None) -> dict:
     """
-    Проверяет: версию/поля заголовка, время, prev_sha256, наличие blob с нужным
-    хэшем, транзакции (один coinbase на 50, ссылки входов на UTXO, отсутствие
-    двойных трат, сумма входов >= суммы выходов).
+    Полная проверка цепочки v2:
+      схема/block_id, prev_id, tx_root, dft_sha256, воспроизводимость геометрии,
+      blob по state_sha256, транзакции (coinbase, UTXO, подписи, комиссии,
+      зрелость, лимит переводов).
     """
     blocks = list_blocks(element_dir)
     problems = []
@@ -757,53 +915,52 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             problems.append(f"{b['name']}: элемент {b['element']} != {element}")
 
         try:
-            with zipfile.ZipFile(b["path"]) as z:
-                names = set(z.namelist())
-                if HEADER_NAME not in names:
-                    problems.append(f"{b['name']}: нет {HEADER_NAME}")
-                    header = {}
-                else:
-                    header = json.loads(z.read(HEADER_NAME).decode("utf-8"))
-                dft = (json.loads(z.read(DFT_NAME).decode("utf-8"))
-                       if DFT_NAME in names else {})
+            header, dft, txs, names = read_block(b["path"])
         except Exception as e:  # noqa: BLE001
             problems.append(f"{b['name']}: не читается как zip ({e})")
-            expected_prev = b["sha256"]
             expected_seq += 1
             continue
 
-        if header:
-            problems.extend(f"{b['name']}: {p}" for p in validate_header(
-                header, expected_seq=b["seq"], expected_element=b["element"],
-                expected_n_atoms=b["n_atoms"]))
-            if header.get("prev_sha256") != expected_prev:
-                problems.append(f"{b['name']}: prev_sha256 не совпадает с предыдущим блоком")
+        problems.extend(f"{b['name']}: {p}" for p in validate_header(
+            header, expected_seq=b["seq"], expected_element=b["element"],
+            expected_n_atoms=b["n_atoms"]))
+        if header.get("prev_id") != expected_prev:
+            problems.append(f"{b['name']}: prev_id не совпадает с предыдущим блоком")
 
-            if not dft or dft.get("energy_ev") is None:
-                problems.append(f"{b['name']}: нет dft.json/energy_ev")
+        if tx_root_of(txs) != header.get("tx_root"):
+            problems.append(f"{b['name']}: tx_root не совпадает с транзакциями")
+
+        if not dft or dft.get("energy_ev") is None:
+            problems.append(f"{b['name']}: нет dft.json/energy_ev")
+        else:
+            if dft_sha256(dft) != header.get("dft_sha256"):
+                problems.append(f"{b['name']}: dft_sha256 не совпадает с dft.json")
+            geom = dft.get("geometry")
+            if not isinstance(geom, list) or len(geom) != b["n_atoms"]:
+                problems.append(f"{b['name']}: geometry в dft.json не соответствует n_atoms")
             else:
-                geom = dft.get("geometry")
-                if not isinstance(geom, list) or len(geom) != b["n_atoms"]:
-                    problems.append(f"{b['name']}: geometry в dft.json не соответствует n_atoms")
+                try:
+                    expect = expected_geometry(header)
+                    got = np.asarray(geom, dtype=float)
+                    if got.shape != expect.shape or \
+                            not np.allclose(got, expect, atol=1e-6, rtol=0.0):
+                        problems.append(f"{b['name']}: геометрия не следует "
+                                        f"из seed(prev_id, nonce)")
+                except Exception as e:  # noqa: BLE001
+                    problems.append(f"{b['name']}: геометрию нельзя воспроизвести ({e})")
 
-            sha = header.get("state_sha256")
-            rel = header.get("state_path")
-            if not sha or not rel:
-                problems.append(f"{b['name']}: нет state_sha256/state_path")
-            elif not SHA_RE.match(str(sha)) or not STATE_PATH_RE.match(str(rel)):
-                problems.append(f"{b['name']}: state_sha256/state_path недопустимого формата")
-            else:
-                blob = os.path.join(element_dir, str(rel))
-                if not os.path.exists(blob):
-                    problems.append(f"{b['name']}: нет файла состояния {rel}")
-                elif sha256_file(blob) != sha:
-                    problems.append(f"{b['name']}: sha256 файла состояния не совпадает")
-
-        try:
-            txs = read_block_txs(b["path"])
-        except Exception as e:  # noqa: BLE001
-            problems.append(f"{b['name']}: транзакции не читаются ({e})")
-            txs = []
+        sha = header.get("state_sha256")
+        rel = header.get("state_path")
+        if not sha or not rel:
+            problems.append(f"{b['name']}: нет state_sha256/state_path")
+        elif not SHA_RE.match(str(sha)) or not STATE_PATH_RE.match(str(rel)):
+            problems.append(f"{b['name']}: state_sha256/state_path недопустимого формата")
+        else:
+            blob = os.path.join(element_dir, str(rel))
+            if not os.path.exists(blob):
+                problems.append(f"{b['name']}: нет файла состояния {rel}")
+            elif sha256_file(blob) != sha:
+                problems.append(f"{b['name']}: sha256 файла состояния не совпадает")
 
         coinbases = [t for t in txs if t.get("type") == "coinbase"]
         if len(coinbases) != 1:
@@ -812,8 +969,7 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
         if len(transfers) > MAX_TXS_PER_BLOCK:
             problems.append(f"{b['name']}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
-        # обычные транзакции: ссылки на UTXO, подписи Ed25519, комиссии
-        block_fee = 0.0
+        block_fee = 0
         for tx in txs:
             tid = tx.get("txid") or txid_of(tx)
             if tid != txid_of(tx):
@@ -822,14 +978,15 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             if tx.get("type") == "coinbase":
                 continue
 
-            total_in = 0.0
+            total_in = 0
             for i in tx.get("inputs", []):
                 key = (i.get("txid"), int(i.get("vout", -1)))
                 if key not in utxo:
-                    problems.append(f"{b['name']}: вход {key} ссылается на неизвестный/потраченный выход")
+                    problems.append(f"{b['name']}: вход {key} ссылается на "
+                                    f"неизвестный/потраченный выход")
                     continue
                 info = utxo.pop(key)
-                total_in += info["value"]
+                total_in += int(info["value"])
                 if (info.get("coinbase")
                         and b["seq"] - int(info.get("height") or 0) < COINBASE_MATURITY):
                     problems.append(f"{b['name']}: вход {key} — незрелый coinbase")
@@ -852,23 +1009,23 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             total_out = sum_outputs(tx)
             if total_in < total_out:
                 problems.append(f"{b['name']}: сумма входов {total_in} < суммы выходов {total_out}")
-            block_fee += max(0.0, total_in - total_out)
+            block_fee += max(0, total_in - total_out)
 
-        # coinbase может забрать субсидию + комиссии блока (как в Bitcoin)
         if coinbases:
             cb_value = sum(int(o["value"]) for o in coinbases[0].get("outputs", []))
             if cb_value > COINBASE_VALUE + block_fee:
-                problems.append(
-                    f"{b['name']}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee}")
+                problems.append(f"{b['name']}: coinbase {cb_value} > "
+                                f"{COINBASE_VALUE} + комиссии {block_fee}")
 
-        # добавляем все выходы блока в UTXO
         for tx in txs:
             tid = tx.get("txid") or txid_of(tx)
             for vout, out in enumerate(tx.get("outputs", [])):
-                utxo[(tid, vout)] = {"value": out["value"] if type(out.get("value")) is int else 0, "address": out["address"],
-                                     "height": b["seq"], "coinbase": tx.get("type") == "coinbase"}
+                utxo[(tid, vout)] = {
+                    "value": out["value"] if type(out.get("value")) is int else 0,
+                    "address": out["address"], "height": b["seq"],
+                    "coinbase": tx.get("type") == "coinbase"}
 
-        expected_prev = b["sha256"]
+        expected_prev = header.get("block_id") or ""
         expected_seq += 1
 
     return {"ok": not problems, "blocks": len(blocks), "problems": problems}

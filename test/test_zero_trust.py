@@ -563,6 +563,18 @@ def identity_tests():
           identity.make_identity("alpha")["pubkey_hash"] != a["pubkey_hash"])
 
 
+def block_dft(element_dir, n_atoms=2, dim=3, nonce=0):
+    """dft.json, геометрия которого следует из (prev_id, nonce) — правило v2."""
+    prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
+    geom = chain.expected_geometry({
+        "prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": dim,
+        "atom_diameter": 2.0, "element": "Cu", "template": None,
+    })
+    return {"energy_ev": -42.0,
+            "forces_ev_ang": [[0.0, 0.0, 0.0]] * n_atoms,
+            "geometry": np.asarray(geom).tolist()}
+
+
 def chain_tests():
     print("\n--- 20. Блокчейн-блоки, подписи и комиссии ---")
     import zipfile
@@ -586,10 +598,9 @@ def chain_tests():
                 "cp2k_build": cp2k_runner.CP2K_BUILD_CPU,
                 "cp2k_params": dict(cp2k_runner.CP2K_PARAMS)}
 
-        dft = {"energy_ev": -42.0, "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
-               "geometry": [[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]]}
         p1 = chain.write_block(tmp, "Cu", 2, sha1, rel1,
-                               [chain.make_coinbase(1, master)], dft=dft, **cp2k)
+                               [chain.make_coinbase(1, master)],
+                               dft=block_dft(tmp), **cp2k)
         check("имя блока 000001_Cu_2.zip",
               os.path.basename(p1) == "000001_Cu_2.zip", os.path.basename(p1))
 
@@ -598,18 +609,20 @@ def chain_tests():
             h1 = json.loads(z.read("header.json"))
             tx1 = json.loads(z.read("tx-0000-coinbase.json"))
 
-        expected = {"version", "seq", "element", "n_atoms", "prev_sha256",
-                    "created_at", "state_sha256", "state_path",
-                    "cp2k_version", "cp2k_build", "cp2k_params"}
+        expected = {"version", "seq", "element", "n_atoms", "dim",
+                    "atom_diameter", "prev_id", "created_at", "state_sha256",
+                    "state_path", "cp2k_version", "cp2k_build", "cp2k_params",
+                    "tx_root", "nonce", "dft_sha256", "geom_version",
+                    "template", "block_id"}
         check("в заголовке только нужные поля", set(h1) == expected, sorted(h1))
         check("отпечаток сборки CP2K попал в заголовок",
               h1.get("cp2k_build") == cp2k_runner.CP2K_BUILD_CPU, h1.get("cp2k_build"))
-        check("version = 1", h1["version"] == 1)
+        check("version = 2", h1["version"] == 2)
         check("created_at — ISO 8601 UTC",
               datetime.strptime(h1["created_at"], "%Y-%m-%dT%H:%M:%SZ") is not None)
         check("CP2K version и params в блоке",
               h1["cp2k_version"] == "2024.3" and h1["cp2k_params"]["cutoff"] == 400)
-        check("первый блок: prev = нули", h1["prev_sha256"] == chain.ZERO_HASH)
+        check("первый блок: prev = нули", h1["prev_id"] == chain.ZERO_HASH)
         check("wfn в блок не кладётся, только ссылка",
               not any(n.endswith(".wfn") for n in names) and h1["state_path"] == rel1)
         check("coinbase — 50 000 000 монет",
@@ -635,13 +648,13 @@ def chain_tests():
 
         cb2 = chain.make_coinbase(2, master, chain.COINBASE_VALUE + fee)
         p2 = chain.write_block(tmp, "Cu", 2, sha1, rel1, [cb2, reward],
-                               dft=dft, **cp2k)
+                               dft=block_dft(tmp), **cp2k)
 
         with zipfile.ZipFile(p2) as z:
             h2 = json.loads(z.read("header.json"))
             cb_tx = json.loads(z.read("tx-0000-coinbase.json"))
-        check("второй блок: prev = sha256(первого)",
-              h2["prev_sha256"] == chain.sha256_file(p1))
+        check("второй блок: prev_id = block_id(первого)",
+              h2["prev_id"] == h1["block_id"])
         check("coinbase = 50 000 000 + комиссия",
               sum(o["value"] for o in cb_tx["outputs"]) == chain.COINBASE_VALUE + fee)
 
@@ -659,12 +672,13 @@ def chain_tests():
         make_wfn(wfn2)
         sha3, rel3 = chain.store_blob(tmp2, wfn2)
         chain.write_block(tmp2, "Cu", 2, sha3, rel3,
-                          [chain.make_coinbase(1, master)], dft=dft, **cp2k)
+                          [chain.make_coinbase(1, master)],
+                          dft=block_dft(tmp2), **cp2k)
         bad_reward = chain.build_transfer(tmp2, {master}, worker, master,
                                           chain.REWARD_VALUE, 1, height=2)
         chain.write_block(tmp2, "Cu", 2, sha3, rel3,
                           [chain.make_coinbase(2, master, 50.0), bad_reward],
-                          dft=dft, **cp2k)
+                          dft=block_dft(tmp2), **cp2k)
         v2 = chain.verify_chain(tmp2, "Cu")
         check("блок без подписи входа отклоняется",
               (not v2["ok"]) and any("без подписи" in p for p in v2["problems"]),
@@ -726,7 +740,8 @@ def chain_tests():
             make_wfn(wfn3)
             sha4, rel4 = chain.store_blob(edir, wfn3)
             p3 = chain.write_block(edir, "Cu", 2, sha4, rel4,
-                                   [chain.make_coinbase(1, master)], dft=dft, **cp2k)
+                                   [chain.make_coinbase(1, master)],
+                                   dft=block_dft(edir), **cp2k)
             vb = chain.verify_block(edir, p3, expected_seq=1,
                                     expected_prev=chain.ZERO_HASH)
             check("verify_block принимает корректный блок", vb["ok"], vb["problems"])
@@ -737,10 +752,16 @@ def chain_tests():
         finally:
             shutil.rmtree(tmp3, ignore_errors=True)
 
-        # --- порча ---
-        with open(p1, "ab") as f:
-            f.write(b"broken")
-        check("порча блока ловится", not chain.verify_chain(tmp, "Cu")["ok"])
+        # --- порча: меняем dft.json внутри блока ---
+        with zipfile.ZipFile(p1) as z:
+            entries = {n: z.read(n) for n in z.namelist()}
+        tampered = json.loads(entries["dft.json"])
+        tampered["energy_ev"] = float(tampered["energy_ev"]) + 1.0
+        entries["dft.json"] = json.dumps(tampered, ensure_ascii=False).encode("utf-8")
+        with zipfile.ZipFile(p1, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            for name, data in entries.items():
+                z.writestr(name, data)
+        check("подмена dft внутри блока ловится", not chain.verify_chain(tmp, "Cu")["ok"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(tmp2, ignore_errors=True)
@@ -997,10 +1018,11 @@ def master_geometry_tests():
               payload.get("struct_id") in main.active_tasks
               and len(main.active_tasks[payload["struct_id"]]["geometry"]) == 2)
 
-        # детерминизм: тот же seed и attempt → те же координаты
-        a = main._issue_geometry(dict(task))
-        b = main._issue_geometry(dict(task))
-        check("геометрия детерминирована по seed",
+        # детерминизм: (prev_id, nonce) → та же геометрия
+        fixed = dict(task, nonce=12345)
+        a = main._issue_geometry(dict(fixed))
+        b = main._issue_geometry(dict(fixed))
+        check("геометрия детерминирована по (prev_id, nonce)",
               a["coords"] == b["coords"] and a["species"] == b["species"])
 
         # шаблон: геометрия строится вокруг него и воспроизводится по выданному seed
@@ -1117,7 +1139,8 @@ def mempool_policy_tests():
         coinbases = []
         for seq in range(1, 7):
             cb = chain.make_coinbase(seq, addr, chain.COINBASE_VALUE)
-            chain.write_block(tmp, "Cu", 2, sha, rel, [cb], dft=dft,
+            chain.write_block(tmp, "Cu", 2, sha, rel, [cb],
+                              dft=block_dft(tmp),
                               cp2k_version="2024.3",
                               cp2k_build=cp2k_runner.CP2K_BUILD_CPU,
                               cp2k_params=dict(cp2k_runner.CP2K_PARAMS))

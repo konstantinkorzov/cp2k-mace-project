@@ -24,6 +24,7 @@ import json
 import time
 import base64
 import signal
+import secrets
 import subprocess
 import re
 import shutil
@@ -473,36 +474,43 @@ GEOMETRY_MATCH_TOL = 1e-6     # Å: допуск сравнения присла
 
 
 def _issue_geometry(task: dict) -> dict:
-    """Геометрия задания — делает МАСТЕР и выдаёт готовой.
+    """Геометрия задания, привязанная к голове цепочки (протокол v2).
 
-    Воркер больше ничего не придумывает: он получает координаты и сорт атомов
-    в задании. Поэтому близость к шаблону/seed — не обещание, а проверяемое
-    свойство: мастер сравнивает присланное с тем, что выдал (_same_geometry),
-    и только потом запускает DFT.
-
-    :return: {"coords": [[x,y,z], ...], "species": [...], "seed": int}
+    seed = H(prev_id ‖ nonce). Значит, любая правка предыдущего блока меняет
+    геометрию этого и требует нового DFT. Переписать K блоков = K работ.
     """
     n_atoms = int(task["n_atoms"])
     dim = int(task["dim"])
-    base = int(task.get("seed") or 0)
-    attempts = int(task.get("attempts", 0))
-    last_error = None
+    element_dir = CONFIG["output_dir"]
+    prev_id = chain_mod.previous_hash(element_dir, chain_mod.next_seq(element_dir))
 
-    for k in range(GEOMETRY_RETRIES):
-        seed = (base + GEOMETRY_SHIFT * attempts + k) % (2 ** 31)
+    tpl = CONFIG.get("template")
+    frame = None
+    template = None
+
+    last_error = None
+    nonce = 0
+    fixed_nonce = task.get("nonce")
+    for _ in range(GEOMETRY_RETRIES):
+        nonce = int(fixed_nonce) if fixed_nonce is not None else secrets.randbits(64)
+        seed = chain_mod.geometry_seed(prev_id, nonce)
         try:
-            if CONFIG.get("template"):
-                coords = structure_generator.generate_from_template(
-                    n_atoms, dim, CONFIG, CONFIG["template"],
-                    seed=seed, max_attempts=3)
-            else:
-                coords = structure_generator.generate_random_cluster(
-                    n_atoms, dim, CONFIG, seed=seed, max_attempts=3)
+            if tpl and tpl.get("frames"):
+                frames = tpl["frames"]
+                frame = frames[seed % len(frames)]
+                template = {"frames": [{"symbols": list(frame.get("symbols") or []),
+                                        "coords": frame["coords"]}]}
+            coords = structure_generator.generate_for_seed(
+                seed, n_atoms, dim, CONFIG, template)
             species = structure_generator.assign_species(n_atoms, CONFIG, seed=seed)
             return {
                 "coords": np.asarray(coords, dtype=float).tolist(),
-                "species": [str(s) for s in species],
+                "species": [str(x) for x in species],
                 "seed": seed,
+                "nonce": nonce,
+                "prev_id": prev_id,
+                "template": ([[float(c) for c in p] for p in frame["coords"]]
+                             if frame is not None else None),
             }
         except Exception as e:  # noqa: BLE001
             last_error = e
@@ -1038,6 +1046,10 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         cp2k_build=CONFIG.get("cp2k_build", ""),
         cp2k_params=cp2k_runner.CP2K_PARAMS,
         dft=dft,
+        nonce=int(task_data.get("_nonce", 0)),
+        dim=int(task_data.get("dim", 3)),
+        atom_diameter=float(CONFIG.get("atom_diameter") or 2.0),
+        template=task_data.get("_template"),
     )
 
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
@@ -1650,6 +1662,8 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             "attempts": task.get("attempts", 0),
             # seed, которым мастер построил геометрию (для воспроизводимости)
             "seed": issued["seed"],
+            "nonce": issued["nonce"],
+            "prev_id": issued["prev_id"],
             "geometry": issued["coords"],
             "species": issued["species"],
             "cfg": task_cfg_payload(CONFIG),
@@ -1663,8 +1677,10 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             "geometry": issued["coords"],
             "species": issued["species"],
             "seed": issued["seed"],
-            # сверка геометрии включена только в шаблонном режиме: без шаблона
-            # задание обещает лишь «валидный кластер из n атомов»
+            "nonce": issued["nonce"],
+            "prev_id": issued["prev_id"],
+            "template": issued["template"],
+            # сверка геометрии включена только в шаблонном режиме
             "check_geometry": bool(CONFIG.get("template")),
         }
 
@@ -1865,6 +1881,17 @@ def submit_result(result: TaskResult):
             return {"status": "rejected", "reason": "worker mismatch"}
 
     try:
+        # --- Голова цепочки изменилась: результат всё равно не примут ---
+        # Проверка дешёвая и делается ДО прогона CP2K.
+        if info.get("prev_id"):
+            tip = chain_mod.previous_hash(CONFIG["output_dir"],
+                                          chain_mod.next_seq(CONFIG["output_dir"]))
+            if info["prev_id"] != tip:
+                with task_queue_lock:
+                    verifying_tasks.discard(sid)
+                    _requeue_or_fail(task_data, "голова цепочки изменилась")
+                return {"status": "rejected", "reason": "stale head"}
+
         # --- Неуспех расчёта: возвращаем задачу в очередь (или бракуем) ---
         if not result.success:
             reason = (result.data or {}).get("message") or (result.data or {}).get("error_reason") \
@@ -1880,12 +1907,21 @@ def submit_result(result: TaskResult):
 
         # Эталон — та геометрия, которую мастер выдал (info), а не присланная.
         # Сверка дешёвая; только после неё запускаются последние шаги DFT.
+        task_data["_nonce"] = info.get("nonce", 0)
+        task_data["_template"] = info.get("template")
         verdict = verify_state_payload(CONFIG, task_data, payload, issued=info)
         persist = _persist_verified_state
 
         with task_queue_lock:
             verifying_tasks.discard(sid)
             if verdict["valid"]:
+                # Голова могла измениться, пока шла проверка (минуты-часы):
+                # блок на старом prev_id уже не собрать — возвращаем задачу.
+                tip = chain_mod.previous_hash(CONFIG["output_dir"],
+                                              chain_mod.next_seq(CONFIG["output_dir"]))
+                if info.get("prev_id") and info["prev_id"] != tip:
+                    _requeue_or_fail(task_data, "голова изменилась во время проверки")
+                    return {"status": "rejected", "reason": "stale head"}
                 kept = persist(task_data, payload, verdict)
                 completed_tasks.add(sid)
                 print(f"[Master] ✓ Воркер [{w_id}] сдал результат {sid}: проверка пройдена "
@@ -1932,7 +1968,7 @@ def _local_head() -> tuple[int, str]:
     blocks = chain_mod.list_blocks(CONFIG["output_dir"])
     if not blocks:
         return 0, chain_mod.ZERO_HASH
-    return blocks[-1]["seq"], blocks[-1]["sha256"]
+    return blocks[-1]["seq"], blocks[-1]["block_id"]
 
 
 def _normalize_peer(url: str) -> str:
@@ -2092,7 +2128,7 @@ def _find_fork_ancestor(peer: str, local_height: int) -> int | None:
     Ищет высоту общего предка с пиром, спускаясь от local_height вниз:
     скачивает блок пира с этим seq и сравнивает sha256 с нашим.
     """
-    mine = {b["seq"]: b["sha256"] for b in chain_mod.list_blocks(CONFIG["output_dir"])}
+    mine = {b["seq"]: b["block_id"] for b in chain_mod.list_blocks(CONFIG["output_dir"])}
     for seq in range(local_height, 0, -1):
         try:
             r = requests.get(f"{peer}/chain/block/{seq}", timeout=60)
@@ -2100,7 +2136,11 @@ def _find_fork_ancestor(peer: str, local_height: int) -> int | None:
             return None
         if r.status_code != 200:
             continue
-        if sha256_bytes(r.content) == mine.get(seq):
+        try:
+            header, _dft, _txs, _names = chain_mod.read_block_bytes(r.content)
+        except Exception:  # noqa: BLE001
+            continue
+        if header.get("block_id") and header["block_id"] == mine.get(seq):
             return seq
     return None
 

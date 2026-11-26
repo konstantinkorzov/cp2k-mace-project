@@ -18,6 +18,8 @@ import tempfile
 import zipfile
 from datetime import datetime
 
+import numpy as np
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
@@ -49,11 +51,16 @@ def make_state(element_dir, data=b"fake-wfn-state" * 200):
     return chain.store_blob(element_dir, p)
 
 
-def make_dft(n_atoms=2, energy=-42.0):
-    geom = [[0.0, 0.0, 0.0]] + [[0.0, 0.0, 3.0]] * max(0, n_atoms - 1)
+def make_dft(element_dir, n_atoms=2, nonce=0, energy=-42.0):
+    """Геометрия должна следовать из (prev_id, nonce) — правило v2."""
+    prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
+    geom = chain.expected_geometry({
+        "prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": 3,
+        "atom_diameter": 2.0, "element": "Cu", "template": None,
+    })
     return {"energy_ev": energy,
             "forces_ev_ang": [[0.0, 0.0, 0.0]] * n_atoms,
-            "geometry": geom}
+            "geometry": np.asarray(geom).tolist()}
 
 
 CP2K = {"cp2k_version": "2024.3",
@@ -61,11 +68,12 @@ CP2K = {"cp2k_version": "2024.3",
         "cp2k_params": dict(cp2k_runner.CP2K_PARAMS)}
 
 
-def write_block(element_dir, txs, dft=None, sha=None, rel=None, n_atoms=2):
+def write_block(element_dir, txs, dft=None, sha=None, rel=None, n_atoms=2, nonce=0):
     sha = sha or make_state(element_dir)[0]
     rel = rel or f"blobs/{sha}.wfn"
     return chain.write_block(element_dir, "Cu", n_atoms, sha, rel, txs,
-                             dft=dft or make_dft(n_atoms), **CP2K)
+                             dft=dft or make_dft(element_dir, n_atoms, nonce),
+                             nonce=nonce, **CP2K)
 
 
 def keypair():
@@ -220,6 +228,59 @@ def test_tampered_tx_after_signature():
         shutil.rmtree(os.path.dirname(d), ignore_errors=True)
 
 
+def test_rewrite_history_needs_work():
+    """Подмена блока с пересчётом всех хэшей, но без нового DFT — отбита.
+
+    Атакующий правит dft первого блока, пересчитывает block_id и prev_id
+    второго, но оставляет старую геометрию/wfn. Хэши сходятся, а геометрия
+    не следует из нового seed(prev_id, nonce) — блок отклоняется.
+    """
+    d = new_element()
+    try:
+        _seed, _pub, addr = keypair()
+        cb1 = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
+        p1 = write_block(d, [cb1])
+        cb2 = chain.make_coinbase(2, addr, chain.COINBASE_VALUE)
+        p2 = write_block(d, [cb2])
+
+        def rewrite(path, mutate):
+            with zipfile.ZipFile(path) as z:
+                entries = {n: z.read(n) for n in z.namelist()}
+            mutate(entries)
+            with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                for name, data in entries.items():
+                    z.writestr(name, data)
+
+        new_id = {}
+
+        def tamper_first(entries):
+            header = json.loads(entries["header.json"])
+            dft = json.loads(entries["dft.json"])
+            dft["energy_ev"] = float(dft["energy_ev"]) + 1.0
+            entries["dft.json"] = json.dumps(dft).encode("utf-8")
+            header["dft_sha256"] = chain.dft_sha256(dft)
+            header["block_id"] = chain.block_id_of(header)
+            new_id["id"] = header["block_id"]
+            entries["header.json"] = json.dumps(header).encode("utf-8")
+
+        rewrite(p1, tamper_first)
+
+        def reparent_second(entries):
+            header = json.loads(entries["header.json"])
+            header["prev_id"] = new_id["id"]
+            header["block_id"] = chain.block_id_of(header)
+            entries["header.json"] = json.dumps(header).encode("utf-8")
+
+        rewrite(p2, reparent_second)
+
+        v = chain.verify_chain(d, "Cu")
+        check("переписаны хэши, но не DFT → геометрия не сходится",
+              (not v["ok"]) and any("геометрия не следует" in p for p in v["problems"]),
+              v["problems"][:3])
+    finally:
+        shutil.rmtree(os.path.dirname(d), ignore_errors=True)
+
+
 def test_blob_path_traversal():
     """state_path вне каталога элемента — блок ссылается на чужой файл."""
     d = new_element()
@@ -231,7 +292,7 @@ def test_blob_path_traversal():
         _, _, addr = keypair()
         path = chain.write_block(d, "Cu", 2, sha, "../outside.bin",
                                  [chain.make_coinbase(1, addr, 50.0)],
-                                 dft=make_dft(), **CP2K)
+                                 dft=make_dft(d), **CP2K)
         v = chain.verify_block(d, path)
         check("state_path выходит за каталог элемента", not v["ok"],
               str(v["problems"][:3]), attack=True)
@@ -333,6 +394,7 @@ def main_run():
     test_double_spend_same_block()
     test_wrong_key_signature()
     test_tampered_tx_after_signature()
+    test_rewrite_history_needs_work()
     test_blob_path_traversal()
     test_duplicate_seq_different_n()
     test_xyz_comment_injection()

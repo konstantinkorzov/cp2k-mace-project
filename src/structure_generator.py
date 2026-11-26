@@ -281,6 +281,10 @@ def generate_structures(config: dict) -> str:
 # меняются, поэтому структура остаётся «около» шаблона, но каждая задача даёт
 # новую геометрию — иначе все блоки этапа были бы одним и тем же кадром.
 
+# Версия генератора геометрии: входит в заголовок блока (geom_version).
+# Пиры обязаны воспроизвести геометрию тем же алгоритмом.
+GEOM_VERSION = 1
+
 TEMPLATE_NOISE_FRACTION = 0.08   # σ смещения атома = доля min_dist
 TEMPLATE_REPAIR_STEPS = 200      # итераций расталкивания слипшихся пар
 TEMPLATE_DECIMALS = 4            # точность координат в задании (Å)
@@ -543,3 +547,12 @@ def generate_from_template(n_atoms: int, dim: int, cfg: dict, template: dict,
     raise RuntimeError(
         f"шаблон {template.get('source')}: не удалось получить валидную структуру "
         f"n={n_atoms}, dim={dim} за {max_attempts} попыток")
+
+def generate_for_seed(seed: int, n_atoms: int, dim: int, cfg: dict,
+                      template: dict | None = None) -> np.ndarray:
+    """ЕДИНСТВЕННЫЙ путь генерации: мастер и проверка блока используют его же."""
+    seed = int(seed)
+    if template:
+        return generate_from_template(n_atoms, dim, cfg, template,
+                                      seed=seed, max_attempts=5)
+    return generate_random_cluster(n_atoms, dim, cfg, seed=seed, max_attempts=5)
