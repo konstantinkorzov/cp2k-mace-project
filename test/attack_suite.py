@@ -267,6 +267,43 @@ def test_xyz_comment_injection():
           len(lines) == 4, f"строк {len(lines)} вместо 4", attack=True)
 
 
+def test_worker_registration_nonce():
+    """Регистрация без подписи nonce не должна давать чужой worker_id."""
+    try:
+        import main  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        check("регистрация: импорт main", False, str(e))
+        return
+
+    main.registered_workers.clear()
+    main.worker_by_pubkey.clear()
+    victim = keypair()
+    victim_id = main._register_worker("victim", victim[2], victim[1].hex(),
+                                      verified=True)["worker_id"]
+    # атакующий заявляет тот же адрес без подписи
+    attack_id = main._register_worker("evil", victim[2], victim[1].hex())["worker_id"]
+    check("чужой адрес без подписи не занимает worker_id",
+          attack_id != victim_id and victim_id in main.registered_workers,
+          f"{attack_id} vs {victim_id}")
+
+    # nonce: верная подпись — ок, повтор — отказ, чужой ключ — отказ
+    nonce = main._issue_registration_nonce()
+    sig = crypto.sign(victim[0], main.REG_SIGN_PREFIX + bytes.fromhex(nonce)).hex()
+    check("nonce: верная подпись", main._verify_registration(
+        nonce, victim[1].hex(), victim[2], sig) is None)
+    check("nonce: повторное использование отклонено",
+          main._verify_registration(nonce, victim[1].hex(), victim[2], sig) is not None)
+
+    nonce2 = main._issue_registration_nonce()
+    other = keypair()
+    sig2 = crypto.sign(other[0], main.REG_SIGN_PREFIX + bytes.fromhex(nonce2)).hex()
+    check("nonce: подпись другим ключом отклонена",
+          main._verify_registration(nonce2, victim[1].hex(), victim[2], sig2) is not None)
+
+    main.registered_workers.clear()
+    main.worker_by_pubkey.clear()
+
+
 def test_admin_api_without_token():
     """Админ-API при незаданном MASTER_ADMIN_TOKEN."""
     try:
@@ -299,6 +336,7 @@ def main_run():
     test_blob_path_traversal()
     test_duplicate_seq_different_n()
     test_xyz_comment_injection()
+    test_worker_registration_nonce()
     test_admin_api_without_token()
 
     broken = [r for r in RESULTS if not r[1]]

@@ -76,10 +76,28 @@ def setup_logger(worker_id: str, log_dir: str):
 
 
 def register_with_retry(reg_url: str, name: str, pubkey_hash: str, public_key: str,
-                        retry_delay: int = RETRY_DELAY) -> str:
-    """Регистрируется на сервере с именем и хэшем публичного ключа."""
-    payload = {"name": name, "pubkey_hash": pubkey_hash, "public_key": public_key}
+                        wallet=None, retry_delay: int = RETRY_DELAY) -> str:
+    """Регистрируется на сервере и доказывает владение ключом.
+
+    Мастер выдаёт одноразовый nonce, воркер подписывает его своим приватным
+    ключом. Без этого чужой адрес можно было бы «занять» и снимать задачи.
+    """
     while True:
+        payload = {"name": name, "pubkey_hash": pubkey_hash, "public_key": public_key}
+        if wallet is not None:
+            try:
+                ch = requests.get(
+                    reg_url.replace("/register-worker", "/register-challenge"),
+                    timeout=10)
+                if ch.status_code == 200:
+                    nonce = str(ch.json().get("nonce") or "")
+                    if nonce:
+                        payload["nonce"] = nonce
+                        payload["signature"] = wallet.sign(
+                            pubkey_hash,
+                            b"cp2k-mace-register:" + bytes.fromhex(nonce)).hex()
+            except Exception:  # noqa: BLE001
+                pass      # старый мастер: регистрируемся без подписи (unverified)
         try:
             print(f"Регистрируюсь на сервере {reg_url} "
                   f"(name={name}, pubkey={pubkey_hash[:12]}...)")
@@ -408,7 +426,8 @@ def main():
     # Регистрация воркера (POST с name + адресом кошелька)
     reg_url = f"{base_url}/register-worker"
     worker_id = register_with_retry(reg_url, worker_name, pubkey_hash,
-                                    public_key, retry_delay=args.retry_delay)
+                                    public_key, wallet=wallet,
+                                    retry_delay=args.retry_delay)
 
     logger = setup_logger(worker_id, log_dir)
     logger.info(f"Воркер {worker_id} зарегистрирован (name={worker_name}, "
@@ -516,7 +535,7 @@ def main():
                 if http_err.response is not None and http_err.response.status_code == 400:
                     logger.warning("Мастер не знает воркера — прохожу регистрацию заново")
                     worker_id = register_with_retry(reg_url, worker_name, pubkey_hash,
-                                                    public_key,
+                                                    public_key, wallet=wallet,
                                                     retry_delay=args.retry_delay)
                     holder["worker_id"] = worker_id
                     logger.info(f"Новый worker_id: {worker_id}")

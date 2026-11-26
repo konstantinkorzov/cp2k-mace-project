@@ -918,7 +918,7 @@ def lease_tests():
         main.active_tasks.clear()
         main.registered_workers.clear()
         main.worker_by_pubkey.clear()
-        wid = main._register_worker("lease_t", "hash_lease", None)["worker_id"]
+        wid = main._register_worker("lease_t", "hash_lease", None, verified=True)["worker_id"]
 
         main.pending_tasks.append({"struct_id": "L1", "task_index": 0,
                                    "n_atoms": 2, "dim": 3, "attempts": 0})
@@ -952,7 +952,7 @@ def lease_tests():
         main.pending_tasks.append({"struct_id": "L3", "task_index": 0,
                                    "n_atoms": 2, "dim": 3, "attempts": 0})
         main.get_task(wid)
-        main._register_worker("lease_t", "hash_lease", None)
+        main._register_worker("lease_t", "hash_lease", None, verified=True)
         check("lease: перерегистрация воркера возвращает его задачу",
               "L3" not in main.active_tasks
               and any(t["struct_id"] == "L3" for t in main.pending_tasks))
@@ -1044,6 +1044,54 @@ def build_tests():
           not cp2k_runner.cp2k_build_allowed("cp2k/cp2k:2024.3_other@sha256:deadbeef"))
 
 
+def rfc8032_tests():
+    print("\n--- 29. Ed25519: векторы RFC 8032 и малые порядки ---")
+    vectors = [
+        ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+         "",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+         "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+         "72",
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+         "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+         "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+         "af82",
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+         "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+    ]
+    for i, (sk_hex, pk_hex, msg_hex, sig_hex) in enumerate(vectors, 1):
+        seed = bytes.fromhex(sk_hex)
+        msg = bytes.fromhex(msg_hex)
+        pub = crypto.public_key_from_seed(seed)
+        sig = crypto.sign(seed, msg)
+        check(f"RFC 8032 вектор {i}: публичный ключ", pub.hex() == pk_hex, pub.hex()[:16])
+        check(f"RFC 8032 вектор {i}: подпись", sig.hex() == sig_hex, sig.hex()[:16])
+        check(f"RFC 8032 вектор {i}: проверка", crypto.verify(pub, msg, sig))
+        check(f"RFC 8032 вектор {i}: другое сообщение отклонено",
+              not crypto.verify(pub, msg + b"x", sig))
+
+    # точка малого порядка (identity) как чужой публичный ключ
+    small = bytes([1]) + b"\x00" * 31
+    forged = bytes(32) + bytes(32)
+    check("публичный ключ малого порядка отклонён",
+          not crypto.verify(small, b"msg", forged))
+
+    # неканоническая S: S + q при том же R не должна проходить
+    seed = bytes.fromhex(vectors[0][0])
+    msg = b""
+    sig = crypto.sign(seed, msg)
+    pub = crypto.public_key_from_seed(seed)
+    S = int.from_bytes(sig[32:], "little")
+    q = 2 ** 252 + 27742317777372353535851937790883648493
+    if S + q < 2 ** 256:
+        malleated = sig[:32] + (S + q).to_bytes(32, "little")
+        check("неканоническая S (S+q) отклонена", not crypto.verify(pub, msg, malleated))
+
+
 def peer_tests():
     print("\n--- 23. Самая длинная цепочка (catch-up перед майнингом) ---")
     import types
@@ -1095,10 +1143,10 @@ def worker_registry_tests():
     main.pending_tasks.clear()
     main.PAUSED = False
 
-    r1 = main._register_worker("alpha", "hash_a", "pub_a")
-    r2 = main._register_worker("beta", "hash_b", "pub_b")
+    r1 = main._register_worker("alpha", "hash_a", "pub_a", verified=True)
+    r2 = main._register_worker("beta", "hash_b", "pub_b", verified=True)
     check("разные ключи — разные воркеры", r1["worker_id"] != r2["worker_id"])
-    r1b = main._register_worker("alpha", "hash_a", "pub_a")
+    r1b = main._register_worker("alpha", "hash_a", "pub_a", verified=True)
     check("тот же ключ — тот же worker_id",
           r1b["worker_id"] == r1["worker_id"] and r1b["known"])
 
@@ -1188,6 +1236,7 @@ def _run_tests():
     lease_tests()
     master_geometry_tests()
     build_tests()
+    rfc8032_tests()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print("\n" + "=" * 60)

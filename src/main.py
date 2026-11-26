@@ -57,6 +57,7 @@ warnings.filterwarnings(
 # generate_structures больше не используется: структуры генерирует воркер
 # (см. src/worker.py + src/structure_generator.py)
 import cp2k_runner
+import crypto
 import chain as chain_mod
 import wallet_store
 import structure_generator
@@ -91,8 +92,13 @@ def _task_timeout() -> int:
         return TASK_TIMEOUT
 MAX_TASK_ATTEMPTS = 5      # сколько раз задача возвращается в очередь (ошибка/провал проверки)
 
-# Допуски дешёвых проверок геометрии
-MIN_DIST_TOLERANCE = 0.9   # доля от min_dist: ближе — геометрия считается подложной
+# Допуски дешёвых проверок геометрии.
+# atom_diameter — параметр ГЕНЕРАЦИИ (как координаты) и в приёмку не входит:
+# иначе мастера с разными диаметрами принимали бы разные структуры — это форк.
+# Консенсусный минимум — физический: ближе 0.5 Å атомы не бывают ни в одной
+# реальной системе (короче всего H–H ≈ 0.74 Å).
+MIN_ATOM_DISTANCE_ANG = 0.5
+MIN_DIST_TOLERANCE = 0.9   # только для проверки шаблона при старте (генерация)
 
 
 
@@ -599,9 +605,9 @@ def _check_geometry(coords: np.ndarray, n_atoms: int, cfg) -> tuple[bool, str]:
         d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
         np.fill_diagonal(d, np.inf)
         d_min = float(d.min())
-        allowed = structure_generator.min_dist(cfg) * MIN_DIST_TOLERANCE
-        if d_min < allowed:
-            return False, (f"atoms too close: d_min={d_min:.4f} < {allowed:.4f}")
+        if d_min < MIN_ATOM_DISTANCE_ANG:
+            return False, (f"atoms too close: d_min={d_min:.4f} < "
+                           f"{MIN_ATOM_DISTANCE_ANG} Å")
     return True, ""
 
 
@@ -1004,6 +1010,8 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         "geometry_verified": bool(verdict.get("geometry_verified")),
         "geometry_policy": verdict.get("geometry_policy"),
         "geometry_seed": payload.get("seed"),
+        # параметр генерации (не консенсус): нужен для воспроизведения выборки
+        "atom_diameter": CONFIG.get("atom_diameter"),
         # фактическое электронное состояние: у одного элемента мультиплетность
         # зависит от n и геометрии, поэтому она обязана быть в датасете
         "charge": int(CONFIG.get("charge") or 0),
@@ -1134,6 +1142,7 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
             "worker_wfn_size": payload.get("wfn_size"),
             # seed геометрии: тот же seed + та же версия генератора = тот же кадр
             "seed": payload.get("seed"),
+            "atom_diameter": CONFIG.get("atom_diameter"),
             # true — присланная геометрия совпала с выданной (шаблонный режим)
             "geometry_verified": bool(verdict.get("geometry_verified")),
             "geometry_policy": verdict.get("geometry_policy"),
@@ -1157,6 +1166,35 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
 # СЕРВЕР ОЧЕРЕДИ С УЧЕТОМ НОМЕРОВ ВОРКЕРОВ
 # =====================================================================
 app = FastAPI()
+
+
+def _body_limit_bytes() -> int:
+    """Лимит тела = base64 от максимально допустимого wfn + запас.
+
+    Легитимный wfn ограничен restart_max_mb, base64 даёт 1.33×. Один knob:
+    подняли restart_max_mb для 55+ атомов — поднялся и лимит.
+    """
+    mb = max(1, int(CONFIG.get("restart_max_mb", 50)))
+    return int(mb * 1024 * 1024 * 1.4) + 2 * 1024 * 1024
+
+
+@app.middleware("http")
+async def _body_guard(request, call_next):
+    if request.method in ("POST", "PUT", "PATCH"):
+        limit = _body_limit_bytes()
+        declared = request.headers.get("content-length")
+        from fastapi.responses import JSONResponse
+        if declared and declared.isdigit() and int(declared) > limit:
+            return JSONResponse({"detail": f"тело запроса больше {limit} байт"},
+                                status_code=413)
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > limit:
+                return JSONResponse({"detail": f"тело запроса больше {limit} байт"},
+                                    status_code=413)
+        request._body = bytes(body)
+    return await call_next(request)
 
 
 def _admin_allowed(host: str) -> bool:
@@ -1360,19 +1398,24 @@ class WorkerRegistration(BaseModel):
     name: str | None = None
     pubkey_hash: str | None = None
     public_key: str | None = None
+    nonce: str | None = None
+    signature: str | None = None
 
 
 def _register_worker(name: str | None, pubkey_hash: str | None,
-                     public_key: str | None) -> dict:
+                     public_key: str | None, verified: bool = False) -> dict:
     """
-    Регистрация воркера. Если pubkey_hash уже известен — возвращаем тот же
-    worker_id (перезапуск воркера с тем же именем/ключом не создаёт дубль).
-    Без pubkey_hash — legacy-режим, новый номер на каждый запуск.
+    Регистрация воркера.
+
+    verified=True — воркер подписал nonce (доказал владение ключом): только
+    тогда переиспользуем worker_id и снимаем его текущую задачу. Без
+    доказательства выдаём отдельную сессию и чужую не трогаем — иначе любой
+    мог бы занять адрес и валить/снимать задачи жертвы.
     """
     global next_worker_id
     with task_queue_lock:
         now = time.time()
-        if pubkey_hash and pubkey_hash in worker_by_pubkey:
+        if verified and pubkey_hash and pubkey_hash in worker_by_pubkey:
             worker_id = worker_by_pubkey[pubkey_hash]
             registered_workers[worker_id].update({"last_seen": now, "name": name or registered_workers[worker_id].get("name")})
             print(f"[Master] Воркер {worker_id} переподключился (pubkey {pubkey_hash[:12]}…)")
@@ -1390,7 +1433,7 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
             "registered_at": now,
             "last_seen": now,
         }
-        if pubkey_hash:
+        if verified and pubkey_hash:
             worker_by_pubkey[pubkey_hash] = worker_id
 
         print(f"[Master] Зарегистрирован воркер {worker_id}"
@@ -1398,8 +1441,24 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
         return {"status": "ok", "worker_id": worker_id, "known": False}
 
 
+@app.get("/register-challenge")
+def register_challenge():
+    """Одноразовый nonce: воркер подписывает его и доказывает владение ключом."""
+    return {"nonce": _issue_registration_nonce(), "ttl": REG_NONCE_TTL,
+            "sign_prefix": REG_SIGN_PREFIX.decode("ascii")}
+
+
 @app.post("/register-worker")
 def register_worker(reg: WorkerRegistration):
+    if reg.nonce or reg.signature:
+        reason = _verify_registration(reg.nonce, reg.public_key,
+                                      reg.pubkey_hash, reg.signature)
+        if reason:
+            raise HTTPException(status_code=403,
+                                detail=f"регистрация не подтверждена: {reason}")
+        return _register_worker(reg.name, reg.pubkey_hash, reg.public_key,
+                                verified=True)
+    # без доказательства — отдельная сессия, без переиспользования чужой
     return _register_worker(reg.name, reg.pubkey_hash, reg.public_key)
 
 
@@ -1616,6 +1675,53 @@ def reset_rate_limits():
 
 STRUCT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 
+# ---------- proof-of-key при регистрации воркера ----------
+# Без него чужой адрес можно «занять»: мастер вернёт тот же worker_id и снимет
+# задачу жертвы (DoS), а также позволит валить её задачи. Nonce одноразовый.
+REG_NONCE_TTL = 120
+REG_NONCE_MAX = 5000
+_REG_NONCES: dict[str, float] = {}
+_REG_LOCK = threading.Lock()
+REG_SIGN_PREFIX = b"cp2k-mace-register:"
+
+
+def _issue_registration_nonce() -> str:
+    nonce = os.urandom(32).hex()
+    now = time.time()
+    with _REG_LOCK:
+        if len(_REG_NONCES) >= REG_NONCE_MAX:
+            for key, ts in list(_REG_NONCES.items()):
+                if now - ts > REG_NONCE_TTL:
+                    _REG_NONCES.pop(key, None)
+        _REG_NONCES[nonce] = now
+    return nonce
+
+
+def _verify_registration(nonce, public_key, pubkey_hash, signature) -> str | None:
+    """None — доказано; иначе причина отказа."""
+    if not nonce or not public_key or not signature:
+        return "нет nonce/подписи"
+    now = time.time()
+    with _REG_LOCK:
+        issued = _REG_NONCES.pop(str(nonce), None)   # одноразовый
+    if issued is None:
+        return "nonce неизвестен или уже использован"
+    if now - issued > REG_NONCE_TTL:
+        return "nonce истёк"
+    try:
+        pub = bytes.fromhex(public_key)
+        sig = bytes.fromhex(signature)
+        nonce_bytes = bytes.fromhex(str(nonce))
+    except ValueError:
+        return "ключ/подпись/nonce не hex"
+    if len(pub) != 32 or len(sig) != 64 or len(nonce_bytes) != 32:
+        return "неверная длина ключа/подписи/nonce"
+    if crypto.address_from_public(pub) != str(pubkey_hash):
+        return "ключ не соответствует адресу"
+    if not crypto.verify(pub, REG_SIGN_PREFIX + nonce_bytes, sig):
+        return "неверная подпись nonce"
+    return None
+
 
 class TaskResult(BaseModel):
     worker_id: str
@@ -1831,7 +1937,11 @@ def _expected_n_atoms(seq: int) -> int:
 
 def _accept_peer_block(peer: str, seq: int, head: str,
                        block_bytes: bytes) -> tuple[bool, list[str]]:
-    """Проверяет чужой блок локально: структура/подписи, затем DFT-пересчёт."""
+    """Проверяет чужой блок локально: структура/подписи, затем DFT-пересчёт.
+
+    Blob пишется через .part и удаляется, если блок не принят: иначе пир
+    забивает диск мусорными файлами состояния (до restart_max_mb каждый).
+    """
     element_dir = CONFIG["output_dir"]
     blocks_dir = chain_mod.blocks_dir(element_dir)
     os.makedirs(blocks_dir, exist_ok=True)
@@ -1865,48 +1975,64 @@ def _accept_peer_block(peer: str, seq: int, head: str,
 
         blob_path = os.path.join(chain_mod.blobs_dir(element_dir), f"{sha}.wfn")
         os.makedirs(os.path.dirname(blob_path), exist_ok=True)
-        if not os.path.exists(blob_path):
-            with open(blob_path, "wb") as f:
-                f.write(blob)
+        created_blob = False
+        accepted = False
+        try:
+            if not os.path.exists(blob_path):
+                # .part + os.replace: никто не увидит недописанный файл
+                part = blob_path + ".part"
+                with open(part, "wb") as f:
+                    f.write(blob)
+                os.replace(part, blob_path)
+                created_blob = True
 
-        v = chain_mod.verify_block(element_dir, path, expected_seq=seq, expected_prev=head)
-        if not v["ok"]:
-            return False, v["problems"][:4]
+            v = chain_mod.verify_block(element_dir, path,
+                                       expected_seq=seq, expected_prev=head)
+            if not v["ok"]:
+                return False, v["problems"][:4]
 
-        coords = dft.get("geometry")
-        n_atoms = int(header.get("n_atoms", 0))
-        res = cp2k_runner.verify_state_from_wfn(
-            coords, blob_path, CONFIG, project=f"peer_{seq}")
-        if not res.get("ok"):
-            return False, [f"DFT-проверка: {res.get('reason')}"]
+            coords = dft.get("geometry")
+            res = cp2k_runner.verify_state_from_wfn(
+                coords, blob_path, CONFIG, project=f"peer_{seq}")
+            if not res.get("ok"):
+                return False, [f"DFT-проверка: {res.get('reason')}"]
 
-        e_block = float(dft.get("energy_ev"))
-        if abs(res["energy_ev"] - e_block) > PEER_TOL_ENERGY_EV:
-            return False, [f"энергия блока {e_block:.6f} != пересчёт {res['energy_ev']:.6f} eV"]
+            e_block = float(dft.get("energy_ev"))
+            if abs(res["energy_ev"] - e_block) > PEER_TOL_ENERGY_EV:
+                return False, [f"энергия блока {e_block:.6f} != "
+                               f"пересчёт {res['energy_ev']:.6f} eV"]
 
-        # Наблюдаемые: блок обязан совпасть с пересчётом. Иначе блок «подкрашен»:
-        # wfn настоящий, а числа в dft.json — нет.
-        props = res.get("props") or {}
-        claimed_checks = (
-            ("homo_lumo_gap_ev", res.get("gap"), PEER_TOL_GAP_EV, "eV"),
-            ("magnetic_moment", res.get("mag"), PEER_TOL_MAG_UB, "μB"),
-            ("dipole_total_debye", props.get("dipole_total_debye"),
-             PEER_TOL_DIPOLE_DEBYE, "Д"),
-        )
-        for key, mine, tol, unit in claimed_checks:
-            claimed = dft.get(key)
-            if claimed is None or mine is None:
-                continue  # старые блоки без этих полей — не повод отбраковывать
-            if abs(float(claimed) - float(mine)) > tol:
-                return False, [f"{key}: в блоке {float(claimed):.6f}, "
-                               f"пересчёт {float(mine):.6f} {unit}"]
+            # Наблюдаемые: блок обязан совпасть с пересчётом. Иначе блок
+            # «подкрашен»: wfn настоящий, а числа в dft.json — нет.
+            props = res.get("props") or {}
+            claimed_checks = (
+                ("homo_lumo_gap_ev", res.get("gap"), PEER_TOL_GAP_EV, "eV"),
+                ("magnetic_moment", res.get("mag"), PEER_TOL_MAG_UB, "μB"),
+                ("dipole_total_debye", props.get("dipole_total_debye"),
+                 PEER_TOL_DIPOLE_DEBYE, "Д"),
+            )
+            for key, mine, tol, unit in claimed_checks:
+                claimed = dft.get(key)
+                if claimed is None or mine is None:
+                    continue  # старые блоки без этих полей — не повод отбраковывать
+                if abs(float(claimed) - float(mine)) > tol:
+                    return False, [f"{key}: в блоке {float(claimed):.6f}, "
+                                   f"пересчёт {float(mine):.6f} {unit}"]
 
-        dst = os.path.join(blocks_dir,
-                           chain_mod.block_name(seq, CONFIG["element"], expected_n))
-        shutil.move(path, dst)
-        print(f"[Peer] ✓ блок {seq} от {peer}: DFT-пересчёт сошёлся "
-              f"(E={res['energy_ev']:.6f} eV), блок записан")
-        return True, []
+            dst = os.path.join(blocks_dir,
+                               chain_mod.block_name(seq, CONFIG["element"], expected_n))
+            shutil.move(path, dst)
+            accepted = True
+            print(f"[Peer] ✓ блок {seq} от {peer}: DFT-пересчёт сошёлся "
+                  f"(E={res['energy_ev']:.6f} eV), блок записан")
+            return True, []
+        finally:
+            # Мусор от непринятого блока не должен оставаться на диске.
+            if created_blob and not accepted:
+                try:
+                    os.remove(blob_path)
+                except OSError:
+                    pass
 
 
 def _find_fork_ancestor(peer: str, local_height: int) -> int | None:

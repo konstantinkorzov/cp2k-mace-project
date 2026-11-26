@@ -130,10 +130,27 @@ def sign(seed: bytes, msg: bytes) -> bytes:
     return Rs + S.to_bytes(32, "little")
 
 
+def _is_small_order(encoded: bytes) -> bool:
+    """Точка малого порядка (в т.ч. единица) — источник подделок в наивных
+    реализациях Ed25519. Проверяем [8]P == identity."""
+    try:
+        P = _decode_point(encoded)
+    except Exception:  # noqa: BLE001
+        return True
+    Q = P
+    for _ in range(3):            # 2P, 4P, 8P
+        Q = _edwards_add(Q, Q)
+    return Q[0] % _p == 0 and Q[1] % _p == 1
+
+
 def verify(public_key: bytes, msg: bytes, signature: bytes) -> bool:
     if len(signature) != 64 or len(public_key) != 32:
         return False
     try:
+        # R и A малого порядка отбрасываем до арифметики: иначе возможны
+        # подписи, валидные для нескольких сообщений (классическая ошибка).
+        if _is_small_order(signature[:32]) or _is_small_order(public_key):
+            return False
         R = _decode_point(signature[:32])
         S = int.from_bytes(signature[32:], "little")
         if S >= _q:
