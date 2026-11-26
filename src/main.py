@@ -1158,6 +1158,28 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
 # =====================================================================
 app = FastAPI()
 
+
+def _admin_allowed(host: str) -> bool:
+    """Админ-API без MASTER_ADMIN_TOKEN — только с localhost.
+
+    Иначе любой, кто видит порт мастера, может менять config.json (в т.ч.
+    atom_diameter — параметр консенсуса), ставить паузу, добавлять пиров и
+    запускать тяжёлую перекачку цепочки.
+    """
+    return bool(ADMIN_TOKEN) or (host or "") in ("127.0.0.1", "::1", "localhost")
+
+
+@app.middleware("http")
+async def _admin_guard(request, call_next):
+    if request.url.path.startswith("/admin"):
+        host = (request.client.host if request.client else "") or ""
+        if not _admin_allowed(host):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                {"detail": "admin API: задайте MASTER_ADMIN_TOKEN для внешнего доступа"},
+                status_code=401)
+    return await call_next(request)
+
 task_queue_lock = threading.RLock()   # RLock: блок пишется под этим же lock, а внутри зовётся _sync_stage()
 pending_tasks = []      # Список нерешенных структур
 active_tasks = {}       # struct_id -> {"task": dict, "time_sent": float, "worker_id": str}
@@ -1559,6 +1581,9 @@ def heartbeat(worker_id: str):
         }
 
 
+STRUCT_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
+
 class TaskResult(BaseModel):
     worker_id: str
     struct_id: str
@@ -1581,6 +1606,8 @@ def submit_result(result: TaskResult):
     """
     sid = result.struct_id
     w_id = result.worker_id
+    if not isinstance(sid, str) or not STRUCT_ID_RE.match(sid):
+        return {"status": "rejected", "reason": "недопустимый struct_id"}
 
     # ---------- готовый результат от воркера (задание было у другого мастера) ----------
     if result.ready:
@@ -1736,11 +1763,31 @@ def _collect_peers(args) -> list[str]:
 
 
 def _fetch_blob(peer: str, sha: str) -> bytes | None:
+    """Скачивает файл состояния с лимитом размера.
+
+    sha обязан быть 64 hex: из него строится имя blobs/<sha>.wfn, иначе
+    "../../x" писал бы файл вне каталога элемента.
+    """
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-f]{64}", str(sha or "")):
+        return None
+    limit = max(1, int(CONFIG.get("restart_max_mb", 50))) * 1024 * 1024
     try:
-        r = requests.get(f"{peer}/chain/blob/{sha}", timeout=60)
+        with requests.get(f"{peer}/chain/blob/{sha}", timeout=60, stream=True) as r:
+            if r.status_code != 200:
+                return None
+            declared = r.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > limit:
+                return None
+            chunks, total = [], 0
+            for chunk in r.iter_content(1 << 20):
+                total += len(chunk)
+                if total > limit:
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
     except Exception:  # noqa: BLE001
         return None
-    return r.content if r.status_code == 200 else None
 
 
 def _accept_peer_block(peer: str, seq: int, head: str,
@@ -1761,8 +1808,8 @@ def _accept_peer_block(peer: str, seq: int, head: str,
             return False, [f"блок не читается: {e}"]
 
         sha = header.get("state_sha256")
-        if not sha:
-            return False, ["нет state_sha256"]
+        if not sha or not re.fullmatch(r"[0-9a-f]{64}", str(sha)):
+            return False, ["нет/некорректный state_sha256"]
 
         blob = _fetch_blob(peer, sha)
         if blob is None:

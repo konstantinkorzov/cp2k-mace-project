@@ -67,6 +67,7 @@ class FastAPI:
     get = _deco
     post = _deco
     delete = _deco
+    middleware = _deco
 ''',
     "uvicorn.py": "def run(*a, **k):\n    pass\n",
     "pydantic.py": '''

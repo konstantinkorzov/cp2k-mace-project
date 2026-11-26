@@ -1454,11 +1454,14 @@ def build_xyz_record(coords, energy_ev, forces_ev_ang, n_atoms, dim, struct_id,
         extra += f"binding_energy_per_atom={e_binding_per_atom:.8f} "
     extra += extra_comment
 
+    # struct_id приходит из задачи (ready-путь — от воркера): без очистки
+    # перевод строки добавил бы в датасет лишние «кадры».
+    safe_id = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(struct_id))[:80]
     comment = (
         f'Lattice="{cfg["lattice_str"]}" '
         f'Properties=species:S:1:pos:R:3:forces:R:3 '
         f'energy={energy_ev:.8f} '
-        f'n_atoms={n_atoms} dim={dim} struct_id={struct_id} '
+        f'n_atoms={n_atoms} dim={dim} struct_id={safe_id} '
         f'{extra}'
         f'pbc="F F F"'
     )

@@ -22,6 +22,7 @@ results/<element>/blobs/<sha256>.wfn, а в заголовке — ссылка.
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,10 @@ COINBASE_VALUE = 50.0
 REWARD_VALUE = 25.0
 TX_FEE = 0.1                     # комиссия за перевод (как в Bitcoin: входы − выходы)
 DEFAULT_CONFIRMATIONS = 1
+# Зрелость coinbase — КОНСЕНСУС (не настройка): coinbase-выход блока N можно
+# тратить только в блоке N + COINBASE_MATURITY. Bitcoin держит 100; здесь 1 —
+# текущая совместимость, поднять = новая версия протокола (см. docs/AUDIT.md).
+COINBASE_MATURITY = 1
 
 
 # ---------- общее ----------
@@ -144,6 +149,35 @@ def make_transfer(inputs: list[dict], outputs: list[dict]) -> dict:
     }
 
 
+STATE_PATH_RE = re.compile(r"^blobs/[0-9a-f]{64}\.wfn$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def invalid_outputs(tx: dict) -> list[str]:
+    """Выходы: конечное положительное число и непустой адрес (как в Bitcoin).
+
+    Без этого отрицательная сумма в одном выходе компенсируется большой
+    положительной в другом: сумма входов == сумма выходов, а денег становится
+    больше. NaN/Infinity проходят любые сравнения и отравляют балансы.
+    """
+    problems = []
+    for vout, out in enumerate(tx.get("outputs") or []):
+        if not isinstance(out, dict):
+            problems.append(f"выход {vout}: не объект")
+            continue
+        try:
+            value = float(out.get("value"))
+        except (TypeError, ValueError):
+            problems.append(f"выход {vout}: сумма не число")
+            continue
+        if not math.isfinite(value) or value <= 0:
+            problems.append(f"выход {vout}: сумма {value!r} не конечная положительная")
+        addr = out.get("address")
+        if not isinstance(addr, str) or not addr or len(addr) > 128:
+            problems.append(f"выход {vout}: нет корректного адреса")
+    return problems
+
+
 def list_blocks(element_dir: str) -> list[dict]:
     d = blocks_dir(element_dir)
     if not os.path.isdir(d):
@@ -224,7 +258,8 @@ def available_utxos(element_dir: str, addresses: set[str],
     for (txid, vout), info in utxo_set(element_dir).items():
         if info["address"] not in addresses:
             continue
-        if info["height"] + max(0, confirmations) > height:
+        need = COINBASE_MATURITY if info.get("coinbase") else max(0, confirmations)
+        if info["height"] + need > height:
             continue
         out.append({"txid": txid, "vout": vout, **info})
     return out
@@ -294,8 +329,9 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
         if info is None:
             problems.append(f"вход {key} не найден или уже потрачен")
             continue
-        if info["height"] + max(0, confirmations) > height:
-            problems.append(f"вход {key} не подтверждён")
+        need = COINBASE_MATURITY if info.get("coinbase") else max(0, confirmations)
+        if info["height"] + need > height:
+            problems.append(f"вход {key} не подтверждён (нужно {need} блок(ов))")
         total_in += info["value"]
 
         pub_hex, sig_hex = i.get("public_key"), i.get("signature")
@@ -316,6 +352,7 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
     outputs = tx.get("outputs") or []
     if not outputs:
         problems.append("нет выходов")
+    problems.extend(invalid_outputs(tx))
     total_out = sum(float(o.get("value", 0)) for o in outputs)
     if total_out <= 0:
         problems.append("нулевая сумма выходов")
@@ -466,7 +503,8 @@ def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
 
 
 def _check_txs(txs: list[dict], utxo: dict, label: str,
-               add_outputs: bool = False) -> tuple[float, list[str]]:
+               add_outputs: bool = False,
+               height: int | None = None) -> tuple[float, list[str]]:
     problems = []
     coinbases = [t for t in txs if t.get("type") == "coinbase"]
     if len(coinbases) != 1:
@@ -477,6 +515,7 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         tid = tx.get("txid") or txid_of(tx)
         if tid != txid_of(tx):
             problems.append(f"{label}: txid транзакции не совпадает с содержимым")
+        problems.extend(f"{label}: {p}" for p in invalid_outputs(tx))
         if tx.get("type") == "coinbase":
             continue
 
@@ -488,6 +527,10 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
                 continue
             info = utxo.pop(key)
             total_in += info["value"]
+            if (height is not None and info.get("coinbase")
+                    and height - int(info.get("height") or 0) < COINBASE_MATURITY):
+                problems.append(f"{label}: вход {key} — незрелый coinbase "
+                                f"({height} - {info.get('height')} < {COINBASE_MATURITY})")
 
             pub_hex, sig_hex = i.get("public_key"), i.get("signature")
             if not pub_hex or not sig_hex:
@@ -520,7 +563,9 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
             tid = tx.get("txid") or txid_of(tx)
             for vout, out in enumerate(tx.get("outputs", [])):
                 utxo[(tid, vout)] = {"value": float(out["value"]),
-                                     "address": out["address"], "coinbase": tx.get("type") == "coinbase"}
+                                     "address": out["address"],
+                                     "height": height or 0,
+                                     "coinbase": tx.get("type") == "coinbase"}
     return block_fee, problems
 
 
@@ -558,13 +603,17 @@ def verify_block(element_dir: str, block_path: str,
     n_atoms = int(header.get("n_atoms", -1))
     sha = header.get("state_sha256")
     rel = header.get("state_path")
-    blob = os.path.join(element_dir, rel) if rel else ""
+    blob = ""
     if not sha or not rel:
         problems.append("нет state_sha256/state_path")
-    elif not os.path.exists(blob):
-        problems.append(f"нет файла состояния {rel} (нужен blob с пира)")
-    elif sha256_file(blob) != sha:
-        problems.append("sha256 файла состояния не совпадает")
+    elif not SHA_RE.match(str(sha)) or not STATE_PATH_RE.match(str(rel)):
+        problems.append("state_sha256/state_path имеют недопустимый формат")
+    else:
+        blob = os.path.join(element_dir, str(rel))
+        if not os.path.exists(blob):
+            problems.append(f"нет файла состояния {rel} (нужен blob с пира)")
+        elif sha256_file(blob) != sha:
+            problems.append("sha256 файла состояния не совпадает")
 
     if not dft:
         problems.append("нет dft.json — блок нельзя пересчитать")
@@ -583,7 +632,7 @@ def verify_block(element_dir: str, block_path: str,
         info = utxo[key]
         utxo[key] = {"value": info["value"], "address": info["address"],
                      "height": info["height"], "coinbase": info["coinbase"]}
-    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path))
+    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path), height=seq)
     problems.extend(tx_problems)
 
     return {"ok": not problems, "problems": problems,
@@ -653,8 +702,10 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             rel = header.get("state_path")
             if not sha or not rel:
                 problems.append(f"{b['name']}: нет state_sha256/state_path")
+            elif not SHA_RE.match(str(sha)) or not STATE_PATH_RE.match(str(rel)):
+                problems.append(f"{b['name']}: state_sha256/state_path недопустимого формата")
             else:
-                blob = os.path.join(element_dir, rel)
+                blob = os.path.join(element_dir, str(rel))
                 if not os.path.exists(blob):
                     problems.append(f"{b['name']}: нет файла состояния {rel}")
                 elif sha256_file(blob) != sha:
@@ -676,6 +727,7 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             tid = tx.get("txid") or txid_of(tx)
             if tid != txid_of(tx):
                 problems.append(f"{b['name']}: txid транзакции не совпадает с содержимым")
+            problems.extend(f"{b['name']}: {p}" for p in invalid_outputs(tx))
             if tx.get("type") == "coinbase":
                 continue
 
@@ -687,6 +739,9 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
                     continue
                 info = utxo.pop(key)
                 total_in += info["value"]
+                if (info.get("coinbase")
+                        and b["seq"] - int(info.get("height") or 0) < COINBASE_MATURITY):
+                    problems.append(f"{b['name']}: вход {key} — незрелый coinbase")
 
                 pub_hex, sig_hex = i.get("public_key"), i.get("signature")
                 if not pub_hex or not sig_hex:
