@@ -867,6 +867,37 @@ def wallet_tests():
               changed.get("ok")
               and wallet_store.unlock(conn, "worker2", "new2") is not None
               and wallet_store.unlock(conn, "worker1", "root") is not None)
+
+        # --- команды кошелька: адрес, переименование, копия, подпись ---
+        w2x = wallet_store.unlock(conn, "worker2", "new2")
+        n_before = len(w2x.keys())
+        key = w2x.add_key()
+        check("--new-address добавляет адрес",
+              bool(key["address"]) and len(w2x.keys()) == n_before + 1)
+        renamed = wallet_store.rename_wallet(conn, "worker2", "worker2x")
+        check("--rename меняет только имя",
+              renamed["name"] == "worker2x"
+              and wallet_store.unlock(conn, "worker2x", "new2") is not None
+              and wallet_store.unlock(conn, "worker2", "new2") is None)
+        check("--rename в занятое имя — ошибка",
+              err(lambda: wallet_store.rename_wallet(conn, "worker2x", "master")) is not None)
+
+        dest = os.path.join(tmp, "backup.db")
+        made_copy = wallet.backup_db(os.path.join(tmp, "keys.db"), dest)
+        conn2 = wallet_store.open_db(made_copy)
+        check("--backup: копия открывается и содержит те же кошельки",
+              {w["name"] for w in wallet_store.list_wallets(conn2)}
+              == {w["name"] for w in wallet_store.list_wallets(conn)})
+        check("--backup не перезаписывает существующий файл",
+              err(lambda: wallet.backup_db(os.path.join(tmp, "keys.db"), dest)) is not None)
+
+        w2y = wallet_store.unlock(conn, "worker2x", "new2")
+        addr2 = w2y.latest_key()["address"]
+        sig = wallet.sign_text(w2y, addr2, "cp2k-mace")
+        check("--sign-message/--verify-message: верная подпись",
+              wallet.verify_text(w2y, addr2, "cp2k-mace", sig))
+        check("--verify-message: другой текст не проходит",
+              not wallet.verify_text(w2y, addr2, "cp2k-mace!", sig))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

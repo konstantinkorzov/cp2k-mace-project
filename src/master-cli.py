@@ -155,8 +155,7 @@ def cmd_keys(args):
         k = res["key"]
         print(f"✓ Создан ключ #{k['id']}: {k['address']}")
         print(f"  public_key : {k['public_key']}")
-        print(f"  private_key: {k['private_key']}")
-        print("  (private_key сохранён в SQLite; показывать его больше не будем)")
+        print("  (приватный ключ зашифрован паролем и лежит в SQLite — не выводим)")
         return
 
     data = _request(args, "GET", "/admin/keys")

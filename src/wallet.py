@@ -21,11 +21,13 @@ wallet.py — кошелёк по паролю.
 import argparse
 import json
 import os
+import sqlite3
 import sys
 
 import requests
 
 import chain
+import crypto
 import wallet_store
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -190,6 +192,141 @@ def show(wallet, element_dir: str, confirmations: int,
     return 0
 
 
+def backup_db(db_path: str, dest: str) -> str:
+    """Копия базы кошельков (sqlite backup API) — страховка единственной копии ключей."""
+    dest = os.path.abspath(dest)
+    if os.path.exists(dest):
+        raise FileExistsError(dest)
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    src = sqlite3.connect(db_path)
+    try:
+        dst = sqlite3.connect(dest)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
+    return dest
+
+
+def sign_text(wallet, address: str, text: str) -> str:
+    return wallet.sign(address, text.encode("utf-8")).hex()
+
+
+def verify_text(wallet, address: str, text: str, signature: str) -> bool:
+    return crypto.verify(wallet.public_for(address), text.encode("utf-8"),
+                         bytes.fromhex(signature))
+
+
+def _totals(element_dir: str, addresses: set[str], confirmations: int) -> dict:
+    totals = {"available": 0, "pending": 0, "total": 0}
+    for b in chain.balances(element_dir, addresses, confirmations).values():
+        for k in totals:
+            totals[k] += int(b.get(k) or 0)
+    return totals
+
+
+def show_info(wallet, element: str, element_dir: str, confirmations: int) -> int:
+    totals = _totals(element_dir, wallet.addresses(), confirmations)
+    print(f"Кошелёк «{wallet.name}»")
+    print(f"  цепочка : {element} (results/{element})")
+    print(f"  высота  : {max(0, chain.next_seq(element_dir) - 1)}")
+    print(f"  адресов : {len(wallet.keys())}")
+    print(f"  доступно: {totals['available']}  pending: {totals['pending']}  "
+          f"всего: {totals['total']}")
+    return 0
+
+
+def show_balance(wallet, element_dir: str, confirmations: int) -> int:
+    totals = _totals(element_dir, wallet.addresses(), confirmations)
+    print(f"available={totals['available']} pending={totals['pending']} "
+          f"total={totals['total']}")
+    return 0
+
+
+def show_unspent(wallet, element_dir: str, confirmations: int) -> int:
+    """Выходы кошелька: сколько подтверждений и можно ли их тратить сейчас."""
+    next_height = chain.next_seq(element_dir)
+    rows = []
+    for (txid, vout), info in sorted(chain.utxo_set(element_dir).items()):
+        if info["address"] not in wallet.addresses():
+            continue
+        need = chain.COINBASE_MATURITY if info.get("coinbase") else max(0, confirmations)
+        ready = info["height"] + need <= next_height
+        rows.append(f"  {txid[:16]}…:{vout:<3} {int(info['value']):>12}  "
+                    f"подтв. {max(0, next_height - 1 - info['height']):>3}  "
+                    f"{info['address'][:16]}…  "
+                    + ("доступен" if ready else "ждёт подтверждений")
+                    + ("  coinbase" if info.get("coinbase") else ""))
+    if not rows:
+        print("  (непотраченных выходов нет)")
+    for r in rows:
+        print(r)
+    return 0
+
+
+def show_tx(element_dir: str, wallet, txid: str) -> int:
+    """Детали транзакции из блоков: входы (с адресами), выходы, комиссия."""
+    addrs = wallet.addresses()
+    owners = _address_map(element_dir)
+    for b in chain.list_blocks(element_dir):
+        try:
+            txs = chain.read_block_txs(b["path"])
+        except Exception:  # noqa: BLE001
+            continue
+        for tx in txs:
+            tid = tx.get("txid") or chain.txid_of(tx)
+            if tid != txid:
+                continue
+            print(f"Транзакция {tid}")
+            print(f"  блок {b['seq']}   тип {tx.get('type')}")
+            total_in = 0
+            for i in tx.get("inputs", []):
+                if i.get("coinbase"):
+                    print("  ← coinbase (новые монеты)")
+                    continue
+                value = _output_value(element_dir, i["txid"], int(i["vout"]))
+                owner = owners.get((i["txid"], int(i["vout"])))
+                total_in += value
+                mark = " (наш)" if owner in addrs else ""
+                print(f"  ← {int(value):>12}  {str(owner)[:16]}…{mark}")
+            total_out = 0
+            for n, o in enumerate(tx.get("outputs", [])):
+                total_out += int(o["value"])
+                mark = " (наш)" if o["address"] in addrs else ""
+                print(f"  → #{n:<2} {int(o['value']):>9}  {o['address'][:16]}…{mark}")
+            if tx.get("type") != "coinbase" and total_in:
+                print(f"  комиссия: {total_in - total_out}")
+            return 0
+    print(f"✗ транзакция {txid} не найдена в блоках цепочки "
+          f"{os.path.basename(os.path.normpath(element_dir))}")
+    print("  если перевод только что отправлен — он ещё в мемпуле у мастера")
+    return 1
+
+
+def show_address(wallet, element_dir: str, address: str, confirmations: int) -> int:
+    key = next((k for k in wallet.keys() if k["address"] == address), None)
+    print(f"Адрес {address}")
+    if key:
+        print(f"  наш: ключ #{key['id']} (создан {key['created_at']})")
+    else:
+        print("  наш: нет (чужой адрес — только баланс по цепочке)")
+    bal = chain.balances(element_dir, {address}, confirmations).get(address)
+    if bal:
+        print(f"  доступно {int(bal['available'])}, pending {int(bal['pending'])}, "
+              f"всего {int(bal['total'])}")
+    else:
+        print("  баланс: пусто")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Кошелёк: создание, балансы, переводы, смена пароля")
@@ -216,6 +353,28 @@ def main():
     ap.add_argument("--fee", type=int, default=chain.TX_FEE, help="комиссия (целые монеты)")
     ap.add_argument("--master", action="append", default=None,
                     help="URL мастера для отправки tx (можно несколько)")
+    ap.add_argument("--new-address", action="store_true",
+                    help="добавить новый адрес (ключ) в кошелёк")
+    ap.add_argument("--rename", metavar="NEW", default=None,
+                    help="переименовать кошелёк (ключи и пароль не меняются)")
+    ap.add_argument("--info", action="store_true",
+                    help="сводка: имя, цепочка, высота, адресов, баланс")
+    ap.add_argument("--balance", action="store_true",
+                    help="только числа баланса (available=/pending=/total=)")
+    ap.add_argument("--unspent", action="store_true",
+                    help="непотраченные выходы кошелька (listunspent)")
+    ap.add_argument("--tx", metavar="TXID", default=None,
+                    help="детали транзакции из блоков")
+    ap.add_argument("--address", metavar="ADDR", default=None,
+                    help="информация об адресе (или адрес для подписи)")
+    ap.add_argument("--backup", metavar="PATH", default=None,
+                    help="копия базы кошельков (пароль не нужен)")
+    ap.add_argument("--sign-message", metavar="TEXT", default=None,
+                    help="подписать текст ключом адреса (--address или последний)")
+    ap.add_argument("--verify-message", metavar="TEXT", default=None,
+                    help="проверить подпись для адреса из этого кошелька")
+    ap.add_argument("--signature", default=None,
+                    help="подпись в hex для --verify-message")
     args = ap.parse_args()
 
     if args.set_confirmations is not None:
@@ -253,6 +412,15 @@ def main():
         print(f"✓ кошелёк «{made.name}» создан, адрес {made.latest_key()['address']}")
         return
 
+    if args.backup:
+        try:
+            dest = backup_db(args.db, args.backup)
+        except FileExistsError:
+            print(f"✗ файл уже существует: {args.backup}", file=sys.stderr)
+            sys.exit(2)
+        print(f"✓ копия базы кошельков: {dest}")
+        return
+
     if not args.wallet:
         print("✗ нужно имя кошелька: --wallet NAME "
               "(список — --list, создать — --create NAME)", file=sys.stderr)
@@ -264,6 +432,38 @@ def main():
     except wallet_store.WalletError as e:
         print(f"✗ {e}", file=sys.stderr)
         sys.exit(1)
+
+    if args.rename:
+        try:
+            renamed = wallet_store.rename_wallet(conn, wallet.name, args.rename)
+        except wallet_store.WalletError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            sys.exit(2)
+        print(f"✓ кошелёк «{wallet.name}» переименован в «{renamed['name']}»")
+        return
+
+    if args.new_address:
+        key = wallet.add_key()
+        print(f"✓ новый адрес: {key['address']} (ключ #{key['id']})")
+        return
+
+    if args.sign_message is not None:
+        addr = args.address or (wallet.latest_key() or {}).get("address")
+        if not addr:
+            print("✗ в кошельке нет адресов", file=sys.stderr)
+            sys.exit(2)
+        print(f"адрес: {addr}")
+        print(f"подпись: {sign_text(wallet, addr, args.sign_message)}")
+        return
+
+    if args.verify_message is not None:
+        if not args.signature:
+            print("✗ нужна --signature HEX", file=sys.stderr)
+            sys.exit(2)
+        addr = args.address or (wallet.latest_key() or {}).get("address")
+        ok = verify_text(wallet, addr, args.verify_message, args.signature)
+        print("✓ подпись верна" if ok else "✗ подпись не совпадает")
+        sys.exit(0 if ok else 1)
 
     if args.change_to:
         wallet.change_password(password, args.change_to)
@@ -281,6 +481,21 @@ def main():
 
     element = args.element or _element()
     element_dir = os.path.join(PROJECT_ROOT, "results", element)
+
+    if args.info:
+        sys.exit(show_info(wallet, element, element_dir, confirmations))
+
+    if args.balance:
+        sys.exit(show_balance(wallet, element_dir, confirmations))
+
+    if args.unspent:
+        sys.exit(show_unspent(wallet, element_dir, confirmations))
+
+    if args.tx:
+        sys.exit(show_tx(element_dir, wallet, args.tx))
+
+    if args.address:
+        sys.exit(show_address(wallet, element_dir, args.address, confirmations))
 
     if args.send_to:
         if args.amount is None or args.amount <= 0:

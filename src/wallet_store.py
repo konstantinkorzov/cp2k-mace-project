@@ -279,6 +279,20 @@ def open_wallet(conn, name: str, password: str) -> Wallet:
     return Wallet(conn, row, password)
 
 
+def rename_wallet(conn, name: str, new_name: str) -> dict:
+    """Переименовать кошелёк: id, ключи и пароль не меняются."""
+    name = str(name or "").strip()
+    new_name = _check_name(new_name)
+    row = conn.execute("SELECT * FROM wallets WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise WalletError(f"кошелёк «{name}» не найден")
+    if conn.execute("SELECT 1 FROM wallets WHERE name = ?", (new_name,)).fetchone():
+        raise WalletError(f"кошелёк «{new_name}» уже существует")
+    conn.execute("UPDATE wallets SET name = ? WHERE id = ?", (new_name, row["id"]))
+    conn.commit()
+    return {"id": row["id"], "name": new_name}
+
+
 if __name__ == "__main__":
     import json
 

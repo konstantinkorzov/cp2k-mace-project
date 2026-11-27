@@ -432,6 +432,22 @@ python3 src/wallet.py --create master --password root
 # кошелёк по имени и паролю: адреса, балансы, транзакции с подтверждениями
 python3 src/wallet.py --wallet master --password root
 
+# адреса и содержимое кошелька
+python3 src/wallet.py --wallet master --password root --new-address   # новый адрес
+python3 src/wallet.py --wallet master --password root --info          # сводка
+python3 src/wallet.py --wallet master --password root --balance       # available=/pending=/total=
+python3 src/wallet.py --wallet master --password root --unspent       # непотраченные выходы
+python3 src/wallet.py --wallet master --password root --tx <txid>     # детали транзакции
+python3 src/wallet.py --wallet master --password root --address <адрес>
+
+# копия базы (пароль не нужен) и переименование кошелька
+python3 src/wallet.py --backup ~/keys-backup.db
+python3 src/wallet.py --wallet master --password root --rename main
+
+# подписать и проверить текст ключом кошелька (--address — какой адрес, по умолчанию последний)
+python3 src/wallet.py --wallet master --password root --sign-message "hello"
+python3 src/wallet.py --wallet master --password root --verify-message "hello" --signature <hex>
+
 # то же по конкретной цепочке (элементу): results/<element>
 python3 src/wallet.py --wallet master --password root --element Fe
 
