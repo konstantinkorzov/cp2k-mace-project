@@ -248,9 +248,19 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     cfg["atom_diameter"] = float(
         system.get("atom_diameter") or cfg.get("atom_diameter") or 2.0)
     name = str(system.get("name") or cfg.get("element") or "Cu")
+    if not chain_mod.SYSTEM_RE.match(name):
+        raise SystemExit(
+            f"system.name {name!r} — слаг: латиница, цифры, . _ - (например cu3, al2o3). "
+            "Формула задаётся в system.composition, а не в имени")
     comp = system.get("composition") or cfg.get("composition") or {}
-    comp = {str(k): int(v) for k, v in comp.items()} or {name: 1}
-    cfg["element"] = name                 # имя системы = имя каталога и поля header
+    comp = {str(k): int(v) for k, v in comp.items()}
+    if not comp:
+        if not chain_mod.SYMBOL_RE.match(name):
+            raise SystemExit(
+                f"system.composition не задан, а имя {name!r} не химический символ — "
+                "задайте состав, например {'Al': 2, 'O': 3}")
+        comp = {name: 1}
+    cfg["element"] = name                 # slug системы: каталог results/<slug> и header
     cfg["composition"] = comp
     cfg["formula_size"] = sum(comp.values())
     cfg.setdefault("charge", 0)
@@ -355,9 +365,25 @@ def _load_template(cfg) -> None:
             f"Уменьшите atom_diameter или возьмите другой шаблон.")
 
     sizes = sorted({len(f["coords"]) for f in frames})
-    cfg["template"] = tpl
+    templates = []
+    for i, frame in enumerate(frames):
+        obj = {"version": chain_mod.TEMPLATE_VERSION,
+               "system": cfg["element"],
+               "composition": {k: int(v) for k, v in comp.items()},
+               "n_atoms": len(frame["coords"]),
+               "dim": 3,
+               "coords": [[float(c) for c in p] for p in frame["coords"]],
+               "source": f"{os.path.basename(path)}#{i}"}
+        bad = chain_mod.validate_template(obj, cfg["element"], cfg["composition"])
+        if bad:
+            raise SystemExit("[Master] ✗ template_xyz: " + "; ".join(bad[:3]))
+        templates.append(obj)
+    cfg["templates"] = templates
+    cfg["template"] = None
     print(f"[Master] 🧩 шаблон геометрии: {tpl['source']} — кадров {len(frames)}, "
           f"атомов {sizes}, min d = {d_tpl:.3f} Å; состав {counts}")
+    print("[Master] 🧩 шаблон регистрируется в цепочке; блоки используют его только "
+          "ПОСЛЕ включения регистрации (правило v4)")
     if not ratio_ok:
         print(f"[Master] ⚠ состав шаблона {counts} не пропорционален system.composition "
               f"{comp} — сорт атомов будет назначен по формуле, шаблон задаёт только геометрию")
@@ -487,9 +513,14 @@ def _issue_geometry(task: dict) -> dict:
     element_dir = CONFIG["output_dir"]
     prev_id = chain_mod.previous_hash(element_dir, chain_mod.next_seq(element_dir))
 
-    tpl = CONFIG.get("template")
-    frame = None
-    template = None
+    # Шаблон можно использовать только если он уже зарегистрирован в цепочке
+    # (H_reg < высоты этого блока): иначе он выбран после результата.
+    next_seq = chain_mod.next_seq(element_dir)
+    usable = []
+    for obj in (CONFIG.get("templates") or []):
+        tsha = chain_mod.template_sha(obj)
+        if chain_mod.find_template(element_dir, tsha, before_seq=next_seq) is not None:
+            usable.append(obj)
 
     last_error = None
     nonce = 0
@@ -497,12 +528,13 @@ def _issue_geometry(task: dict) -> dict:
     for _ in range(GEOMETRY_RETRIES):
         nonce = int(fixed_nonce) if fixed_nonce is not None else secrets.randbits(64)
         seed = chain_mod.geometry_seed(prev_id, nonce)
+        obj = None
+        template = None
         try:
-            if tpl and tpl.get("frames"):
-                frames = tpl["frames"]
-                frame = frames[seed % len(frames)]
-                template = {"frames": [{"symbols": list(frame.get("symbols") or []),
-                                        "coords": frame["coords"]}]}
+            if usable:
+                obj = usable[seed % len(usable)]
+                template = {"frames": [{"symbols": [],
+                                        "coords": np.asarray(obj["coords"], dtype=float)}]}
             coords = structure_generator.generate_for_seed(
                 seed, n_atoms, dim, CONFIG, template)
             species = structure_generator.assign_species(n_atoms, CONFIG, seed=seed)
@@ -512,8 +544,8 @@ def _issue_geometry(task: dict) -> dict:
                 "seed": seed,
                 "nonce": nonce,
                 "prev_id": prev_id,
-                "template": ([[float(c) for c in p] for p in frame["coords"]]
-                             if frame is not None else None),
+                "template_sha": chain_mod.template_sha(obj) if obj else None,
+                "template_obj": obj,
             }
         except Exception as e:  # noqa: BLE001
             last_error = e
@@ -1013,13 +1045,24 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     # coinbase = субсидия + комиссии блока (как в Bitcoin)
     coinbase = chain_mod.make_coinbase(seq, latest["address"],
                                        chain_mod.COINBASE_VALUE + fee + mem_fee)
-    txs = [coinbase] + ([reward] if reward else []) + mem_txs
+    # Регистрация шаблонов: данные, не деньги (type=template, без входов).
+    # Включаем только те, которых ещё нет в цепочке; лимит — консенсусный.
+    reg_txs = []
+    for obj in (CONFIG.get("templates") or []):
+        if len(reg_txs) >= chain_mod.MAX_TEMPLATES_PER_BLOCK:
+            break
+        tsha = chain_mod.template_sha(obj)
+        if chain_mod.find_template(CONFIG["output_dir"], tsha, before_seq=seq) is None:
+            reg_txs.append(chain_mod.template_tx(obj))
+    txs = ([coinbase] + ([reward] if reward else []) + reg_txs + mem_txs)
 
     dft = {
         "energy_ev": verdict.get("energy_ev"),
         "energy_hartree": verdict.get("energy_hartree"),
         "forces_ev_ang": verdict.get("forces_ev_ang"),
         "geometry": payload.get("geometry"),
+        # виды атомов: для многокомпонентных систем без них блок не проверить
+        "species": payload.get("species"),
         "homo_lumo_gap_ev": verdict.get("gap"),
         "magnetic_moment": verdict.get("mag"),
         "e_isolated_atom_ev": verdict.get("e_isolated_atom"),
@@ -1035,6 +1078,9 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         "charge": int(CONFIG.get("charge") or 0),
         "multiplicity": _effective_multiplicity(n_atoms, CONFIG),
         "scf": (verdict.get("state") or {}).get("scf"),
+        # происхождение геометрии: seed или зарегистрированный шаблон
+        "geometry_source": (f"template:{task_data.get('_template_sha')}"
+                            if task_data.get("_template_sha") else "seed"),
     }
     # Физические наблюдаемые (мастер посчитал в том же прогоне, что и E):
     # диполь, заряды/спины по атомам, разложение энергии, занятый спектр,
@@ -1052,7 +1098,9 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         nonce=int(task_data.get("_nonce", 0)),
         dim=int(task_data.get("dim", 3)),
         atom_diameter=float(CONFIG.get("atom_diameter") or 2.0),
-        template=task_data.get("_template"),
+        template_sha=task_data.get("_template_sha"),
+        template_obj=task_data.get("_template_obj"),
+        composition=CONFIG.get("composition"),
     )
 
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
@@ -1682,15 +1730,17 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             "seed": issued["seed"],
             "nonce": issued["nonce"],
             "prev_id": issued["prev_id"],
-            "template": issued["template"],
+            "template_sha": issued.get("template_sha"),
+            "template_obj": issued.get("template_obj"),
             # сверка геометрии включена только в шаблонном режиме
-            "check_geometry": bool(CONFIG.get("template")),
+            "check_geometry": bool(issued.get("template_sha")),
         }
 
         print(f"Воркер [{worker_id}] получил задание {struct_id}: "
               f"n={task['n_atoms']}, dim={task['dim']}, seed={issued['seed']}, "
               f"элемент {CONFIG['element']} ({CONFIG['potential']})"
-              + (f", шаблон {CONFIG['template']['source']}" if CONFIG.get("template") else "")
+              + (f", шаблон {issued['template_obj']['source']}"
+                 if issued.get("template_obj") else "")
               + f" | В очереди: {len(pending_tasks)} | У воркеров: {len(active_tasks)}")
         return {"status": "ok", "task": task_payload}
 
@@ -1911,7 +1961,8 @@ def submit_result(result: TaskResult):
         # Эталон — та геометрия, которую мастер выдал (info), а не присланная.
         # Сверка дешёвая; только после неё запускаются последние шаги DFT.
         task_data["_nonce"] = info.get("nonce", 0)
-        task_data["_template"] = info.get("template")
+        task_data["_template_sha"] = info.get("template_sha")
+        task_data["_template_obj"] = info.get("template_obj")
         verdict = verify_state_payload(CONFIG, task_data, payload, issued=info)
         persist = _persist_verified_state
 
@@ -2057,6 +2108,9 @@ def _accept_peer_block(peer: str, seq: int, head: str,
         if int(header.get("n_atoms", -1)) != expected_n:
             return False, [f"n_atoms {header.get('n_atoms')} != {expected_n} "
                            f"(этап для высоты {seq})"]
+        local_comp = CONFIG.get("composition") or {str(CONFIG.get("element")): 1}
+        if header.get("composition") != local_comp:
+            return False, [f"состав блока {header.get('composition')} != {local_comp}"]
         if any(b["seq"] == seq for b in chain_mod.list_blocks(element_dir)):
             return False, [f"блок с seq {seq} уже есть"]
 
@@ -2479,7 +2533,16 @@ def work_height(element: str, pubkey_hash: str | None = None,
 @app.get("/chain/height")
 def chain_height():
     h, sha = _local_head()
-    return {"element": CONFIG["element"], "height": h, "head_sha256": sha}
+    templates = CONFIG.get("templates") or []
+    tpl_info = None
+    if templates:
+        tsha = chain_mod.template_sha(templates[0])
+        tpl_info = {"sha256": tsha,
+                    "registered_at": chain_mod.template_registered_at(
+                        CONFIG["output_dir"], tsha),
+                    "count": len(templates)}
+    return {"element": CONFIG["element"], "height": h, "head_sha256": sha,
+            "template": tpl_info}
 
 
 @app.get("/chain/block/{seq}")

@@ -134,9 +134,9 @@ def cmd_resume(args):
 def cmd_chain(args):
     data = _request(args, "GET", "/admin/chain", params={"verify": str(args.verify).lower()})
     blocks = data.get("blocks", [])
-    print(f"Элемент {data.get('element')}: блоков {len(blocks)}")
+    print(f"Система {data.get('element') or data.get('system')}: блоков {len(blocks)}")
     if blocks:
-        _print_table([(b["seq"], b["element"], b["n_atoms"], b["name"]) for b in blocks],
+        _print_table([(b["seq"], b["system"], b["n_atoms"], b["name"]) for b in blocks],
                      ["seq", "элемент", "атомов", "файл"])
     if args.verify:
         chk = data.get("chain", {})

@@ -398,17 +398,15 @@ def restart_tests():
         main.pending_tasks.clear(); main.active_tasks.clear()
         main.completed_tasks.clear(); main.failed_tasks.clear(); main.registered_workers.clear()
         wid = main._register_worker("test", None, None)["worker_id"]
-        # шаблон включаем, чтобы работала сверка геометрии с выданной
-        tpl_path = os.path.join(tmp, "dimer.xyz")
-        with open(tpl_path, "w", encoding="utf-8") as f:
-            f.write("2\nseed\nCu 0 0 0\nCu 2.5 0 0\n")
-        cfg["template"] = structure_generator.load_template_xyz(tpl_path)
+        # В v4 сверка геометрии включается для блоков с зарегистрированным
+        # шаблоном (это проверяется отдельным тестом); здесь — сам механизм.
         t = {**task, "struct_id": "n2_d3_0007", "attempts": 0}
         main.pending_tasks.append(t)
         got = main.get_task(wid)
         check("мастер не передаёт режим проверки (он всегда restart)",
               "verify_mode" not in got["task"]["cfg"])
         issued = got["task"]
+        main.active_tasks[issued["struct_id"]]["check_geometry"] = True
         wrong = {"geometry": [[0.0, 0.0, 0.0], [3.4, 0.0, 0.0]],
                  "species": issued["species"],
                  "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
@@ -563,16 +561,24 @@ def identity_tests():
           identity.make_identity("alpha")["pubkey_hash"] != a["pubkey_hash"])
 
 
-def block_dft(element_dir, n_atoms=2, dim=3, nonce=0):
-    """dft.json, геометрия которого следует из (prev_id, nonce) — правило v2."""
+def block_dft(element_dir, n_atoms=2, dim=3, nonce=0, system="Cu",
+              composition=None):
+    """dft.json, геометрия которого следует из (prev_id, nonce) — правило v3."""
+    import structure_generator
+
+    comp = composition or {system: 1}
     prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
-    geom = chain.expected_geometry({
-        "prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": dim,
-        "atom_diameter": 2.0, "element": "Cu", "template": None,
-    })
+    header = {"prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": dim,
+              "atom_diameter": 2.0, "system": system, "composition": comp,
+              "template": None}
+    geom = chain.expected_geometry(header)
+    species = structure_generator.assign_species(
+        n_atoms, {"composition": comp},
+        seed=chain.geometry_seed(prev, nonce))
     return {"energy_ev": -42.0,
             "forces_ev_ang": [[0.0, 0.0, 0.0]] * n_atoms,
-            "geometry": np.asarray(geom).tolist()}
+            "geometry": np.asarray(geom).tolist(),
+            "species": species}
 
 
 def chain_tests():
@@ -609,20 +615,117 @@ def chain_tests():
             h1 = json.loads(z.read("header.json"))
             tx1 = json.loads(z.read("tx-0000-coinbase.json"))
 
-        expected = {"version", "seq", "element", "n_atoms", "dim",
+        expected = {"version", "seq", "system", "composition", "n_atoms", "dim",
                     "atom_diameter", "prev_id", "created_at", "state_sha256",
                     "state_path", "cp2k_version", "cp2k_build", "cp2k_params",
                     "tx_root", "nonce", "dft_sha256", "geom_version",
-                    "template", "block_id"}
+                    "template_sha", "block_id"}
         check("в заголовке только нужные поля", set(h1) == expected, sorted(h1))
         check("отпечаток сборки CP2K попал в заголовок",
               h1.get("cp2k_build") == cp2k_runner.CP2K_BUILD_CPU, h1.get("cp2k_build"))
-        check("version = 2", h1["version"] == 2)
+        check("version = 4", h1["version"] == 4)
         check("created_at — ISO 8601 UTC",
               datetime.strptime(h1["created_at"], "%Y-%m-%dT%H:%M:%SZ") is not None)
         check("CP2K version и params в блоке",
               h1["cp2k_version"] == "2024.3" and h1["cp2k_params"]["cutoff"] == 400)
         check("первый блок: prev = нули", h1["prev_id"] == chain.ZERO_HASH)
+
+        # --- молекула: слаг системы + состав в заголовке ---
+        tmpm = tempfile.mkdtemp(prefix="chain_mol_")
+        try:
+            wfnm = os.path.join(tmpm, "state.wfn")
+            make_wfn(wfnm)
+            sham, relm = chain.store_blob(tmpm, wfnm)
+            comp = {"Al": 2, "O": 3}
+            dftm = block_dft(tmpm, n_atoms=5, system="al2o3", composition=comp)
+            pm = chain.write_block(tmpm, "al2o3", 5, sham, relm,
+                                   [chain.make_coinbase(1, master)], dft=dftm,
+                                   composition=comp, **cp2k)
+            check("молекула: имя блока с слагом",
+                  os.path.basename(pm) == "000001_al2o3_5.zip", os.path.basename(pm))
+            with zipfile.ZipFile(pm) as z:
+                hm = json.loads(z.read("header.json"))
+            check("молекула: состав в заголовке", hm["composition"] == comp)
+            check("молекула: цепочка проверяется",
+                  chain.verify_chain(tmpm, "al2o3")["ok"],
+                  chain.verify_chain(tmpm, "al2o3")["problems"][:2])
+            bad = chain.validate_header(dict(hm, system="Al2O3!"))
+            check("молекула: неверный слаг отвергается",
+                  any("system" in p for p in bad), bad[:2])
+
+        finally:
+            shutil.rmtree(tmpm, ignore_errors=True)
+
+        # --- v4: шаблон — объект в цепочке, только после регистрации ---
+        tmpl_dir = tempfile.mkdtemp(prefix="chain_tpl_")
+        try:
+            wfnt = os.path.join(tmpl_dir, "state.wfn")
+            make_wfn(wfnt)
+            shat, relt = chain.store_blob(tmpl_dir, wfnt)
+            comp = {"Cu": 1}
+
+            coords = [[0.0, 0.0, 0.0], [2.5, 0.0, 0.0], [0.0, 2.5, 0.0]]
+            tpl = {"version": chain.TEMPLATE_VERSION, "system": "Cu",
+                   "composition": comp, "n_atoms": 3, "dim": 3,
+                   "coords": coords, "source": "test"}
+            tsha = chain.template_sha(tpl)
+
+            d1 = block_dft(tmpl_dir, n_atoms=2)
+            reg = chain.template_tx(tpl)
+            cb1 = chain.make_coinbase(1, master)
+            chain.write_block(tmpl_dir, "Cu", 2, shat, relt, [cb1, reg], dft=d1, **cp2k)
+            check("шаблон: регистрация — отдельная транзакция",
+                  any(t.get("type") == "template"
+                      for t in chain.read_block_txs(chain.list_blocks(tmpl_dir)[0]["path"])))
+            check("шаблон: цепочка с регистрацией целая",
+                  chain.verify_chain(tmpl_dir, "Cu")["ok"],
+                  chain.verify_chain(tmpl_dir, "Cu")["problems"][:3])
+            check("шаблон: известен начиная со следующего блока",
+                  chain.find_template(tmpl_dir, tsha, before_seq=1) is None
+                  and chain.find_template(tmpl_dir, tsha, before_seq=2) is not None)
+
+            prev = chain.previous_hash(tmpl_dir, chain.next_seq(tmpl_dir))
+            hdr = {"prev_id": prev, "nonce": 0, "n_atoms": 3, "dim": 3,
+                   "atom_diameter": 2.0, "system": "Cu", "composition": comp,
+                   "template_sha": tsha}
+            geom = chain.expected_geometry(hdr, tpl)
+            d2 = {"energy_ev": -42.0,
+                  "forces_ev_ang": [[0.0, 0.0, 0.0]] * 3,
+                  "geometry": np.asarray(geom).tolist(),
+                  "species": structure_generator.assign_species(
+                      3, {"composition": comp}, seed=chain.geometry_seed(prev, 0))}
+            chain.write_block(tmpl_dir, "Cu", 3, shat, relt,
+                              [chain.make_coinbase(2, master)], dft=d2,
+                              nonce=0, template_sha=tsha, template_obj=tpl, **cp2k)
+            check("шаблон: блок с template_sha проверяется",
+                  chain.verify_chain(tmpl_dir, "Cu")["ok"],
+                  chain.verify_chain(tmpl_dir, "Cu")["problems"][:3])
+
+            bad_tpl = dict(tpl, system="Fe")
+            check("шаблон: чужая система отбивается",
+                  any("систем" in p for p in
+                      chain.validate_template(bad_tpl, "Cu", comp)))
+            close = dict(tpl, coords=[[0.0, 0.0, 0.0], [0.01, 0.0, 0.0],
+                                      [0.0, 2.5, 0.0]])
+            check("шаблон: атомы ближе 0.5 Å отбиваются",
+                  any("ближе" in p for p in chain.validate_template(close, "Cu", comp)))
+
+            bad_dir = tempfile.mkdtemp(prefix="chain_tpl_bad_")
+            try:
+                wfnb = os.path.join(bad_dir, "state.wfn")
+                make_wfn(wfnb)
+                shab, relb = chain.store_blob(bad_dir, wfnb)
+                dbad = block_dft(bad_dir, n_atoms=2)
+                chain.write_block(bad_dir, "Cu", 2, shab, relb,
+                                  [chain.make_coinbase(1, master),
+                                   chain.template_tx(dict(tpl, composition={"O": 1}))],
+                                  dft=dbad, **cp2k)
+                check("шаблон: чужой состав в транзакции отбивается",
+                      not chain.verify_chain(bad_dir, "Cu")["ok"])
+            finally:
+                shutil.rmtree(bad_dir, ignore_errors=True)
+        finally:
+            shutil.rmtree(tmpl_dir, ignore_errors=True)
         check("wfn в блок не кладётся, только ссылка",
               not any(n.endswith(".wfn") for n in names) and h1["state_path"] == rel1)
         check("coinbase — 50 000 000 монет",
@@ -1082,9 +1185,11 @@ def master_geometry_tests():
     import tempfile as _tempfile
 
     tmp = _tempfile.mkdtemp(prefix="geom_")
-    saved = {k: main.CONFIG.get(k) for k in ("output_dir", "element", "template")}
+    saved = {k: main.CONFIG.get(k)
+             for k in ("output_dir", "element", "template", "templates")}
     try:
-        main.CONFIG.update({"output_dir": tmp, "element": "Cu", "template": None})
+        main.CONFIG.update({"output_dir": tmp, "element": "Cu",
+                            "template": None, "templates": None})
         main.pending_tasks.clear()
         main.active_tasks.clear()
         main.registered_workers.clear()
@@ -1110,20 +1215,36 @@ def master_geometry_tests():
         check("геометрия детерминирована по (prev_id, nonce)",
               a["coords"] == b["coords"] and a["species"] == b["species"])
 
-        # шаблон: геометрия строится вокруг него и воспроизводится по выданному seed
+        # шаблон: регистрируется в цепочке, затем геометрия строится вокруг него
         tpl_path = os.path.join(tmp, "dimer.xyz")
         with open(tpl_path, "w", encoding="utf-8") as f:
             f.write("2\nseed\nCu 0 0 0\nCu 2.5 0 0\n")
-        main.CONFIG["template"] = structure_generator.load_template_xyz(tpl_path)
+        frame = structure_generator.load_template_xyz(tpl_path)["frames"][0]
+        obj = {"version": chain.TEMPLATE_VERSION, "system": "Cu",
+               "composition": {"Cu": 1}, "n_atoms": len(frame["coords"]),
+               "dim": 3,
+               "coords": [[float(c) for c in p] for p in frame["coords"]],
+               "source": "dimer.xyz"}
+        wfn_g = os.path.join(tmp, "state.wfn")
+        make_wfn(wfn_g)
+        sha_g, rel_g = chain.store_blob(tmp, wfn_g)
+        chain.write_block(tmp, "Cu", 2, sha_g, rel_g,
+                          [chain.make_coinbase(1, "a" * 64),
+                           chain.template_tx(obj)],
+                          dft=block_dft(tmp, n_atoms=2))
+        main.CONFIG["templates"] = [obj]
         tmpl_task = {"struct_id": "n2_g2", "n_atoms": 2, "dim": 3,
                      "seed": 5, "attempts": 0}
         g = main._issue_geometry(dict(tmpl_task))
         pts = np.asarray(g["coords"])
         d = float(np.linalg.norm(pts[0] - pts[1]))
         check("шаблон: расстояние около исходного (2.5 Å)", 2.0 <= d <= 3.5, f"d={d:.2f}")
-
+        check("шаблон: в задании есть ссылка на зарегистрированный шаблон",
+              g.get("template_sha") == chain.template_sha(obj))
         again = structure_generator.generate_from_template(
-            2, 3, main.CONFIG, main.CONFIG["template"], seed=g["seed"])
+            2, 3, main.CONFIG,
+            {"frames": [{"coords": np.asarray(obj["coords"], dtype=float)}]},
+            seed=g["seed"])
         check("шаблон: геометрия воспроизводится по выданному seed",
               np.allclose(np.asarray(again), pts, atol=1e-9))
     finally:

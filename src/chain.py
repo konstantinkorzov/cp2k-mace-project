@@ -2,18 +2,19 @@
 """
 Блокчейн-блоки принятых результатов + UTXO-транзакции.
 
-Блок: results/<element>/blocks/000001_Cu_2.zip
+Блок: results/<system>/blocks/000001_cu_2.zip
 Имя: <номер>_<элемент>_<атомов>.zip
 
 Внутри:
-  header.json                 — version, seq, element, n_atoms, prev_sha256,
-                                created_at (ISO 8601 UTC), state_sha256, state_path
+  header.json                 — version, seq, system (слаг), composition,
+                                n_atoms, prev_sha256, created_at (ISO 8601 UTC),
+                                state_sha256, state_path
   tx-0000-coinbase.json       — 50 монет на адрес мастера (последний ключ)
   tx-0001-reward.json         — 25 монет воркеру (если у мастера есть
                                 подтверждённый баланс)
 
 Файл состояния (.wfn) в блок НЕ кладётся: он хранится один раз в
-results/<element>/blobs/<sha256>.wfn, а в заголовке — ссылка.
+results/<system>/blobs/<sha256>.wfn, а в заголовке — ссылка.
 
 Транзакции — в духе Bitcoin UTXO: входы ссылаются на (txid, vout) предыдущих
 выходов, coinbase-вход специальный. Выход становится доступен спустя
@@ -34,9 +35,8 @@ import numpy as np
 
 import crypto
 
-BLOCK_VERSION = 2
+BLOCK_VERSION = 4
 ZERO_HASH = "0" * 64
-BLOCK_RE = re.compile(r"^(\d{6})_([A-Za-z]{1,3})_(\d+)\.zip$")
 HEADER_NAME = "header.json"
 DFT_NAME = "dft.json"
 
@@ -242,21 +242,33 @@ def block_id_of(header: dict) -> str:
     return hashlib.sha256(b"cp2k-block-v2\x00" + canonical_json(body)).hexdigest()
 
 
-def expected_geometry(header: dict) -> np.ndarray:
+def expected_geometry(header: dict, template: dict | None = None) -> np.ndarray:
     """Какая геометрия обязана быть у блока при его prev_id/nonce/параметрах."""
     import structure_generator
 
+    comp = header.get("composition")
+    if not isinstance(comp, dict) or not comp:
+        comp = {str(header.get("system") or "X"): 1}
+    comp = {str(k): int(v) for k, v in comp.items()}
     cfg = {"atom_diameter": float(header.get("atom_diameter") or 2.0),
-           "composition": {str(header.get("element")): 1}}
-    template = None
-    if header.get("template"):
-        template = {"frames": [{
-            "symbols": [str(header.get("element"))] * int(header["n_atoms"]),
-            "coords": np.asarray(header["template"], dtype=float),
-        }]}
-    return structure_generator.generate_for_seed(
-        geometry_seed(str(header["prev_id"]), int(header["nonce"])),
-        int(header["n_atoms"]), int(header["dim"]), cfg, template)
+           "composition": comp}
+    n_atoms = int(header["n_atoms"])
+    seed = geometry_seed(str(header["prev_id"]), int(header["nonce"]))
+    frames = None
+    tsha = header.get("template_sha")
+    if tsha:
+        if not isinstance(template, dict):
+            raise ValueError("в заголовке template_sha, но шаблон не передан")
+        coords = template.get("coords")
+        if not isinstance(coords, list) or not coords:
+            raise ValueError("шаблон пуст")
+        # Символы не влияют на координаты, но обязаны быть теми же, что в dft.json.
+        symbols = structure_generator.assign_species(n_atoms, {"composition": comp},
+                                                     seed=seed)
+        frames = {"frames": [{"symbols": symbols,
+                              "coords": np.asarray(coords, dtype=float)}]}
+    return structure_generator.generate_for_seed(seed, n_atoms, int(header["dim"]),
+                                                 cfg, frames)
 
 
 _BLOCK_ID_CACHE: dict[tuple, str] = {}
@@ -284,11 +296,11 @@ def list_blocks(element_dir: str) -> list[dict]:
         return []
     out = []
     for name in os.listdir(d):
-        m = BLOCK_RE.match(name)
-        if not m:
+        m = BLOCK_NAME_RE.match(name)
+        if not m or not SYSTEM_RE.match(m.group(2)):
             continue
         path = os.path.join(d, name)
-        out.append({"seq": int(m.group(1)), "element": m.group(2),
+        out.append({"seq": int(m.group(1)), "system": m.group(2),
                     "n_atoms": int(m.group(3)), "path": path, "name": name,
                     "sha256": sha256_file(path),
                     "block_id": _block_id_of_file(path)})
@@ -526,7 +538,7 @@ def restore_blocks(removed: list[dict]):
         shutil.move(path, dst)
 
 
-def write_block(element_dir: str, element: str, n_atoms: int,
+def write_block(element_dir: str, system: str, n_atoms: int,
                 state_sha256: str, state_path: str,
                 transactions: list[dict],
                 cp2k_version: str = "",
@@ -537,7 +549,9 @@ def write_block(element_dir: str, element: str, n_atoms: int,
                 dim: int = 3,
                 atom_diameter: float = 2.0,
                 geom_version: int | None = None,
-                template: list | None = None) -> str:
+                template_sha: str | None = None,
+                template_obj: dict | None = None,
+                composition: dict | None = None) -> str:
     """Создаёт следующий блок цепочки элемента (протокол v2).
 
     block_id — канонический хэш заголовка (включая tx_root, wfn_sha, dft_sha,
@@ -548,16 +562,23 @@ def write_block(element_dir: str, element: str, n_atoms: int,
     if geom_version is None:
         geom_version = structure_generator.GEOM_VERSION
 
+    if composition is None:
+        if not SYMBOL_RE.match(str(system)):
+            raise ValueError("для системы без символьного имени нужен composition")
+        composition = {str(system): 1}
+    composition = {str(k): int(v) for k, v in composition.items()}
+
     d = blocks_dir(element_dir)
     os.makedirs(d, exist_ok=True)
     seq = next_seq(element_dir)
     prev_id = previous_hash(element_dir, seq)
-    path = os.path.join(d, block_name(seq, element, n_atoms))
+    path = os.path.join(d, block_name(seq, system, n_atoms))
 
     header = {
         "version": BLOCK_VERSION,
         "seq": seq,
-        "element": element,
+        "system": system,
+        "composition": composition,
         "n_atoms": int(n_atoms),
         "dim": int(dim),
         "atom_diameter": float(atom_diameter),
@@ -572,13 +593,13 @@ def write_block(element_dir: str, element: str, n_atoms: int,
         "nonce": int(nonce),
         "dft_sha256": dft_sha256(dft or {}),
         "geom_version": int(geom_version),
-        "template": template,
+        "template_sha": template_sha,
     }
     header["block_id"] = block_id_of(header)
 
     # Дешёвая проверка на месте: геометрия должна следовать из prev_id+nonce.
     if dft is not None:
-        expect = expected_geometry(header)
+        expect = expected_geometry(header, template_obj)
         got = np.asarray(dft.get("geometry"), dtype=float)
         if got.shape != expect.shape or not np.allclose(got, expect, atol=1e-6, rtol=0.0):
             raise ValueError("geometry не соответствует seed(prev_id, nonce)")
@@ -595,6 +616,7 @@ def write_block(element_dir: str, element: str, n_atoms: int,
             z.writestr(fname, json.dumps(tx, ensure_ascii=False, indent=2))
     os.replace(tmp, path)
     _BLOCK_ID_CACHE.clear()
+    _TEMPLATE_CACHE.clear()
     return path
 
 
@@ -609,15 +631,144 @@ def _parse_iso(value: str) -> bool:
 
 # ---------- Схема заголовка блока v2 (консенсус) ----------
 HEADER_FIELDS = frozenset({
-    "version", "seq", "element", "n_atoms", "dim", "atom_diameter", "prev_id",
-    "created_at", "state_sha256", "state_path", "cp2k_version", "cp2k_build",
-    "cp2k_params", "tx_root", "nonce", "dft_sha256", "geom_version", "template",
-    "block_id",
+    "version", "seq", "system", "composition", "n_atoms", "dim", "atom_diameter",
+    "prev_id", "created_at", "state_sha256", "state_path", "cp2k_version",
+    "cp2k_build", "cp2k_params", "tx_root", "nonce", "dft_sha256", "geom_version",
+    "template_sha", "block_id",
 })
 REQUIRED_CP2K_PARAMS = ("cutoff", "rel_cutoff", "eps_default", "eps_scf",
                         "max_scf", "min_cell_size", "max_cell_size", "box_padding")
-ELEMENT_RE = re.compile(r"^[A-Za-z]{1,3}$")
+# system — слаг цепочки (каталог результатов), а не химический символ:
+# cu, cu3, al2o3, cu10-tpl. Формула для показа выводится из composition.
+SYSTEM_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
+SYMBOL_RE = re.compile(r"^[A-Z][a-z]?$")
+# 000001_cu_2.zip / 000001_al2o3_10.zip: слаг может содержать . _ -, поэтому
+# берём его жадно, а n_atoms — последний _<число>.zip.
+BLOCK_NAME_RE = re.compile(r"^(\d{6})_(.+)_(\d+)\.zip$")
 MAX_NONCE = 2 ** 64 - 1
+
+# ---------- шаблоны геометрии (протокол v4) ----------
+# Шаблон — объект в цепочке, а не координаты в заголовке: он регистрируется
+# отдельной транзакцией и может использоваться только в блоках ВЫШЕ высоты
+# регистрации. Иначе мастер подбирал бы шаблон под уже посчитанный результат.
+TEMPLATE_VERSION = 1
+MAX_TEMPLATE_ATOMS = 500          # больше — и проверка min_dist становится дорогой
+MAX_TEMPLATES_PER_BLOCK = 8
+TEMPLATE_MIN_DIST_ANG = 0.5       # физический минимум, как при приёме работы
+TEMPLATE_KEYS = frozenset({"version", "system", "composition", "n_atoms", "dim",
+                           "coords", "source"})
+
+
+def template_sha(template: dict) -> str:
+    """Хеш шаблона: канонический JSON ровно ожидаемых полей."""
+    body = {k: (template or {}).get(k) for k in sorted(TEMPLATE_KEYS)}
+    return hashlib.sha256(b"cp2k-template-v1\x00" + canonical_json(body)).hexdigest()
+
+
+def validate_template(template, system: str | None, composition: dict | None) -> list[str]:
+    """Проверка шаблона: та же система, состав, размеры, расстояния."""
+    problems: list[str] = []
+    if not isinstance(template, dict):
+        return ["шаблон — не объект"]
+    keys = set(template)
+    if keys != TEMPLATE_KEYS:
+        problems.append(f"шаблон: поля {sorted(keys)} != {sorted(TEMPLATE_KEYS)}")
+    if template.get("version") != TEMPLATE_VERSION:
+        problems.append(f"шаблон: version {template.get('version')!r} != {TEMPLATE_VERSION}")
+    if system is not None and template.get("system") != system:
+        problems.append(f"шаблон: система {template.get('system')!r} != {system}")
+    if composition is not None and template.get("composition") != composition:
+        problems.append("шаблон: состав не совпадает с системой")
+    if not isinstance(template.get("source"), str) or len(template["source"]) > 200:
+        problems.append("шаблон: source — строка до 200 символов")
+
+    n = template.get("n_atoms")
+    coords = template.get("coords")
+    if type(n) is not int or not 1 <= n <= MAX_TEMPLATE_ATOMS:
+        problems.append(f"шаблон: n_atoms {n!r} — не целое 1..{MAX_TEMPLATE_ATOMS}")
+        return problems
+    if template.get("dim") not in (1, 2, 3):
+        problems.append(f"шаблон: dim {template.get('dim')!r} — не 1/2/3")
+    if not isinstance(coords, list) or len(coords) != n:
+        problems.append("шаблон: coords — не список длины n_atoms")
+        return problems
+
+    pts = []
+    for i, p in enumerate(coords):
+        if not isinstance(p, list) or len(p) != 3 or not all(_is_number(x) for x in p):
+            problems.append(f"шаблон: координата #{i} — не [x,y,z] числа")
+            return problems
+        if max(abs(float(x)) for x in p) > 10_000:
+            problems.append(f"шаблон: координата #{i} вне разумных пределов")
+            return problems
+        pts.append((float(p[0]), float(p[1]), float(p[2])))
+    if problems:
+        return problems
+    for i in range(n):
+        xi, yi, zi = pts[i]
+        for j in range(i + 1, n):
+            xj, yj, zj = pts[j]
+            d2 = (xi - xj) ** 2 + (yi - yj) ** 2 + (zi - zj) ** 2
+            if d2 < TEMPLATE_MIN_DIST_ANG ** 2:
+                problems.append(f"шаблон: атомы {i} и {j} ближе "
+                                f"{TEMPLATE_MIN_DIST_ANG} Å")
+                return problems
+    return problems
+
+
+_TEMPLATE_CACHE: dict[tuple[str, str], tuple[int, dict] | None] = {}
+
+
+def _scan_template(element_dir: str, sha: str):
+    for b in list_blocks(element_dir):
+        try:
+            txs = read_block_txs(b["path"])
+        except Exception:  # noqa: BLE001
+            continue
+        for tx in txs:
+            tpl = tx.get("template")
+            if isinstance(tpl, dict) and template_sha(tpl) == sha:
+                return (b["seq"], tpl)
+    return None
+
+
+def template_registered_at(element_dir: str, sha: str) -> int | None:
+    """Высота регистрации шаблона или None."""
+    if not isinstance(sha, str) or not SHA_RE.match(sha):
+        return None
+    key = (os.path.abspath(element_dir), sha)
+    if key not in _TEMPLATE_CACHE:
+        _TEMPLATE_CACHE[key] = _scan_template(element_dir, sha)
+    hit = _TEMPLATE_CACHE[key]
+    return hit[0] if hit else None
+
+
+def find_template(element_dir: str, sha: str,
+                  before_seq: int | None = None) -> dict | None:
+    """
+    Тело шаблона из цепочки. `before_seq` — шаблон обязан быть зарегистрирован
+    СТРОГО раньше этого блока: иначе он выбран после результата.
+    """
+    if not isinstance(sha, str) or not SHA_RE.match(sha):
+        return None
+    key = (os.path.abspath(element_dir), sha)
+    if key not in _TEMPLATE_CACHE:
+        _TEMPLATE_CACHE[key] = _scan_template(element_dir, sha)
+    hit = _TEMPLATE_CACHE[key]
+    if hit is None:
+        return None
+    seq, tpl = hit
+    if before_seq is not None and seq >= before_seq:
+        return None
+    return tpl
+
+
+def template_tx(template: dict) -> dict:
+    """Транзакция регистрации шаблона (без входов/выходов: это данные, не деньги)."""
+    tx = {"version": 1, "type": "template", "template": template}
+    tx["txid"] = txid_of(tx)
+    return tx
+
 
 
 def _is_number(value) -> bool:
@@ -626,7 +777,7 @@ def _is_number(value) -> bool:
 
 
 def validate_header(header: dict, *, expected_seq: int | None = None,
-                    expected_element: str | None = None,
+                    expected_system: str | None = None,
                     expected_n_atoms: int | None = None) -> list[str]:
     """Строгая проверка header.json v2. Возвращает список проблем."""
     problems: list[str] = []
@@ -648,17 +799,36 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
     elif expected_seq is not None and seq != expected_seq:
         problems.append(f"seq {seq} != ожидаемого {expected_seq}")
 
-    element = header.get("element")
-    if not isinstance(element, str) or not ELEMENT_RE.match(element):
-        problems.append(f"element {element!r} не соответствует ^[A-Za-z]{{1,3}}$")
-    elif expected_element is not None and element != expected_element:
-        problems.append(f"элемент блока {element} != {expected_element}")
+    system = header.get("system")
+    if not isinstance(system, str) or not SYSTEM_RE.match(system):
+        problems.append(f"system {system!r} — не слаг ^[A-Za-z][A-Za-z0-9._-]{{0,63}}$")
+    elif expected_system is not None and system != expected_system:
+        problems.append(f"система блока {system} != {expected_system}")
 
     n_atoms = header.get("n_atoms")
     if type(n_atoms) is not int or not 1 <= n_atoms <= 10_000:
         problems.append(f"n_atoms {n_atoms!r} — не целое 1..10000")
     elif expected_n_atoms is not None and n_atoms != expected_n_atoms:
         problems.append(f"n_atoms {n_atoms} != ожидаемого {expected_n_atoms}")
+
+    comp = header.get("composition")
+    if not isinstance(comp, dict) or not comp:
+        problems.append("composition — не непустой объект")
+    elif len(comp) > 20:
+        problems.append("composition: больше 20 элементов")
+    else:
+        total = 0
+        for sym, cnt in comp.items():
+            if not isinstance(sym, str) or not SYMBOL_RE.match(sym):
+                problems.append(f"composition: {sym!r} — не химический символ")
+            if type(cnt) is not int or cnt < 1:
+                problems.append(f"composition: {sym} — количество не целое >= 1")
+            else:
+                total += cnt
+        if type(n_atoms) is int and total:
+            # composition — формульная единица (Cu:1, Al2O3:5), n_atoms кратно ей
+            if n_atoms % total:
+                problems.append(f"n_atoms {n_atoms} не кратно формуле ({total} атомов)")
 
     if type(header.get("dim")) is not int or header["dim"] not in (1, 2, 3):
         problems.append(f"dim {header.get('dim')!r} — не 1/2/3")
@@ -708,15 +878,9 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
     if type(header.get("geom_version")) is not int:
         problems.append("geom_version — не целое")
 
-    template = header.get("template")
-    if template is not None:
-        if not isinstance(template, list) or len(template) != (n_atoms if type(n_atoms) is int else -1):
-            problems.append("template: не список координат длины n_atoms")
-        else:
-            bad = [p for p in template
-                   if not isinstance(p, list) or len(p) != 3 or not all(_is_number(x) for x in p)]
-            if bad:
-                problems.append("template: координаты не [x,y,z] числа")
+    tsha = header.get("template_sha")
+    if tsha is not None and (not isinstance(tsha, str) or not SHA_RE.match(tsha)):
+        problems.append("template_sha — не 64 hex и не null")
 
     bid = header.get("block_id")
     if not isinstance(bid, str) or not SHA_RE.match(bid):
@@ -754,12 +918,20 @@ def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
 
 def _check_txs(txs: list[dict], utxo: dict, label: str,
                add_outputs: bool = False,
-               height: int | None = None) -> tuple[float, list[str]]:
+               height: int | None = None,
+               system: str | None = None,
+               composition: dict | None = None) -> tuple[float, list[str]]:
     problems = []
     coinbases = [t for t in txs if t.get("type") == "coinbase"]
     if len(coinbases) != 1:
         problems.append(f"{label}: coinbase-транзакций {len(coinbases)}, ожидается 1")
-    transfers = [t for t in txs if t.get("type") != "coinbase"]
+    templates = [t for t in txs if t.get("type") == "template"]
+    if len(templates) > MAX_TEMPLATES_PER_BLOCK:
+        problems.append(f"{label}: шаблонов {len(templates)} > {MAX_TEMPLATES_PER_BLOCK}")
+    for tx in templates:
+        problems.extend(f"{label}: {p}" for p in
+                        validate_template(tx.get("template"), system, composition))
+    transfers = [t for t in txs if t.get("type") not in ("coinbase", "template")]
     if len(transfers) > MAX_TXS_PER_BLOCK:
         problems.append(f"{label}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
@@ -768,6 +940,8 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         tid = tx.get("txid") or txid_of(tx)
         if tid != txid_of(tx):
             problems.append(f"{label}: txid транзакции не совпадает с содержимым")
+        if tx.get("type") == "template":
+            continue
         problems.extend(f"{label}: {p}" for p in invalid_outputs(tx))
         if tx.get("type") == "coinbase":
             continue
@@ -837,9 +1011,9 @@ def verify_block(element_dir: str, block_path: str,
         return {"ok": False, "problems": [f"блок не читается: {e}"],
                 "header": {}, "dft": {}, "txs": []}
 
-    element = os.path.basename(os.path.normpath(element_dir))
+    system = os.path.basename(os.path.normpath(element_dir))
     problems.extend(validate_header(header, expected_seq=expected_seq,
-                                    expected_element=element))
+                                    expected_system=system))
     if expected_prev is not None and header.get("prev_id") != expected_prev:
         problems.append("prev_id не совпадает с головой локальной цепочки")
     seq = header.get("seq") if type(header.get("seq")) is int else -1
@@ -875,27 +1049,54 @@ def verify_block(element_dir: str, block_path: str,
             problems.append("dft.json: нет energy_ev")
         if dft_sha256(dft) != header.get("dft_sha256"):
             problems.append("dft_sha256 не совпадает с dft.json")
+        tpl = None
+        if header.get("template_sha"):
+            tpl = find_template(element_dir, header["template_sha"], before_seq=seq)
+            if tpl is None:
+                problems.append("шаблон не зарегистрирован в цепочке до этого блока")
+            else:
+                problems.extend(validate_template(tpl, header.get("system"),
+                                                  header.get("composition")))
         try:
-            expect = expected_geometry(header)
+            expect = expected_geometry(header, tpl)
             got = np.asarray(geom, dtype=float)
             if got.shape != expect.shape or not np.allclose(got, expect, atol=1e-6, rtol=0.0):
                 problems.append("геометрия не следует из seed(prev_id, nonce)")
         except Exception as e:  # noqa: BLE001
             problems.append(f"геометрию нельзя воспроизвести: {e}")
 
+        # Виды атомов тоже выводятся из seed и состава: иначе можно объявить
+        # любую раскладку элементов и «считать» не ту систему.
+        species = dft.get("species")
+        comp = header.get("composition")
+        if isinstance(comp, dict) and len(comp) > 1 and not species:
+            problems.append("dft.json: нет species для многокомпонентной системы")
+        elif species is not None:
+            try:
+                import structure_generator
+                want = structure_generator.assign_species(
+                    n_atoms, {"composition": comp},
+                    seed=geometry_seed(str(header["prev_id"]), int(header["nonce"])))
+                if [str(s) for s in species] != want:
+                    problems.append("виды атомов не следуют из seed(prev_id, nonce)")
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"виды атомов нельзя воспроизвести: {e}")
+
     utxo = utxo_set(element_dir)
     for key in list(utxo):
         info = utxo[key]
         utxo[key] = {"value": info["value"], "address": info["address"],
                      "height": info["height"], "coinbase": info["coinbase"]}
-    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path), height=seq)
+    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path), height=seq,
+                                system=header.get("system"),
+                                composition=header.get("composition"))
     problems.extend(tx_problems)
 
     return {"ok": not problems, "problems": problems,
             "header": header, "dft": dft, "txs": txs}
 
 
-def verify_chain(element_dir: str, element: str | None = None) -> dict:
+def verify_chain(element_dir: str, system: str | None = None) -> dict:
     """
     Полная проверка цепочки v2:
       схема/block_id, prev_id, tx_root, dft_sha256, воспроизводимость геометрии,
@@ -907,12 +1108,13 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
     utxo: dict = {}
     expected_prev = ZERO_HASH
     expected_seq = 1
+    chain_composition = None
 
     for b in blocks:
         if b["seq"] != expected_seq:
             problems.append(f"пропуск в нумерации: ожидался {expected_seq}, найден {b['seq']}")
-        if element and b["element"] != element:
-            problems.append(f"{b['name']}: элемент {b['element']} != {element}")
+        if system and b["system"] != system:
+            problems.append(f"{b['name']}: система {b['system']} != {system}")
 
         try:
             header, dft, txs, names = read_block(b["path"])
@@ -922,8 +1124,13 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             continue
 
         problems.extend(f"{b['name']}: {p}" for p in validate_header(
-            header, expected_seq=b["seq"], expected_element=b["element"],
+            header, expected_seq=b["seq"], expected_system=b["system"],
             expected_n_atoms=b["n_atoms"]))
+        if chain_composition is None:
+            chain_composition = header.get("composition")
+        elif header.get("composition") != chain_composition:
+            problems.append(f"{b['name']}: состав {header.get('composition')} "
+                            f"!= состава цепочки {chain_composition}")
         if header.get("prev_id") != expected_prev:
             problems.append(f"{b['name']}: prev_id не совпадает с предыдущим блоком")
 
@@ -939,8 +1146,19 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             if not isinstance(geom, list) or len(geom) != b["n_atoms"]:
                 problems.append(f"{b['name']}: geometry в dft.json не соответствует n_atoms")
             else:
+                tpl = None
+                if header.get("template_sha"):
+                    tpl = find_template(element_dir, header["template_sha"],
+                                        before_seq=b["seq"])
+                    if tpl is None:
+                        problems.append(f"{b['name']}: шаблон не зарегистрирован "
+                                        f"до этого блока")
+                    else:
+                        problems.extend(f"{b['name']}: {p}" for p in
+                                        validate_template(tpl, header.get("system"),
+                                                          header.get("composition")))
                 try:
-                    expect = expected_geometry(header)
+                    expect = expected_geometry(header, tpl)
                     got = np.asarray(geom, dtype=float)
                     if got.shape != expect.shape or \
                             not np.allclose(got, expect, atol=1e-6, rtol=0.0):
@@ -965,7 +1183,16 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
         coinbases = [t for t in txs if t.get("type") == "coinbase"]
         if len(coinbases) != 1:
             problems.append(f"{b['name']}: coinbase-транзакций {len(coinbases)}, ожидается 1")
-        transfers = [t for t in txs if t.get("type") != "coinbase"]
+        templates = [t for t in txs if t.get("type") == "template"]
+        if len(templates) > MAX_TEMPLATES_PER_BLOCK:
+            problems.append(f"{b['name']}: шаблонов {len(templates)} > "
+                            f"{MAX_TEMPLATES_PER_BLOCK}")
+        for tx in templates:
+            problems.extend(f"{b['name']}: {p}" for p in
+                            validate_template(tx.get("template"),
+                                              header.get("system"),
+                                              header.get("composition")))
+        transfers = [t for t in txs if t.get("type") not in ("coinbase", "template")]
         if len(transfers) > MAX_TXS_PER_BLOCK:
             problems.append(f"{b['name']}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
@@ -974,6 +1201,8 @@ def verify_chain(element_dir: str, element: str | None = None) -> dict:
             tid = tx.get("txid") or txid_of(tx)
             if tid != txid_of(tx):
                 problems.append(f"{b['name']}: txid транзакции не совпадает с содержимым")
+            if tx.get("type") == "template":
+                continue
             problems.extend(f"{b['name']}: {p}" for p in invalid_outputs(tx))
             if tx.get("type") == "coinbase":
                 continue

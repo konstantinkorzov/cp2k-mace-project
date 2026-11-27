@@ -471,6 +471,8 @@ function renderMasters(all, alive, external) {
       </div>
       <div class="kv">
         <span>элемент <code>${esc(e.element)}</code></span>
+        ${e.template ? `<span>шаблон <code>${e.template.registered_at
+          ? 'в блоке ' + e.template.registered_at : 'ожидает включения'}</code></span>` : ''}
         <span>высота <code>${e.height == null ? '—' : e.height}</code></span>
         <span>очередь <code>${e.pending == null ? '—' : e.pending}</code></span>
         <span>в работе <code>${e.active == null ? '—' : e.active}</code></span>
@@ -499,6 +501,8 @@ function renderMasters(all, alive, external) {
         <div class="kv">
           <span>порт <code>${p.port || '—'}</code></span>
           <span>папка <code>${esc((p.dir || '').replace(overview.root + '/', ''))}</code></span>
+          ${info && info.template ? `<span>шаблон <code>${info.template.registered_at
+            ? 'в блоке ' + info.template.registered_at : 'ожидает включения'}</code></span>` : ''}
           ${info ? `<span>высота <code>${info.height == null ? '—' : info.height}</code></span>
           <span>очередь <code>${info.pending == null ? '—' : info.pending}</code></span>
           <span>в работе <code>${info.active == null ? '—' : info.active}</code></span>
