@@ -383,7 +383,10 @@ def main():
     parser.add_argument("--server", type=str, default=default_server, help="Хост сервера main.py")
     parser.add_argument("--retry-delay", type=int, default=RETRY_DELAY, help="Пауза между попытками подключения (сек)")
     parser.add_argument("--name", type=str, default=None,
-                        help="ярлык процесса для логов и панели (кошелёк задаётся паролем)")
+                        help="ярлык процесса для логов и панели")
+    parser.add_argument("--wallet", type=str, default=None,
+                        help="имя кошелька (иначе WORKER_WALLET); кошельки создаются "
+                             "явно: wallet.py create --name NAME")
     parser.add_argument("--password", type=str, default=None,
                         help="пароль кошелька воркера (иначе WORKER_PASSWORD или запрос)")
     parser.add_argument("--master", action="append", default=None,
@@ -417,13 +420,15 @@ def main():
     results_root = os.path.join(project_root, "results")
     log_dir = os.path.join(results_root, "worker_logs")
 
-    # Кошелёк — самостоятельная сущность: он не «воркерский». Воркер просто
-    # пользуется кошельком, который открывается его паролем (та же база
-    # results/keys.db). Имя ниже — ярлык процесса для логов и панели.
+    # Кошелёк — самостоятельная сущность: он не «воркерский» и не создаётся
+    # на лету. Воркер открывает кошелёк по имени и паролю (та же база
+    # results/keys.db). Имя процесса ниже — только ярлык для логов и панели.
     worker_name = args.name or identity.new_worker_name()
     conn = wallet_store.open_db(os.path.join(results_root, "keys.db"))
     try:
-        wallet, created = wallet_store.ensure_wallet(conn, _worker_password(args.password))
+        wallet = wallet_store.open_wallet(
+            conn, args.wallet or os.environ.get("WORKER_WALLET"),
+            _worker_password(args.password))
     except wallet_store.WalletError as e:
         print(f"✗ {e}")
         sys.exit(2)
@@ -441,9 +446,8 @@ def main():
     logger = setup_logger(worker_id, log_dir)
     logger.info(f"Воркер {worker_id} зарегистрирован (name={worker_name}, "
                 f"адрес={pubkey_hash[:16]}...). Логи: {log_dir}/{worker_id}.log")
-    if created:
-        logger.info("Кошелёк с таким паролем не найден — создан новый (пустой). "
-                    "Если пароль введён с опечаткой, монеты остались в старом кошельке")
+    logger.info(f"Кошелёк «{wallet.name}»: адресов {len(wallet.keys())}, "
+                f"награды идут на {key['address'][:16]}…")
 
     task_url = f"{base_url}/get-task"
     submit_url = f"{base_url}/submit-result"

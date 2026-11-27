@@ -108,6 +108,8 @@ exports.handle = function (app) {
     // кошелёк
     app.post('/api/wallet/info', onWalletInfo);
     app.post('/api/wallet/chains', onWalletChains);
+    app.post('/api/wallet/list', onWalletList);
+    app.post('/api/wallet/create', onWalletCreate);
     app.post('/api/wallet/send', onWalletSend);
     app.post('/api/wallet/passwd', onWalletPasswd);
     app.post('/api/wallet/newkey', onWalletNewKey);
@@ -179,7 +181,8 @@ async function onMasterStart(req, res) {
         const rec = await procs.startMaster({
             port: body.port,
             dir: body.dir,
-            password: body.password || 'master',
+            wallet: body.wallet,
+            password: body.password || '',
             peers: Array.isArray(body.peers) ? body.peers : [],
             name: body.name,
         });
@@ -194,7 +197,8 @@ async function onWorkerStart(req, res) {
         const body = req.body || {};
         const rec = await procs.startWorker({
             name: body.name,
-            password: body.password || 'worker',
+            wallet: body.wallet,
+            password: body.password || '',
             masters: Array.isArray(body.masters) ? body.masters : [],
         });
         res.json({ ok: true, process: rec });
@@ -341,6 +345,7 @@ async function onWalletInfo(req, res) {
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'info', '--results-root', root];
+        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         for (const url of (body.masters || [])) {
             if (url) args.push('--master', String(url));
@@ -348,6 +353,35 @@ async function onWalletInfo(req, res) {
         const out = await runPython(
             args,
             { WEBUI_WALLET_PASSWORD: String(body.password) }, 20000);
+        res.json(out);
+    } catch (e) {
+        bad(res, 500, String(e));
+    }
+}
+
+async function onWalletList(req, res) {
+    // Какие кошельки вообще есть: только имена, без секретов.
+    try {
+        const body = req.body || {};
+        const out = await runPython(
+            ['src/webwallet.py', 'list', '--results-root', walletRoot(body)], {}, 20000);
+        res.json(out);
+    } catch (e) {
+        bad(res, 500, String(e));
+    }
+}
+
+async function onWalletCreate(req, res) {
+    // Явное создание: имя + пароль. Ничего не создаётся само.
+    try {
+        const body = req.body || {};
+        const name = String(body.name || '').trim();
+        if (!name) return bad(res, 400, 'нужно имя кошелька');
+        if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
+        const args = ['src/webwallet.py', 'create', '--results-root', walletRoot(body),
+            '--name', name];
+        const out = await runPython(
+            args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
         res.json(out);
     } catch (e) {
         bad(res, 500, String(e));
@@ -380,6 +414,7 @@ async function onWalletSend(req, res) {
         if (body.fee !== undefined && body.fee !== null && body.fee !== '') {
             args.push('--fee', String(body.fee));
         }
+        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const masters = (body.masters || []).map((m) => String(m).trim()).filter(Boolean);
         for (const url of masters) args.push('--master', url);
@@ -397,6 +432,7 @@ async function onWalletNewKey(req, res) {
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
         const args = ['src/webwallet.py', 'newkey',
             '--results-root', walletRoot(body)];
+        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const out = await runPython(
             args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
@@ -415,6 +451,7 @@ async function onWalletPasswd(req, res) {
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'passwd', '--results-root', root,
             '--change-to', String(body.newPassword)];
+        if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const out = await runPython(args, { WEBUI_WALLET_PASSWORD: String(body.password) }, 30000);
         res.json(out);

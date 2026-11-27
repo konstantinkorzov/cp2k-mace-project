@@ -591,7 +591,7 @@ def chain_tests():
               sha1 == sha2 and rel1 == rel2 == f"blobs/{sha1}.wfn")
 
         conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
-        wallet, _ = wallet_store.ensure_wallet(conn, "root")
+        wallet = wallet_store.create_wallet(conn, "master", "root")
         master = wallet.latest_key()["address"]
         worker = "b" * 64
         cp2k = {"cp2k_version": "2024.3",
@@ -768,33 +768,43 @@ def chain_tests():
 
 
 def wallet_tests():
-    print("\n--- 22. Кошельки (без ролей: пароль = кошелёк) ---")
+    print("\n--- 22. Кошельки (имя + пароль; создание только явное) ---")
     tmp = tempfile.mkdtemp(prefix="wallet_test_")
     try:
+        def err(fn):
+            try:
+                fn()
+                return None
+            except Exception as e:  # noqa: BLE001
+                return e
+
         conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
-        m, created = wallet_store.ensure_wallet(conn, "root")
-        check("кошелёк создаётся по паролю", created)
-        again, created2 = wallet_store.ensure_wallet(conn, "root")
-        check("повторный запуск находит тот же кошелёк", not created2)
-        check("адрес кошелька не изменился",
-              again.latest_key()["address"] == m.latest_key()["address"])
+        check("свежая база — ни одного кошелька", wallet_store.list_wallets(conn) == [])
+        check("несуществующий кошелёк не открывается молча",
+              err(lambda: wallet_store.open_wallet(conn, "master", "root")) is not None)
 
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(wallets)")}
-        check("в кошельке нет роли и имени",
-              cols == {"id", "password_salt", "password_hash", "enc_salt", "created_at"})
+        m = wallet_store.create_wallet(conn, "master", "root")
+        check("кошелёк создаётся только явной командой",
+              m.name == "master" and len(m.keys()) == 1)
+        check("занятое имя — ошибка",
+              err(lambda: wallet_store.create_wallet(conn, "master", "other")) is not None)
+        check("короткий пароль не принимается",
+              err(lambda: wallet_store.create_wallet(conn, "short", "123")) is not None)
+        check("кривое имя не принимается",
+              err(lambda: wallet_store.create_wallet(conn, "bad name", "root")) is not None)
 
-        w, created_w = wallet_store.ensure_wallet(conn, "worker")
-        check("другой пароль — другой кошелёк", created_w)
-        rows = conn.execute("SELECT * FROM wallets").fetchall()
-        check("пароли с разными солями дают разные хэши",
-              len({r["password_hash"] for r in rows}) == 2)
-        check("адреса разных кошельков разные",
-              m.latest_key()["address"] != w.latest_key()["address"])
-
-        check("верный пароль находит кошелёк",
-              len(wallet_store.find_by_password(conn, "root")) == 1)
-        check("неверный пароль не находит ничего",
-              wallet_store.find_by_password(conn, "nope") == [])
+        w1 = wallet_store.create_wallet(conn, "worker1", "root")
+        w2 = wallet_store.create_wallet(conn, "worker2", "root")
+        check("один пароль открывает несколько кошельков",
+              wallet_store.unlock(conn, "worker1", "root") is not None
+              and wallet_store.unlock(conn, "worker2", "root") is not None)
+        check("у кошельков с общим паролем разные адреса",
+              w1.latest_key()["address"] != w2.latest_key()["address"])
+        check("чужой пароль не открывает",
+              wallet_store.unlock(conn, "worker1", "nope") is None)
+        e = err(lambda: wallet_store.open_wallet(conn, "worker1", "nope"))
+        check("ошибка пароля говорит, что пароль неверный",
+              e is not None and "неверный пароль" in str(e))
 
         addr = m.latest_key()["address"]
         sig = m.sign(addr, b"hello")
@@ -802,53 +812,61 @@ def wallet_tests():
               crypto.verify(m.public_for(addr), b"hello", sig))
 
         m.change_password("root", "newpass")
-        check("старый пароль после смены не работает",
-              wallet_store.find_by_password(conn, "root") == [])
-        m2 = wallet_store.WalletSet(wallet_store.find_by_password(conn, "newpass"))
+        check("старый пароль мастера после смены не работает",
+              wallet_store.unlock(conn, "master", "root") is None)
+        m2 = wallet_store.unlock(conn, "master", "newpass")
         check("новый пароль работает, ключи на месте",
-              m2.latest_key()["address"] == addr)
+              m2 is not None and m2.latest_key()["address"] == addr)
         sig2 = m2.sign(addr, b"x")
         check("ключи перешифрованы и подпись валидна",
               crypto.verify(m2.public_for(addr), b"x", sig2))
-        check("другой кошелёк не затронут",
-              len(wallet_store.find_by_password(conn, "worker")) == 1)
+        check("смена пароля одного кошелька не трогает другие",
+              wallet_store.unlock(conn, "worker1", "root") is not None
+              and wallet_store.unlock(conn, "worker2", "root") is not None)
+
+        names = {w["name"] for w in wallet_store.list_wallets(conn)}
+        check("список кошельков показывает имена", names == {"master", "worker1", "worker2"})
 
         element_dir = os.path.join(tmp, "element")
         os.makedirs(element_dir, exist_ok=True)
-        check("wallet.py находит кошелёк по паролю",
-              wallet.show(conn, "newpass", element_dir, 1) == 0)
-        check("wallet.py отвергает неверный пароль",
-              wallet.show(conn, "bad", element_dir, 1) == 1)
+        check("wallet.py показывает кошелёк по имени и паролю",
+              wallet.show(m2, element_dir, 1, "element") == 0)
 
-        # --- элемент = цепочка; старые записи под одним паролем = один кошелёк ---
+        # --- элемент = цепочка, панель: список/создание/выбор ---
         import webwallet
 
         os.makedirs(os.path.join(tmp, "Cu", "blocks"), exist_ok=True)
         os.makedirs(os.path.join(tmp, "Fe", "blocks"), exist_ok=True)
-        wallet_store._create(conn, "newpass")   # так наплодили старые версии
-        dup = wallet_store.find_by_password(conn, "newpass")
-        check("несколько записей под одним паролем — один кошелёк", len(dup) == 2)
-        view = wallet_store.WalletSet(dup)
-        check("кошелёк объединяет адреса всех записей",
-              len(view.addresses()) == 2
-              and view.addresses() == {k["address"] for k in view.keys()})
-        some = sorted(view.addresses())[0]
-        check("подпись адреса из любой записи проходит проверку",
-              crypto.verify(view.public_for(some), b"y", view.sign(some, b"y")))
+        listed = webwallet.list_wallets(tmp)
+        check("панель получает список кошельков без пароля",
+              listed.get("ok") and {w["name"] for w in listed["wallets"]}
+              == {"master", "worker1", "worker2"})
+        made = webwallet.create_wallet(tmp, "panelw", "pass1234")
+        check("панель создаёт кошелёк явно",
+              made.get("ok") and any(w["name"] == "panelw" for w in made["wallets"]))
+        check("панель не даёт создать дубль имени",
+              not webwallet.create_wallet(tmp, "panelw", "pass1234").get("ok"))
 
-        info = webwallet.collect(tmp, "newpass", 1, element="Cu")
-        check("панель показывает один кошелёк на пароль",
-              info.get("ok") and info.get("wallet")
-              and len(info["wallet"]["addresses"]) == 2)
+        info = webwallet.collect(tmp, "worker1", "root", 1, element="Cu")
+        check("кошелёк открывается по имени и паролю",
+              info.get("ok") and info["wallet"]["name"] == "worker1")
+        check("неверное имя — ошибка, без автосоздания",
+              not webwallet.collect(tmp, "nosuch", "root", 1, element="Cu").get("ok")
+              and "nosuch" not in {w["name"] for w in webwallet.list_wallets(tmp)["wallets"]})
         check("панель читает выбранную цепочку (элемент)",
               info.get("element") == "Cu")
         check("в каталоге видны обе цепочки (Cu и Fe)",
               {c["name"] for c in info["chains"]} >= {"Cu", "Fe"})
         check("чужой элемент (выход из каталога) отвергается",
-              not webwallet.collect(tmp, "newpass", 1, element="../etc").get("ok"))
-        got = webwallet.new_address(tmp, "newpass")
-        check("новый адрес добавляется в объединённый кошелёк",
-              got.get("ok") and len(got.get("addresses") or []) == 3)
+              not webwallet.collect(tmp, "worker1", "root", 1, element="../etc").get("ok"))
+        got = webwallet.new_address(tmp, "worker1", "root")
+        check("новый адрес добавляется в выбранный кошелёк",
+              got.get("ok") and len(got.get("addresses") or []) == 2)
+        changed = webwallet.change_password(tmp, "worker2", "root", "new2")
+        check("смена пароля из панели меняет только свой кошелёк",
+              changed.get("ok")
+              and wallet_store.unlock(conn, "worker2", "new2") is not None
+              and wallet_store.unlock(conn, "worker1", "root") is not None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

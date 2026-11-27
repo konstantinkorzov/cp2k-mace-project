@@ -151,81 +151,58 @@ def _output_value(element_dir: str, txid: str, vout: int) -> int:
     return _value_cache.get(key, 0.0)
 
 
-def show(conn, password: str, element_dir: str, confirmations: int,
+def _prompt(label: str) -> str:
+    import getpass
+    return getpass.getpass(label)
+
+
+def show(wallet, element_dir: str, confirmations: int,
          element_name: str = "") -> int:
-    wallets = wallet_store.find_by_password(conn, password)
-    if not wallets:
-        print("✗ Пароль не подходит ни к одному кошельку")
-        return 1
-
     chain_name = element_name or os.path.basename(os.path.abspath(element_dir))
-    for view in (wallet_store.WalletSet(wallets),):
-        keys = view.keys()
-        addrs = view.addresses()
-        print("=" * 70)
-        print(f"Кошелёк   ·   цепочка: {chain_name}")
-        print(f"Адресов: {len(keys)}")
-        for k in keys:
-            print(f"  {k['address']}  (создан {k['created_at']})")
+    keys = wallet.keys()
+    addrs = wallet.addresses()
+    print("=" * 70)
+    print(f"Кошелёк «{wallet.name}»   ·   цепочка: {chain_name}")
+    print(f"Адресов: {len(keys)}")
+    for k in keys:
+        print(f"  {k['address']}  (создан {k['created_at']})")
 
-        bal = chain.balances(element_dir, addrs, confirmations)
-        print("\nБалансы:")
-        if not bal:
-            print("  (пусто)")
-        for a, b in bal.items():
-            print(f"  {a[:16]}…  доступно {b['available']:>10.2f}  "
-                  f"pending {b['pending']:>8.2f}  всего {b['total']:>10.2f}")
+    bal = chain.balances(element_dir, addrs, confirmations)
+    print("\nБалансы:")
+    if not bal:
+        print("  (пусто)")
+    for a, b in bal.items():
+        print(f"  {a[:16]}…  доступно {b['available']:>10.2f}  "
+              f"pending {b['pending']:>8.2f}  всего {b['total']:>10.2f}")
 
-        print("\nТранзакции:")
-        rows = _transactions(element_dir, addrs)
-        if not rows:
-            print("  (нет)")
-        for r in rows:
-            if r["received"]:
-                sign = f"+{r['received']:.2f}"
-            else:
-                sign = f"-{r['sent']:.2f}"
-            print(f"  блок {r['block']:>3}  {r['type']:<8} {sign:>10}  "
-                  f"подтв. {r['confirmations']:>3}  {r['txid'][:16]}…"
-                  + (f"  комиссия {r['fee']:.8f}" if r["fee"] else ""))
+    print("\nТранзакции:")
+    rows = _transactions(element_dir, addrs)
+    if not rows:
+        print("  (нет)")
+    for r in rows:
+        if r["received"]:
+            sign = f"+{r['received']:.2f}"
+        else:
+            sign = f"-{r['sent']:.2f}"
+        print(f"  блок {r['block']:>3}  {r['type']:<8} {sign:>10}  "
+              f"подтв. {r['confirmations']:>3}  {r['txid'][:16]}…"
+              + (f"  комиссия {r['fee']:.8f}" if r["fee"] else ""))
     return 0
 
 
-def send_coins(wallet, element_dir: str, to: str, amount: int, fee: int,
-               masters: list[str], confirmations: int) -> int:
-    tx = chain.build_wallet_transfer(wallet, element_dir, to, amount, fee=fee,
-                                     confirmations=confirmations)
-    if tx is None:
-        print("✗ Недостаточно подтверждённых средств на адресах кошелька")
-        return 1
-
-    tid = tx["txid"]
-    print(f"Транзакция {tid}")
-    print(f"  входов: {len(tx['inputs'])}, выходов: {len(tx['outputs'])}, "
-          f"комиссия: {fee:g}")
-    for o in tx["outputs"]:
-        print(f"  → {o['address'][:16]}…  {o['value']:g}")
-
-    for url in masters:
-        try:
-            r = requests.post(url.rstrip("/") + "/tx/submit", json={"tx": tx},
-                              timeout=30)
-            if r.status_code == 200 and r.json().get("status") == "accepted":
-                print(f"✓ Принята мастером {url}")
-                return 0
-            print(f"  {url}: {r.status_code} {r.text[:120]}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  {url}: {e}")
-    print("✗ Ни один мастер не принял транзакцию")
-    return 1
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Кошелёк: балансы, транзакции и смена пароля")
-    ap.add_argument("--db", default=DEFAULT_DB, help=f"база кошельков (по умолчанию {DEFAULT_DB})")
-    ap.add_argument("--password", default=None, help="пароль (иначе запрос)")
+    ap = argparse.ArgumentParser(
+        description="Кошелёк: создание, балансы, переводы, смена пароля")
+    ap.add_argument("--db", default=DEFAULT_DB,
+                    help=f"база кошельков (по умолчанию {DEFAULT_DB})")
+    ap.add_argument("--list", action="store_true", help="список кошельков (имена)")
+    ap.add_argument("--create", metavar="NAME", default=None,
+                    help="создать кошелёк с этим именем (пароль — --password или запрос)")
+    ap.add_argument("--wallet", "--name", dest="wallet", default=None,
+                    help="имя кошелька для операций с балансом")
+    ap.add_argument("--password", default=None, help="пароль кошелька (иначе запрос)")
     ap.add_argument("--change-to", default=None,
-                    help="новый пароль (меняется для всего кошелька целиком)")
+                    help="новый пароль для этого кошелька")
     ap.add_argument("--element", "--system", dest="element", default=None,
                     help="элемент/система: цепочка results/<element> "
                          "(по умолчанию system.name из config.json)")
@@ -251,22 +228,46 @@ def main():
               f"(применится к следующему запуску мастера)")
         return
 
-    password = args.password
-    if not password:
-        import getpass
-        password = getpass.getpass("Пароль: ")
-
     conn = wallet_store.open_db(args.db)
 
+    if args.list:
+        rows = wallet_store.list_wallets(conn)
+        if not rows:
+            print("кошельков нет — создайте: python3 src/wallet.py --create NAME")
+            return
+        for w in rows:
+            print(f"  {w['name']:<24} адресов {w['keys']:>3}   создан {w['created_at']}")
+        return
+
+    if args.create:
+        password = args.password or _prompt("Новый пароль: ")
+        if not args.password:
+            if _prompt("Повторите пароль: ") != password:
+                print("✗ пароли не совпадают", file=sys.stderr)
+                sys.exit(2)
+        try:
+            made = wallet_store.create_wallet(conn, args.create, password)
+        except wallet_store.WalletError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            sys.exit(2)
+        print(f"✓ кошелёк «{made.name}» создан, адрес {made.latest_key()['address']}")
+        return
+
+    if not args.wallet:
+        print("✗ нужно имя кошелька: --wallet NAME "
+              "(список — --list, создать — --create NAME)", file=sys.stderr)
+        sys.exit(2)
+
+    password = args.password or _prompt(f"Пароль кошелька «{args.wallet}»: ")
+    try:
+        wallet = wallet_store.open_wallet(conn, args.wallet, password)
+    except wallet_store.WalletError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        sys.exit(1)
+
     if args.change_to:
-        wallets = wallet_store.find_by_password(conn, password)
-        if not wallets:
-            print("✗ Пароль не подходит ни к одному кошельку")
-            sys.exit(1)
-        for w in wallets:
-            w.change_password(password, args.change_to)
-        print(f"✓ Пароль изменён (записей: {len(wallets)}, ключей: "
-              f"{sum(len(w.keys()) for w in wallets)})")
+        wallet.change_password(password, args.change_to)
+        print(f"✓ Пароль кошелька «{wallet.name}» изменён")
         return
 
     if args.confirmations is not None:
@@ -285,17 +286,12 @@ def main():
         if args.amount is None or args.amount <= 0:
             print("✗ Нужна положительная сумма: --amount", file=sys.stderr)
             sys.exit(2)
-        wallets = wallet_store.find_by_password(conn, password)
-        if not wallets:
-            print("✗ Пароль не подходит ни к одному кошельку")
-            sys.exit(1)
-        wallet = wallet_store.WalletSet(wallets)
         masters = [m.rstrip("/") for m in (args.master or
                    [os.environ.get("MASTER_URL", "http://127.0.0.1:8000")]) if m]
         sys.exit(send_coins(wallet, element_dir, args.send_to, args.amount,
                             args.fee, masters, confirmations))
 
-    sys.exit(show(conn, password, element_dir, confirmations, element))
+    sys.exit(show(wallet, element_dir, confirmations, element))
 
 
 if __name__ == "__main__":

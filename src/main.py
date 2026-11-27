@@ -371,6 +371,9 @@ def get_args():
                         help="порт FastAPI-сервера (иначе port из config.json или 8000)")
     parser.add_argument("--password", type=str, default=None,
                         help="пароль кошелька мастера (иначе MASTER_PASSWORD или запрос)")
+    parser.add_argument("--wallet", type=str, default=None,
+                        help="имя кошелька мастера (иначе MASTER_WALLET); кошельки "
+                             "создаются явно: wallet.py create --name NAME")
     parser.add_argument("--peer", action="append", default=None,
                         help="URL другого мастера для синхронизации (можно несколько)")
     parser.add_argument("--results-dir", default=None,
@@ -2817,21 +2820,21 @@ def _main_impl():
     _load_mempool()
     _load_template(CONFIG)
 
-    # Кошелёк мастера: пароль — --password / MASTER_PASSWORD / запрос.
-    # Кошелёк не «мастерский»: мастер просто пользуется им, как и воркер.
+    # Кошелёк мастера: --wallet NAME + --password / MASTER_PASSWORD.
+    # Кошелёк — самостоятельная сущность и НЕ создаётся на лету: только явно
+    # (wallet.py create / кнопка «Создать» в панели). Опечатка в имени не должна
+    # молча заводить пустой кошелёк и уводить туда эмиссию.
     conn = wallet_store.open_db(CONFIG["wallet_store_db"])
     CONFIG["wallet_conn"] = conn
+    wallet_name = args.wallet or os.environ.get("MASTER_WALLET")
     try:
-        wallet, created = wallet_store.ensure_wallet(conn, _master_password())
+        wallet = wallet_store.open_wallet(conn, wallet_name, _master_password())
     except wallet_store.WalletError as e:
         print(f"[Master] ✗ {e}")
         sys.exit(2)
     CONFIG["wallet"] = wallet
-    if created:
-        print("[Master] ⚠ кошелёк с таким паролем не найден — создан НОВЫЙ (пустой). "
-              "Если это опечатка, монеты остались в старом кошельке")
     mkey = wallet.latest_key()
-    print(f"[Master] Кошелёк: адресов {len(wallet.keys())}, "
+    print(f"[Master] Кошелёк «{wallet.name}»: адресов {len(wallet.keys())}, "
           f"ключ #{mkey['id']}: {mkey['address']}")
     print(f"[Master] Подтверждений до доступности баланса: "
           f"{CONFIG.get('coinbase_confirmations')}")

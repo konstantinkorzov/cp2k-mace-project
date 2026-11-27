@@ -91,17 +91,15 @@ docker exec -it cp2k-mace-cpu python3 src/worker.py \
 
 | Вкладка | Что делает |
 |---|---|
-| **Мастер** | Запуск/остановка; порт — «авто» (свободный с 8000) или явно; каталог результатов выбирает код (`results`, затем `results-<порт>`), пароль кошелька — по умолчанию `master`; очередь, высота цепочки, пиры (добавить/удалить), «Настройки» (`src/config.json`). |
-| **Воркер** | Запуск/остановка; имя — ярлык процесса (кошелёк задаётся паролем); список мастеров галочками (панель + пиры); чекбокс «подробный лог CP2K» (только для этого запуска); живой лог SCF и лог CP2K. |
+| **Мастер** | Запуск/остановка; порт — «авто» (свободный с 8000) или явно; каталог результатов выбирает код (`results`, затем `results-<порт>`); кошелёк выбирается по имени + пароль (создаётся на вкладке «Кошелёк»); очередь, высота цепочки, пиры (добавить/удалить), «Настройки» (`src/config.json`). |
+| **Воркер** | Запуск/остановка; имя — ярлык процесса, отдельно выбираются кошелёк и пароль; список мастеров галочками (панель + пиры); чекбокс «подробный лог CP2K» (только для этого запуска); живой лог SCF и лог CP2K. |
 | **MACE** | Запуск `mace_pipeline/run_mace.py` и его лог. |
-| **Кошелёк** | Одна вкладка: кошелёк — самостоятельная сущность, роли у него нет (мастер и воркер просто пользуются им). **Пароль — это кошелёк**: все его адреса дают один баланс и одну историю. **«Система (элемент)»** — отдельная цепочка, как отдельный металл: у Cu и Fe свои монеты, свой UTXO и своя высота; монеты одной цепочки в другой не тратятся. Детали tx по клику, перевод **всем известным мастерам**, **«＋ адрес»**. |
+| **Кошелёк** | Кошелёк — самостоятельная сущность, роли у него нет (мастер и воркер просто пользуются им). **Ничего не создаётся само:** по умолчанию список пуст, кошелёк появляется по кнопке «Создать» (имя + пароль). Имя — идентификатор, пароль — ключ; **пароль может быть общим у нескольких кошельков**. **«Система (элемент)»** — отдельная цепочка, как отдельный металл: у Cu и Fe свои монеты, свой UTXO и своя высота; монеты одной цепочки в другой не тратятся. Детали tx по клику, перевод **всем известным мастерам**, **«＋ адрес»**. |
 
 Панель слушает **HTTPS :8443** и **HTTP :8080** (`WEBUI_PORT`), сертификат создаётся
-при первом запуске. Пароль кошелька задаётся при его создании: `root` — если
-мастер/воркер запускались из CLI, `master` / `worker` — если из панели. Меняется
-на вкладке кошелька (сразу для всех адресов этой роли).
-Если база создана раньше с паролем `root`, панель скажет «пароль не подходит» —
-введите `root` или смените пароль во вкладке кошелька.
+при первом запуске. Кошельков изначально нет: создайте нужный на вкладке «Кошелёк»
+(или `python3 src/wallet.py --create NAME`) и выберите его при запуске мастера/воркера.
+Без кошелька мастер и воркер не стартуют — сообщение об этом видно в логе.
 
 **Вход в панель обязателен.** Пароль администратора хранится scrypt-хэшем в
 `results/webui.db` (не в открытом виде). При первом запуске он генерируется и
@@ -159,14 +157,15 @@ flowchart LR
 ### Мастер: main.py
 
 ```bash
-python3 src/main.py --port 8000 --password root \
+python3 src/main.py --port 8000 --wallet master --password root \
     --peer http://127.0.0.1:8001 --results-dir /workspace/results2
 ```
 
 | Флаг / env | По умолчанию | Смысл |
 |---|---|---|
 | `--port` | `port` из `config.json`, иначе 8000 | порт HTTP API |
-| `--password` / `MASTER_PASSWORD` | запрос в консоли | пароль кошелька мастера |
+| `--wallet` / `MASTER_WALLET` | — | имя кошелька мастера (обязательно; создаётся явно) |
+| `--password` / `MASTER_PASSWORD` | запрос в консоли | пароль этого кошелька |
 | `--peer URL` (можно несколько) / `MASTER_PEERS` | пусто | другие мастера для синхронизации |
 | `--results-dir` / `MASTER_RESULTS_DIR` | `results` | каталог цепочки, кошельков и логов |
 | `MASTER_ADMIN_TOKEN` | — | **устарел:** админ-API теперь только с localhost |
@@ -174,14 +173,15 @@ python3 src/main.py --port 8000 --password root \
 ### Воркер: worker.py
 
 ```bash
-python3 src/worker.py --name worker1 --password root \
+python3 src/worker.py --name worker1 --wallet worker1 --password root \
     --master http://127.0.0.1:8000 --master http://127.0.0.1:8001
 ```
 
 | Флаг / env | По умолчанию | Смысл |
 |---|---|---|
-| `--name` | генерируется | имя воркера = имя кошелька (уникальное) |
-| `--password` / `WORKER_PASSWORD` | запрос в консоли | пароль кошелька воркера |
+| `--name` | генерируется | ярлык процесса для логов и панели |
+| `--wallet` / `WORKER_WALLET` | — | имя кошелька воркера (обязательно) |
+| `--password` / `WORKER_PASSWORD` | запрос в консоли | пароль этого кошелька |
 | `--master URL` (можно несколько) / `WORKER_MASTERS` | `http://<server>:<port>` | мастера; первый — основной |
 | `--server` / `MASTER_HOST`, `--port` / `MASTER_PORT` | `host.docker.internal`, `8000` | адрес основного мастера, если не задан `--master` |
 | `--verbose` / `--no-verbose` | как передал мастер | печатать шаги SCF для этого запуска воркера |
@@ -423,30 +423,38 @@ python3 src/master-cli.py sync
 ### wallet.py и webwallet.py
 
 ```bash
-# кошелёк по паролю: роль, адреса, балансы, транзакции с подтверждениями
-python3 src/wallet.py --password root
+# какие кошельки есть (только имена)
+python3 src/wallet.py --list
+
+# создать кошелёк: имя + пароль (только так; мастер и воркер ничего не создают)
+python3 src/wallet.py --create master --password root
+
+# кошелёк по имени и паролю: адреса, балансы, транзакции с подтверждениями
+python3 src/wallet.py --wallet master --password root
 
 # то же по конкретной цепочке (элементу): results/<element>
-python3 src/wallet.py --password root --element Fe
+python3 src/wallet.py --wallet master --password root --element Fe
 
 # настройка кошелька: сколько блоков ждать до доступности монет
 python3 src/wallet.py --set-confirmations 2
 
-# новый адрес (ключ) в кошельке; JSON-версия для панели — webwallet.py newkey
-python3 src/webwallet.py newkey --password root
+# новый адрес (ключ) в кошельке
+python3 src/webwallet.py newkey --name worker1 --password root
 
 # JSON-версия (та же логика; её использует веб-панель)
-python3 src/webwallet.py info --password root \
+python3 src/webwallet.py list
+python3 src/webwallet.py create --name worker1 --password root
+python3 src/webwallet.py info --name master --password root \
     --master http://127.0.0.1:8000
-python3 src/webwallet.py info --password root --element Fe
+python3 src/webwallet.py info --name master --password root --element Fe
 python3 src/webwallet.py tx --txid <txid> --master http://127.0.0.1:8000
 
 # перевод (уйдёт всем перечисленным мастерам)
-python3 src/wallet.py --password root --send-to <адрес> --amount 5 \
+python3 src/wallet.py --wallet master --password root --send-to <адрес> --amount 5 \
     --master http://127.0.0.1:8000 --master http://127.0.0.1:8001
 
-# смена пароля
-python3 src/wallet.py --password old --change-to new
+# смена пароля одного кошелька (другие не затрагиваются)
+python3 src/wallet.py --wallet master --password old --change-to new
 ```
 
 ### HTTP API мастера

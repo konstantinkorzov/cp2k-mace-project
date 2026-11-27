@@ -2,27 +2,31 @@
 """
 Единое хранилище кошельков мастера и воркеров (SQLite).
 
-Одна база (по умолчанию results/keys.db) хранит кошельки — БЕЗ ролей:
+Одна база (по умолчанию results/keys.db) хранит кошельки:
 
-    wallets(id, password_salt, password_hash, enc_salt, created_at)
+    wallets(id, name UNIQUE, password_salt, password_hash, enc_salt, created_at)
     wallet_keys(id, wallet_id, created_at, public_key, address UNIQUE, enc_private)
 
 Кошелёк — самостоятельная сущность: мастер это или воркер, решает процесс,
-который им пользуется, а не деньги. Пароль и есть кошелёк: один пароль —
-один кошелёк со всеми его адресами.
+который им пользуется, а не деньги. Кошелёк задаётся парой «имя + пароль»:
+имена разные, а пароль может быть общим — один пароль на несколько кошельков.
+
+По умолчанию в базе НЕТ ни одного кошелька: он появляется только по явной
+команде `wallet.py create` (или кнопкой «Создать» в панели). Ни мастер, ни
+воркер кошельки не создают.
 
 * Пароль проверяется по scrypt(password, password_salt).
 * Приватные ключи (Ed25519 seed) шифруются ключом scrypt(password, enc_salt)
   (encrypt-then-MAC, см. src/crypto.py) — в базе открытого ключа нет.
-* Соли случайные: один и тот же пароль в двух разных базах (на разных
-  машинах) даёт разные ключи шифрования и разные адреса.
-* Пароль по умолчанию — «root»; меняется командой master-cli passwd или
-  wallet.py (в панели — «Сменить пароль кошелька»).
+* Соли случайные: один и тот же пароль в двух разных кошельках (или базах)
+  даёт разные ключи шифрования и разные адреса.
+* Пароль меняется командой wallet.py --change-to (в панели — «Сменить пароль»).
 
 Криптография только stdlib (scrypt/HMAC/SHA-256/Ed25519 из crypto.py).
 """
 
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -34,6 +38,7 @@ DEFAULT_PASSWORD = "root"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wallets (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT    NOT NULL UNIQUE,
     password_salt BLOB    NOT NULL,
     password_hash BLOB    NOT NULL,
     enc_salt      BLOB    NOT NULL,
@@ -61,6 +66,7 @@ class Wallet:
     def __init__(self, conn: sqlite3.Connection, row: sqlite3.Row, password: str):
         self.conn = conn
         self.id = row["id"]
+        self.name = row["name"]
         self._enc_key = crypto.kdf(password, row["enc_salt"])
 
     # ---- ключи ----
@@ -153,29 +159,39 @@ def open_db(path: str) -> sqlite3.Connection:
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """
-    Старые базы хранили у кошелька роль и имя. Роль — свойство процесса, а не
-    денег, поэтому колонки убираем. Ключи, пароли и id сохраняются: записи
-    wallet_keys продолжают ссылаться на те же кошельки.
+    Приводим старые базы к текущей схеме. Ключи, пароли и id не трогаем:
+    записи wallet_keys продолжают ссылаться на те же кошельки.
+
+      * v1 (role + name): роль — свойство процесса, а не денег; убираем её,
+        имя оставляем (оно и есть идентификатор кошелька);
+      * v2 (без имени): имя потерялось при миграции — подставляем техническое
+        «wallet-<id>», пользователь может задать своё командой rename.
     """
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(wallets)")}
-    if "role" not in cols and "name" not in cols:
+    if "role" in cols:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
+            """
+            CREATE TABLE wallets_v3 (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT    NOT NULL UNIQUE,
+                password_salt BLOB    NOT NULL,
+                password_hash BLOB    NOT NULL,
+                enc_salt      BLOB    NOT NULL,
+                created_at    TEXT    NOT NULL
+            );
+            INSERT INTO wallets_v3 (id, name, password_salt, password_hash, enc_salt, created_at)
+                SELECT id, name, password_salt, password_hash, enc_salt, created_at FROM wallets;
+            DROP TABLE wallets;
+            ALTER TABLE wallets_v3 RENAME TO wallets;
+            """)
+        conn.commit()
         return
-    conn.execute("PRAGMA foreign_keys = OFF")
-    conn.executescript(
-        """
-        CREATE TABLE wallets_v2 (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            password_salt BLOB    NOT NULL,
-            password_hash BLOB    NOT NULL,
-            enc_salt      BLOB    NOT NULL,
-            created_at    TEXT    NOT NULL
-        );
-        INSERT INTO wallets_v2 (id, password_salt, password_hash, enc_salt, created_at)
-            SELECT id, password_salt, password_hash, enc_salt, created_at FROM wallets;
-        DROP TABLE wallets;
-        ALTER TABLE wallets_v2 RENAME TO wallets;
-        """)
-    conn.commit()
+    if "name" not in cols:
+        conn.execute("ALTER TABLE wallets ADD COLUMN name TEXT")
+        conn.execute("UPDATE wallets SET name = 'wallet-' || id")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_wallets_name ON wallets(name)")
+        conn.commit()
 
 
 def _check_password(row: sqlite3.Row, password: str) -> bool:
@@ -183,92 +199,84 @@ def _check_password(row: sqlite3.Row, password: str) -> bool:
     return digest == row["password_hash"]
 
 
-def _create(conn, password: str) -> Wallet:
+MIN_PASSWORD = 4
+NAME_RE = re.compile(r"^[\w.+-]{1,64}$")
+
+
+def _check_name(name: str) -> str:
+    name = str(name or "").strip()
+    if not NAME_RE.match(name):
+        raise WalletError("имя кошелька: 1–64 символа, буквы/цифры/точка/дефис/подчёркивание, без пробелов")
+    return name
+
+
+def _create(conn, name: str, password: str) -> Wallet:
+    name = _check_name(name)
     pw_salt, pw_hash = crypto.hash_password(password)
     enc_salt = os.urandom(16)
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    cur = conn.execute(
-        "INSERT INTO wallets (password_salt, password_hash, enc_salt, created_at) "
-        "VALUES (?, ?, ?, ?)", (pw_salt, pw_hash, enc_salt, created_at))
-    conn.commit()
+    try:
+        cur = conn.execute(
+            "INSERT INTO wallets (name, password_salt, password_hash, enc_salt, created_at) "
+            "VALUES (?, ?, ?, ?, ?)", (name, pw_salt, pw_hash, enc_salt, created_at))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise WalletError(f"кошелёк «{name}» уже существует")
     row = conn.execute("SELECT * FROM wallets WHERE id = ?", (cur.lastrowid,)).fetchone()
     wallet = Wallet(conn, row, password)
     wallet.add_key()  # первый ключ создаётся сразу
     return wallet
 
 
-def find_by_password(conn, password: str) -> list[Wallet]:
-    """Все записи, которые открывает пароль (старые базы могли наплодить их)."""
-    out = []
-    for row in conn.execute("SELECT * FROM wallets ORDER BY id").fetchall():
-        if _check_password(row, password):
-            out.append(Wallet(conn, row, password))
-    return out
-
-
-class WalletSet:
+def create_wallet(conn, name: str, password: str) -> Wallet:
     """
-    Кошелёк = пароль. В базе под одним паролем может оказаться несколько
-    записей (старые версии создавали отдельную запись на мастера и на каждого
-    воркера). Для владельца это ОДИН кошелёк: общий набор адресов, общий
-    баланс, общая история. Роли здесь нет — ею пользуется процесс.
+    Явное создание кошелька. Автосоздания нет нигде: ни в мастере, ни в
+    воркере, ни в панели — только по команде пользователя.
     """
-
-    def __init__(self, wallets: list):
-        self.wallets = list(wallets)
-        self.primary = max(self.wallets, key=lambda w: w.id) if self.wallets else None
-
-    def keys(self) -> list[dict]:
-        out = []
-        for w in self.wallets:
-            out += w.keys()
-        return sorted(out, key=lambda k: k["id"])
-
-    def addresses(self) -> set[str]:
-        return {k["address"] for k in self.keys()}
-
-    def latest_key(self) -> dict | None:
-        keys = self.keys()
-        return keys[-1] if keys else None
-
-    def add_key(self) -> dict:
-        if self.primary is None:
-            raise WalletError("пустой кошелёк")
-        return self.primary.add_key()
-
-    def _owner(self, address: str) -> Wallet:
-        for w in self.wallets:
-            if address in w.addresses():
-                return w
-        raise WalletError(f"адрес {address} не принадлежит кошельку")
-
-    def public_for(self, address: str) -> bytes:
-        return self._owner(address).public_for(address)
-
-    def sign(self, address: str, message: bytes) -> bytes:
-        return self._owner(address).sign(address, message)
-
-    def change_password(self, old: str, new: str):
-        # Пароль один на все записи кошелька — меняем сразу у всех, иначе
-        # часть адресов осталась бы за старым паролем.
-        for w in self.wallets:
-            w.change_password(old, new)
+    name = _check_name(name)
+    password = str(password or "")
+    if len(password) < MIN_PASSWORD:
+        raise WalletError(f"пароль кошелька короче {MIN_PASSWORD} символов")
+    return _create(conn, name, password)
 
 
-def ensure_wallet(conn, password: str | None = None) -> tuple[WalletSet, bool]:
+def unlock(conn, name: str, password: str) -> Wallet | None:
+    """Кошелёк по имени и паролю (имя — идентификатор, пароль — ключ)."""
+    row = conn.execute("SELECT * FROM wallets WHERE name = ?",
+                       (str(name or "").strip(),)).fetchone()
+    if row is None or not _check_password(row, password):
+        return None
+    return Wallet(conn, row, password)
+
+
+def list_wallets(conn) -> list[dict]:
+    """Имена кошельков для панели (секретов здесь нет)."""
+    rows = conn.execute(
+        "SELECT w.id, w.name, w.created_at, "
+        "(SELECT COUNT(*) FROM wallet_keys k WHERE k.wallet_id = w.id) AS keys "
+        "FROM wallets w ORDER BY w.name COLLATE NOCASE").fetchall()
+    return [dict(r) for r in rows]
+
+
+def open_wallet(conn, name: str, password: str) -> Wallet:
     """
-    (кошелёк, создан_ли_сейчас). Пароль и есть кошелёк: если он уже есть —
-    возвращаем его, иначе создаём новый пустой.
-
-    Опечатка в пароле неотличима от нового кошелька — поэтому вызывающий
-    обязан сказать пользователю, что кошелёк создан с нуля (иначе «пропавший»
-    баланс будет искать в поддержке).
+    Открыть существующий кошелёк. Если его нет — понятная ошибка, а не
+    создание пустого: опечатка в имени не должна стоить потерянных монет.
     """
-    pw = password or DEFAULT_PASSWORD
-    matched = find_by_password(conn, pw)
-    if matched:
-        return WalletSet(matched), False
-    return WalletSet([_create(conn, pw)]), True
+    name = str(name or "").strip()
+    if not name:
+        raise WalletError("нужно имя кошелька (--wallet NAME); список: wallet.py list")
+    row = conn.execute("SELECT * FROM wallets WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        names = [w["name"] for w in list_wallets(conn)]
+        hint = ("кошельков пока нет — создайте: "
+                f"python3 src/wallet.py create --name {name}")
+        if names:
+            hint = "есть: " + ", ".join(names)
+        raise WalletError(f"кошелёк «{name}» не найден ({hint})")
+    if not _check_password(row, password):
+        raise WalletError(f"неверный пароль кошелька «{name}»")
+    return Wallet(conn, row, password)
 
 
 if __name__ == "__main__":
@@ -276,7 +284,7 @@ if __name__ == "__main__":
 
     conn = open_db(os.path.join("results", "keys.db"))
     rows = conn.execute(
-        "SELECT w.id, w.created_at, "
+        "SELECT w.id, w.name, w.created_at, "
         "(SELECT COUNT(*) FROM wallet_keys k WHERE k.wallet_id = w.id) AS keys "
-        "FROM wallets w ORDER BY w.id").fetchall()
+        "FROM wallets w ORDER BY w.name").fetchall()
     print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))

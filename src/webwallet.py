@@ -185,15 +185,37 @@ def list_chains(root: str) -> dict:
     return {"ok": True, "root": root, "element": current, "chains": out}
 
 
-def collect(root: str, password: str, confirmations: int,
+def list_wallets(root: str) -> dict:
+    """Имена кошельков для панели (без секретов: имя — не тайна)."""
+    root = _root(root)
+    db_path = os.path.join(root, "keys.db")
+    if not os.path.exists(db_path):
+        return {"ok": True, "root": root, "wallets": []}
+    conn = wallet_store.open_db(db_path)
+    return {"ok": True, "root": root, "wallets": wallet_store.list_wallets(conn)}
+
+
+def create_wallet(root: str, name: str, password: str) -> dict:
+    """Явное создание кошелька из панели. Автосоздания нигде нет."""
+    root = _root(root)
+    conn = wallet_store.open_db(os.path.join(root, "keys.db"))
+    try:
+        wallet = wallet_store.create_wallet(conn, name, password)
+    except wallet_store.WalletError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "name": wallet.name,
+            "address": wallet.latest_key()["address"],
+            "wallets": wallet_store.list_wallets(conn)}
+
+
+def collect(root: str, name: str, password: str, confirmations: int,
             masters: list[str] | None = None,
             element: str | None = None) -> dict:
     """
-    Кошелёк по паролю в выбранной цепочке.
+    Кошелёк по имени и паролю в выбранной цепочке.
 
-    Кошелёк — самостоятельная сущность: роли у него нет, поэтому здесь нет
-    ни role, ни name. Один пароль — один кошелёк (если старые базы наплодили
-    несколько записей под ним, они объединяются: общий баланс и история).
+    Кошелёк — самостоятельная сущность: роли у него нет. Имя — идентификатор
+    (можно иметь несколько кошельков с одним паролем), пароль — ключ.
     """
     root = _root(root)
     db_path = os.path.join(root, "keys.db")
@@ -210,16 +232,15 @@ def collect(root: str, password: str, confirmations: int,
     tip = (chain.next_seq(element_dir) - 1) if os.path.isdir(element_dir) else 0
     tip = max(0, tip)
 
-    wallets = wallet_store.find_by_password(conn, password)
-    if not wallets:
+    try:
+        wallet = wallet_store.open_wallet(conn, name, password)
+    except wallet_store.WalletError as e:
         return {"ok": False, "root": root, "element": element, "height": tip,
-                "error": "пароль не подходит ни к одному кошельку (новый пароль "
-                         "создаёт новый пустой кошелёк)",
-                "wallet": None, "chains": list_chains(root)["chains"]}
+                "error": str(e), "wallet": None,
+                "chains": list_chains(root)["chains"]}
 
-    view = wallet_store.WalletSet(wallets)
-    keys = view.keys()
-    addresses = view.addresses()
+    keys = wallet.keys()
+    addresses = wallet.addresses()
 
     balances, txs = {}, []
     mempool = _mempool(masters, element)
@@ -251,6 +272,7 @@ def collect(root: str, password: str, confirmations: int,
 
     return {"ok": True, "root": root, "element": element, "height": tip,
             "wallet": {
+                "name": wallet.name,
                 "addresses": [{"address": k["address"],
                                "created_at": k["created_at"]} for k in keys],
                 "balances": balances,
@@ -385,7 +407,7 @@ def locked_utxos(masters: list[str] | None,
     return locked
 
 
-def send(root: str, password: str, to: str, amount: int, fee: int,
+def send(root: str, name: str, password: str, to: str, amount: int, fee: int,
          masters: list[str], confirmations: int,
          element: str | None = None) -> dict:
     root = _root(root)
@@ -397,10 +419,10 @@ def send(root: str, password: str, to: str, amount: int, fee: int,
     if not os.path.isdir(element_dir):
         return {"ok": False, "error": f"нет цепочки {element}: {element_dir}"}
 
-    wallets = wallet_store.find_by_password(conn, password)
-    if not wallets:
-        return {"ok": False, "error": "пароль не подходит ни к одному кошельку"}
-    wallet = wallet_store.WalletSet(wallets)
+    try:
+        wallet = wallet_store.open_wallet(conn, name, password)
+    except wallet_store.WalletError as e:
+        return {"ok": False, "error": str(e)}
 
     tx = chain.build_wallet_transfer(wallet, element_dir, to, amount, fee=fee,
                                      confirmations=confirmations,
@@ -415,7 +437,6 @@ def send(root: str, password: str, to: str, amount: int, fee: int,
     for url in masters:
         url = url.rstrip("/")
         try:
-            import requests
             r = requests.post(url + "/tx/submit", json={"tx": tx}, timeout=30)
             body = {}
             try:
@@ -430,47 +451,46 @@ def send(root: str, password: str, to: str, amount: int, fee: int,
 
     return {"ok": bool(accepted_by), "txid": tx["txid"], "tx": tx,
             "accepted_by": accepted_by, "attempts": attempts,
-            "element": element, "from": sorted(wallet.addresses())}
+            "element": element, "wallet": wallet.name,
+            "from": sorted(wallet.addresses())}
 
 
-def change_password(root: str, old: str, new: str) -> dict:
-    """
-    Меняет пароль кошелька целиком: все записи, которые открывал старый пароль.
-    Иначе после смены половина адресов осталась бы за старым — и «один кошелёк»
-    снова распался бы на части.
-    """
+def change_password(root: str, name: str, old: str, new: str) -> dict:
+    """Смена пароля одного кошелька (другие кошельки не затрагиваются)."""
     root = _root(root)
     conn = wallet_store.open_db(os.path.join(root, "keys.db"))
-    wallets = wallet_store.find_by_password(conn, old)
-    if not wallets:
-        return {"ok": False, "error": "старый пароль не подходит ни к одному кошельку"}
-    keys = 0
-    for w in wallets:
-        keys += len(w.keys())
-        w.change_password(old, new)
-    return {"ok": True, "changed": len(wallets), "keys": keys}
+    try:
+        wallet = wallet_store.open_wallet(conn, name, old)
+    except wallet_store.WalletError as e:
+        return {"ok": False, "error": str(e)}
+    wallet.change_password(old, new)
+    return {"ok": True, "name": wallet.name, "keys": len(wallet.keys())}
 
 
-def new_address(root: str, password: str) -> dict:
-    """Создаёт новый ключ (адрес) в кошельке, который открыт паролем."""
+def new_address(root: str, name: str, password: str) -> dict:
+    """Новый адрес (ключ) в указанном кошельке."""
     conn = wallet_store.open_db(os.path.join(root, "keys.db"))
-    wallets = wallet_store.find_by_password(conn, password)
-    if not wallets:
-        return {"ok": False, "error": "пароль не подходит ни к одному кошельку"}
-    view = wallet_store.WalletSet(wallets)
-    key = view.add_key()
+    try:
+        wallet = wallet_store.open_wallet(conn, name, password)
+    except wallet_store.WalletError as e:
+        return {"ok": False, "error": str(e)}
+    key = wallet.add_key()
     return {
         "ok": True,
+        "name": wallet.name,
         "address": key["address"],
         "key_id": key["id"],
-        "addresses": [k["address"] for k in view.keys()],
+        "addresses": [k["address"] for k in wallet.keys()],
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="JSON-кошелёк для веб-панели")
     ap.add_argument("action",
-                    choices=["info", "send", "passwd", "tx", "newkey", "chains"])
+                    choices=["list", "create", "info", "send", "passwd",
+                             "tx", "newkey", "chains"])
+    ap.add_argument("--name", default=None,
+                    help="имя кошелька (нужно для info/send/passwd/newkey)")
     ap.add_argument("--password", default=None)
     ap.add_argument("--password-env", default="WEBUI_WALLET_PASSWORD")
     ap.add_argument("--results-root", default=DEFAULT_ROOT)
@@ -490,6 +510,19 @@ def main() -> int:
     confirmations = args.confirmations if args.confirmations is not None \
         else _confirmations(args.results_root)
 
+    if args.action == "list":
+        result = list_wallets(args.results_root)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+
+    if args.action == "create":
+        if not args.name:
+            print(json.dumps({"ok": False, "error": "нужен --name"}, ensure_ascii=False))
+            return 2
+        result = create_wallet(args.results_root, args.name, password)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+
     if args.action == "chains":
         result = list_chains(args.results_root)
         print(json.dumps(result, ensure_ascii=False))
@@ -497,7 +530,7 @@ def main() -> int:
 
     if args.action == "info":
         masters = [m for m in (args.master or []) if m]
-        result = collect(args.results_root, password, confirmations,
+        result = collect(args.results_root, args.name, password, confirmations,
                          masters=masters, element=args.element)
     elif args.action == "tx":
         if not args.txid:
@@ -507,7 +540,7 @@ def main() -> int:
                             masters=[m for m in (args.master or []) if m],
                             element=args.element)
     elif args.action == "newkey":
-        result = new_address(args.results_root, password)
+        result = new_address(args.results_root, args.name, password)
     elif args.action == "send":
         if not args.to or args.amount <= 0:
             print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},
@@ -515,14 +548,15 @@ def main() -> int:
             return 2
         masters = [m for m in (args.master or [os.environ.get(
             "MASTER_URL", "http://127.0.0.1:8000")]) if m]
-        result = send(args.results_root, password, args.to, args.amount,
+        result = send(args.results_root, args.name, password, args.to, args.amount,
                       args.fee, masters, confirmations, element=args.element)
     else:
         if not args.change_to:
             print(json.dumps({"ok": False, "error": "нужен --change-to"},
                              ensure_ascii=False))
             return 2
-        result = change_password(args.results_root, password, args.change_to)
+        result = change_password(args.results_root, args.name, password,
+                                 args.change_to)
 
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("ok") else 1

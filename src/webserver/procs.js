@@ -148,7 +148,13 @@ function addRecord(kind, name) {
 }
 
 async function startMaster(opts = {}) {
-    const password = String(opts.password || 'master');
+    const wallet = String(opts.wallet || '').trim();
+    if (!wallet) {
+        throw new Error('не выбран кошелёк: создайте его на вкладке «Кошелёк» '
+            + 'и выберите в поле «Кошелёк (имя)»');
+    }
+    const password = String(opts.password || '');
+    if (!password) throw new Error('нужен пароль кошелька');
     let port = parseInt(opts.port, 10);
     if (!Number.isInteger(port) || port <= 0) {
         port = await pickPort(configuredMasterPort());
@@ -168,10 +174,12 @@ async function startMaster(opts = {}) {
     rec.dir = dir;
     rec.password = password;
 
-    const args = ['src/main.py', '--port', String(port), '--results-dir', dir];
+    const args = ['src/main.py', '--port', String(port), '--results-dir', dir,
+        '--wallet', wallet];
     const peers = (opts.peers || []).map((p) => String(p).trim()).filter(Boolean);
     for (const peer of peers) args.push('--peer', peer);
     rec.peers = peers;
+    rec.wallet = wallet;
 
     start(rec, 'python3', args, { MASTER_PASSWORD: password });
     return publicRecord(rec);
@@ -194,16 +202,23 @@ async function startWorker(opts = {}) {
     const masters = (opts.masters || []).map((m) => String(m).trim()).filter(Boolean);
     if (!masters.length) throw new Error('не выбран ни один адрес мастера');
 
-    const password = String(opts.password || 'worker');
+    const wallet = String(opts.wallet || '').trim();
+    if (!wallet) {
+        throw new Error('не выбран кошелёк: создайте его на вкладке «Кошелёк» '
+            + 'и выберите в поле «Кошелёк (имя)»');
+    }
+    const password = String(opts.password || '');
+    if (!password) throw new Error('нужен пароль кошелька');
     const rec = addRecord('worker', name);
     rec.masters = masters;
     rec.password = password;
 
-    const args = ['src/worker.py', '--name', name];
+    const args = ['src/worker.py', '--name', name, '--wallet', wallet];
     for (const url of masters) args.push('--master', url);
     if (opts.verbose === true) args.push('--verbose');
     else if (opts.verbose === false) args.push('--no-verbose');
     rec.verbose = opts.verbose;
+    rec.wallet = wallet;
 
     start(rec, 'python3', args, { WORKER_PASSWORD: password, WORKER_MASTERS: masters.join(',') });
     return publicRecord(rec);
