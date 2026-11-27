@@ -56,7 +56,7 @@ def make_dft(element_dir, n_atoms=2, nonce=0, energy=-42.0):
     prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
     geom = chain.expected_geometry({
         "prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": 3,
-        "atom_diameter": 2.0, "element": "Cu", "template": None,
+        "atom_diameter": 2.0, "element": "Cu",
     })
     return {"energy_ev": energy,
             "forces_ev_ang": [[0.0, 0.0, 0.0]] * n_atoms,

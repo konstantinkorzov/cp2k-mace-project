@@ -146,7 +146,6 @@ async function masterInfo(rec) {
         workers: status ? (status.workers || []).length : null,
         paused: status ? status.paused : null,
         peers: peers ? (peers.peers || []) : [],
-        template: height ? (height.template || null) : null,
     };
 }
 

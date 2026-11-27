@@ -368,7 +368,6 @@ async function discoverMasters(from = 8000, to = 8010) {
             pending: queue ? queue.pending : null,
             active: queue ? queue.active : null,
             peers: peers ? (peers.peers || []) : [],
-            template: h.template || null,
         };
     }));
     return found.filter(Boolean);

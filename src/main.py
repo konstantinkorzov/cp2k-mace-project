@@ -230,17 +230,6 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     # подтверждения чтения restart — константы в cp2k_runner.py (RESTART_VERIFY_SCF).
     cfg.setdefault("restart_max_mb", 50)                  # лимит размера принятого wfn
 
-    # Необязательный шаблон геометрии (template_xyz). В отличие от первой
-    # версии (шаблон уезжал воркеру как подсказка) теперь по нему генерирует
-    # САМ МАСТЕР и выдаёт готовые координаты в задании — иначе близость
-    # к шаблону недоказуема: воркер мог бы его проигнорировать.
-    tpl = str(cfg.get("template_xyz") or "").strip()
-    cfg["template"] = None
-    cfg["template_path"] = None
-    if tpl:
-        cfg["template_path"] = (tpl if os.path.isabs(tpl)
-                                else os.path.join(PROJECT_ROOT, tpl))
-
     # Мастеру обязательно нужно описание системы
     _require(cfg, ["system"])
 
@@ -321,73 +310,6 @@ def load_config(path: str, results_root: str | None = None) -> Config:
 
 CONFIG = load_config(CONFIG_PATH)
 
-
-def _load_template(cfg) -> None:
-    """Читает template_xyz и проверяет совместимость с system.
-
-    Шаблон — сид геометрии на стороне МАСТЕРА: координаты по нему генерирует
-    мастер и отдаёт воркеру в задании. Поэтому близость к шаблону проверяется
-    не доверием, а равенством присланной геометрии выданной (см. _same_geometry),
-    и никакой DFT для этой проверки не нужен.
-    """
-    cfg["template"] = None
-    path = cfg.get("template_path")
-    if not path:
-        return
-
-    tpl = structure_generator.load_template_xyz(path)
-    frames = tpl["frames"]
-    first = frames[0]
-    counts: dict[str, int] = {}
-    for sym in first["symbols"]:
-        counts[sym] = counts.get(sym, 0) + 1
-
-    comp = cfg["composition"]
-    unknown = sorted(set(counts) - set(comp))
-    if unknown:
-        raise SystemExit(
-            f"[Master] ✗ template_xyz: элементы {unknown} отсутствуют в system.composition "
-            f"{comp}. Шаблон должен быть из той же системы.")
-
-    unit = sum(comp.values())
-    total = sum(counts.values())
-    expected = {sym: cnt / unit for sym, cnt in comp.items()}
-    actual = {sym: cnt / total for sym, cnt in counts.items()}
-    ratio_ok = all(abs(actual.get(sym, 0.0) - exp) <= 0.02 for sym, exp in expected.items())
-
-    d_min = structure_generator.min_dist(cfg)
-    d_tpl = structure_generator.template_min_distance(tpl)
-    if d_tpl < d_min * MIN_DIST_TOLERANCE:
-        raise SystemExit(
-            f"[Master] ✗ template_xyz: минимальное расстояние в шаблоне {d_tpl:.3f} Å "
-            f"меньше допустимого {d_min * MIN_DIST_TOLERANCE:.3f} Å "
-            f"(min_dist = {d_min:.3f} = system.atom_diameter × {structure_generator.MIN_DIST_FACTOR}). "
-            f"Уменьшите atom_diameter или возьмите другой шаблон.")
-
-    sizes = sorted({len(f["coords"]) for f in frames})
-    templates = []
-    for i, frame in enumerate(frames):
-        obj = {"version": chain_mod.TEMPLATE_VERSION,
-               "system": cfg["element"],
-               "composition": {k: int(v) for k, v in comp.items()},
-               "n_atoms": len(frame["coords"]),
-               "dim": 3,
-               "coords": [[float(c) for c in p] for p in frame["coords"]],
-               "source": f"{os.path.basename(path)}#{i}"}
-        bad = chain_mod.validate_template(obj, cfg["element"], cfg["composition"])
-        if bad:
-            raise SystemExit("[Master] ✗ template_xyz: " + "; ".join(bad[:3]))
-        templates.append(obj)
-    cfg["templates"] = templates
-    cfg["template"] = None
-    print(f"[Master] 🧩 шаблон геометрии: {tpl['source']} — кадров {len(frames)}, "
-          f"атомов {sizes}, min d = {d_tpl:.3f} Å; состав {counts}")
-    print("[Master] 🧩 шаблон регистрируется в цепочке; блоки используют его только "
-          "ПОСЛЕ включения регистрации (правило v4)")
-    if not ratio_ok:
-        print(f"[Master] ⚠ состав шаблона {counts} не пропорционален system.composition "
-              f"{comp} — сорт атомов будет назначен по формуле, шаблон задаёт только геометрию")
-    print("[Master] 🧩 геометрию по шаблону генерирует мастер; воркер считает ровно выданное")
 
 
 # ---------- CLI / Порт ----------
@@ -513,30 +435,14 @@ def _issue_geometry(task: dict) -> dict:
     element_dir = CONFIG["output_dir"]
     prev_id = chain_mod.previous_hash(element_dir, chain_mod.next_seq(element_dir))
 
-    # Шаблон можно использовать только если он уже зарегистрирован в цепочке
-    # (H_reg < высоты этого блока): иначе он выбран после результата.
-    next_seq = chain_mod.next_seq(element_dir)
-    usable = []
-    for obj in (CONFIG.get("templates") or []):
-        tsha = chain_mod.template_sha(obj)
-        if chain_mod.find_template(element_dir, tsha, before_seq=next_seq) is not None:
-            usable.append(obj)
-
     last_error = None
     nonce = 0
     fixed_nonce = task.get("nonce")
     for _ in range(GEOMETRY_RETRIES):
         nonce = int(fixed_nonce) if fixed_nonce is not None else secrets.randbits(64)
         seed = chain_mod.geometry_seed(prev_id, nonce)
-        obj = None
-        template = None
         try:
-            if usable:
-                obj = usable[seed % len(usable)]
-                template = {"frames": [{"symbols": [],
-                                        "coords": np.asarray(obj["coords"], dtype=float)}]}
-            coords = structure_generator.generate_for_seed(
-                seed, n_atoms, dim, CONFIG, template)
+            coords = structure_generator.generate_for_seed(seed, n_atoms, dim, CONFIG)
             species = structure_generator.assign_species(n_atoms, CONFIG, seed=seed)
             return {
                 "coords": np.asarray(coords, dtype=float).tolist(),
@@ -544,8 +450,6 @@ def _issue_geometry(task: dict) -> dict:
                 "seed": seed,
                 "nonce": nonce,
                 "prev_id": prev_id,
-                "template_sha": chain_mod.template_sha(obj) if obj else None,
-                "template_obj": obj,
             }
         except Exception as e:  # noqa: BLE001
             last_error = e
@@ -780,11 +684,10 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
     if not ok:
         return fail(f"geometry rejected: {reason}")
 
-    # 0. Геометрия сверяется с выданной ТОЛЬКО в шаблонном режиме: там близость
-    #    к шаблону — часть задания. Без шаблона задание обещает лишь «валидный
-    #    кластер из n атомов того же состава», поэтому любая такая структура
-    #    принимается (как раньше), а E/силы мастер считает для присланной.
-    if issued and issued.get("check_geometry"):
+    # 0. Мастер выдал геометрию сам (seed → координаты), значит воркер обязан
+    #    посчитать ровно её. Сверка дешёвая и идёт до DFT. Готовый путь
+    #    (результат принесён мастеру, который задание не выдавал) эталона не имеет.
+    if issued:
         same, why = _same_geometry(coords, payload.get("species"), issued)
         if not same:
             return fail(f"геометрия не та, что выдана в задании: {why}")
@@ -897,11 +800,10 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
             "valid": True,
             "reason": "",
             "elapsed": time.perf_counter() - t0,
-            # true — геометрия сверена с выданной (только шаблонный режим);
-            # geometry_policy: template | random | worker (ready-путь)
-            "geometry_verified": bool(issued and issued.get("check_geometry")),
-            "geometry_policy": ("worker" if not issued else
-                                ("template" if issued.get("check_geometry") else "random")),
+            # true — геометрия сверена с выданной мастером;
+            # geometry_policy: seed (выдал мастер) | worker (ready-путь)
+            "geometry_verified": bool(issued),
+            "geometry_policy": ("worker" if not issued else "seed"),
             "energy_ev": float(res["energy_ev"]),
             "energy_hartree": float(res.get("energy_hartree", float("nan"))),
             "forces_ev_ang": res.get("forces_ev_ang"),
@@ -1045,16 +947,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     # coinbase = субсидия + комиссии блока (как в Bitcoin)
     coinbase = chain_mod.make_coinbase(seq, latest["address"],
                                        chain_mod.COINBASE_VALUE + fee + mem_fee)
-    # Регистрация шаблонов: данные, не деньги (type=template, без входов).
-    # Включаем только те, которых ещё нет в цепочке; лимит — консенсусный.
-    reg_txs = []
-    for obj in (CONFIG.get("templates") or []):
-        if len(reg_txs) >= chain_mod.MAX_TEMPLATES_PER_BLOCK:
-            break
-        tsha = chain_mod.template_sha(obj)
-        if chain_mod.find_template(CONFIG["output_dir"], tsha, before_seq=seq) is None:
-            reg_txs.append(chain_mod.template_tx(obj))
-    txs = ([coinbase] + ([reward] if reward else []) + reg_txs + mem_txs)
+    txs = [coinbase] + ([reward] if reward else []) + mem_txs
 
     dft = {
         "energy_ev": verdict.get("energy_ev"),
@@ -1078,9 +971,6 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         "charge": int(CONFIG.get("charge") or 0),
         "multiplicity": _effective_multiplicity(n_atoms, CONFIG),
         "scf": (verdict.get("state") or {}).get("scf"),
-        # происхождение геометрии: seed или зарегистрированный шаблон
-        "geometry_source": (f"template:{task_data.get('_template_sha')}"
-                            if task_data.get("_template_sha") else "seed"),
     }
     # Физические наблюдаемые (мастер посчитал в том же прогоне, что и E):
     # диполь, заряды/спины по атомам, разложение энергии, занятый спектр,
@@ -1098,8 +988,6 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         nonce=int(task_data.get("_nonce", 0)),
         dim=int(task_data.get("dim", 3)),
         atom_diameter=float(CONFIG.get("atom_diameter") or 2.0),
-        template_sha=task_data.get("_template_sha"),
-        template_obj=task_data.get("_template_obj"),
         composition=CONFIG.get("composition"),
     )
 
@@ -1730,17 +1618,11 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
             "seed": issued["seed"],
             "nonce": issued["nonce"],
             "prev_id": issued["prev_id"],
-            "template_sha": issued.get("template_sha"),
-            "template_obj": issued.get("template_obj"),
-            # сверка геометрии включена только в шаблонном режиме
-            "check_geometry": bool(issued.get("template_sha")),
         }
 
         print(f"Воркер [{worker_id}] получил задание {struct_id}: "
               f"n={task['n_atoms']}, dim={task['dim']}, seed={issued['seed']}, "
               f"элемент {CONFIG['element']} ({CONFIG['potential']})"
-              + (f", шаблон {issued['template_obj']['source']}"
-                 if issued.get("template_obj") else "")
               + f" | В очереди: {len(pending_tasks)} | У воркеров: {len(active_tasks)}")
         return {"status": "ok", "task": task_payload}
 
@@ -1961,8 +1843,6 @@ def submit_result(result: TaskResult):
         # Эталон — та геометрия, которую мастер выдал (info), а не присланная.
         # Сверка дешёвая; только после неё запускаются последние шаги DFT.
         task_data["_nonce"] = info.get("nonce", 0)
-        task_data["_template_sha"] = info.get("template_sha")
-        task_data["_template_obj"] = info.get("template_obj")
         verdict = verify_state_payload(CONFIG, task_data, payload, issued=info)
         persist = _persist_verified_state
 
@@ -2533,16 +2413,7 @@ def work_height(element: str, pubkey_hash: str | None = None,
 @app.get("/chain/height")
 def chain_height():
     h, sha = _local_head()
-    templates = CONFIG.get("templates") or []
-    tpl_info = None
-    if templates:
-        tsha = chain_mod.template_sha(templates[0])
-        tpl_info = {"sha256": tsha,
-                    "registered_at": chain_mod.template_registered_at(
-                        CONFIG["output_dir"], tsha),
-                    "count": len(templates)}
-    return {"element": CONFIG["element"], "height": h, "head_sha256": sha,
-            "template": tpl_info}
+    return {"element": CONFIG["element"], "height": h, "head_sha256": sha}
 
 
 @app.get("/chain/block/{seq}")
@@ -2881,7 +2752,6 @@ def _main_impl():
 
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
     _load_mempool()
-    _load_template(CONFIG)
 
     # Кошелёк мастера: --wallet NAME + --password / MASTER_PASSWORD.
     # Кошелёк — самостоятельная сущность и НЕ создаётся на лету: только явно

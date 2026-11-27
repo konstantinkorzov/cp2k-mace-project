@@ -406,7 +406,6 @@ def restart_tests():
         check("мастер не передаёт режим проверки (он всегда restart)",
               "verify_mode" not in got["task"]["cfg"])
         issued = got["task"]
-        main.active_tasks[issued["struct_id"]]["check_geometry"] = True
         wrong = {"geometry": [[0.0, 0.0, 0.0], [3.4, 0.0, 0.0]],
                  "species": issued["species"],
                  "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
@@ -431,9 +430,8 @@ def restart_tests():
                                            success=True, data=good))
         check("результат для неизвестной задачи не принимается", True)
 
-        # без шаблона сверка не выполняется: подмена геометрии проходит,
-        # числа считаются мастером для ПРИСЛАННОЙ геометрии (как раньше)
-        cfg["template"] = None
+        # шаблонов больше нет, но геометрия всё равно сверяется с выданной:
+        # мастер выдал координаты сам, воркер обязан считать ровно их
         main.pending_tasks.clear(); main.active_tasks.clear()
         main.pending_tasks.append({**task, "struct_id": "n2_d3_0010", "attempts": 0})
         issued2 = main.get_task(wid)["task"]
@@ -444,8 +442,8 @@ def restart_tests():
                 "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
         free_resp = main.submit_result(main.TaskResult(
             worker_id=wid, struct_id=issued2["struct_id"], success=True, data=free))
-        check("без шаблона геометрия не сверяется (как раньше)",
-              free_resp.get("status") == "accepted", str(free_resp))
+        check("подменённая геометрия отклоняется без всяких шаблонов",
+              free_resp.get("status") == "rejected", str(free_resp))
 
         shutil.rmtree(main.CONFIG["frames_dir"], ignore_errors=True)
         for f in (agg, main.CONFIG["verified_ids_file"], main.CONFIG["failed_ids_file"]):
@@ -569,8 +567,7 @@ def block_dft(element_dir, n_atoms=2, dim=3, nonce=0, system="Cu",
     comp = composition or {system: 1}
     prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
     header = {"prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": dim,
-              "atom_diameter": 2.0, "system": system, "composition": comp,
-              "template": None}
+              "atom_diameter": 2.0, "system": system, "composition": comp}
     geom = chain.expected_geometry(header)
     species = structure_generator.assign_species(
         n_atoms, {"composition": comp},
@@ -619,11 +616,11 @@ def chain_tests():
                     "atom_diameter", "prev_id", "created_at", "state_sha256",
                     "state_path", "cp2k_version", "cp2k_build", "cp2k_params",
                     "tx_root", "nonce", "dft_sha256", "geom_version",
-                    "template_sha", "block_id"}
+                    "block_id"}
         check("в заголовке только нужные поля", set(h1) == expected, sorted(h1))
         check("отпечаток сборки CP2K попал в заголовок",
               h1.get("cp2k_build") == cp2k_runner.CP2K_BUILD_CPU, h1.get("cp2k_build"))
-        check("version = 4", h1["version"] == 4)
+        check("version = 5", h1["version"] == 5)
         check("created_at — ISO 8601 UTC",
               datetime.strptime(h1["created_at"], "%Y-%m-%dT%H:%M:%SZ") is not None)
         check("CP2K version и params в блоке",
@@ -655,77 +652,6 @@ def chain_tests():
 
         finally:
             shutil.rmtree(tmpm, ignore_errors=True)
-
-        # --- v4: шаблон — объект в цепочке, только после регистрации ---
-        tmpl_dir = tempfile.mkdtemp(prefix="chain_tpl_")
-        try:
-            wfnt = os.path.join(tmpl_dir, "state.wfn")
-            make_wfn(wfnt)
-            shat, relt = chain.store_blob(tmpl_dir, wfnt)
-            comp = {"Cu": 1}
-
-            coords = [[0.0, 0.0, 0.0], [2.5, 0.0, 0.0], [0.0, 2.5, 0.0]]
-            tpl = {"version": chain.TEMPLATE_VERSION, "system": "Cu",
-                   "composition": comp, "n_atoms": 3, "dim": 3,
-                   "coords": coords, "source": "test"}
-            tsha = chain.template_sha(tpl)
-
-            d1 = block_dft(tmpl_dir, n_atoms=2)
-            reg = chain.template_tx(tpl)
-            cb1 = chain.make_coinbase(1, master)
-            chain.write_block(tmpl_dir, "Cu", 2, shat, relt, [cb1, reg], dft=d1, **cp2k)
-            check("шаблон: регистрация — отдельная транзакция",
-                  any(t.get("type") == "template"
-                      for t in chain.read_block_txs(chain.list_blocks(tmpl_dir)[0]["path"])))
-            check("шаблон: цепочка с регистрацией целая",
-                  chain.verify_chain(tmpl_dir, "Cu")["ok"],
-                  chain.verify_chain(tmpl_dir, "Cu")["problems"][:3])
-            check("шаблон: известен начиная со следующего блока",
-                  chain.find_template(tmpl_dir, tsha, before_seq=1) is None
-                  and chain.find_template(tmpl_dir, tsha, before_seq=2) is not None)
-
-            prev = chain.previous_hash(tmpl_dir, chain.next_seq(tmpl_dir))
-            hdr = {"prev_id": prev, "nonce": 0, "n_atoms": 3, "dim": 3,
-                   "atom_diameter": 2.0, "system": "Cu", "composition": comp,
-                   "template_sha": tsha}
-            geom = chain.expected_geometry(hdr, tpl)
-            d2 = {"energy_ev": -42.0,
-                  "forces_ev_ang": [[0.0, 0.0, 0.0]] * 3,
-                  "geometry": np.asarray(geom).tolist(),
-                  "species": structure_generator.assign_species(
-                      3, {"composition": comp}, seed=chain.geometry_seed(prev, 0))}
-            chain.write_block(tmpl_dir, "Cu", 3, shat, relt,
-                              [chain.make_coinbase(2, master)], dft=d2,
-                              nonce=0, template_sha=tsha, template_obj=tpl, **cp2k)
-            check("шаблон: блок с template_sha проверяется",
-                  chain.verify_chain(tmpl_dir, "Cu")["ok"],
-                  chain.verify_chain(tmpl_dir, "Cu")["problems"][:3])
-
-            bad_tpl = dict(tpl, system="Fe")
-            check("шаблон: чужая система отбивается",
-                  any("систем" in p for p in
-                      chain.validate_template(bad_tpl, "Cu", comp)))
-            close = dict(tpl, coords=[[0.0, 0.0, 0.0], [0.01, 0.0, 0.0],
-                                      [0.0, 2.5, 0.0]])
-            check("шаблон: атомы ближе 0.5 Å отбиваются",
-                  any("ближе" in p for p in chain.validate_template(close, "Cu", comp)))
-
-            bad_dir = tempfile.mkdtemp(prefix="chain_tpl_bad_")
-            try:
-                wfnb = os.path.join(bad_dir, "state.wfn")
-                make_wfn(wfnb)
-                shab, relb = chain.store_blob(bad_dir, wfnb)
-                dbad = block_dft(bad_dir, n_atoms=2)
-                chain.write_block(bad_dir, "Cu", 2, shab, relb,
-                                  [chain.make_coinbase(1, master),
-                                   chain.template_tx(dict(tpl, composition={"O": 1}))],
-                                  dft=dbad, **cp2k)
-                check("шаблон: чужой состав в транзакции отбивается",
-                      not chain.verify_chain(bad_dir, "Cu")["ok"])
-            finally:
-                shutil.rmtree(bad_dir, ignore_errors=True)
-        finally:
-            shutil.rmtree(tmpl_dir, ignore_errors=True)
         check("wfn в блок не кладётся, только ссылка",
               not any(n.endswith(".wfn") for n in names) and h1["state_path"] == rel1)
         check("coinbase — 50 000 000 монет",
@@ -1185,11 +1111,9 @@ def master_geometry_tests():
     import tempfile as _tempfile
 
     tmp = _tempfile.mkdtemp(prefix="geom_")
-    saved = {k: main.CONFIG.get(k)
-             for k in ("output_dir", "element", "template", "templates")}
+    saved = {k: main.CONFIG.get(k) for k in ("output_dir", "element")}
     try:
-        main.CONFIG.update({"output_dir": tmp, "element": "Cu",
-                            "template": None, "templates": None})
+        main.CONFIG.update({"output_dir": tmp, "element": "Cu"})
         main.pending_tasks.clear()
         main.active_tasks.clear()
         main.registered_workers.clear()
@@ -1215,38 +1139,9 @@ def master_geometry_tests():
         check("геометрия детерминирована по (prev_id, nonce)",
               a["coords"] == b["coords"] and a["species"] == b["species"])
 
-        # шаблон: регистрируется в цепочке, затем геометрия строится вокруг него
-        tpl_path = os.path.join(tmp, "dimer.xyz")
-        with open(tpl_path, "w", encoding="utf-8") as f:
-            f.write("2\nseed\nCu 0 0 0\nCu 2.5 0 0\n")
-        frame = structure_generator.load_template_xyz(tpl_path)["frames"][0]
-        obj = {"version": chain.TEMPLATE_VERSION, "system": "Cu",
-               "composition": {"Cu": 1}, "n_atoms": len(frame["coords"]),
-               "dim": 3,
-               "coords": [[float(c) for c in p] for p in frame["coords"]],
-               "source": "dimer.xyz"}
-        wfn_g = os.path.join(tmp, "state.wfn")
-        make_wfn(wfn_g)
-        sha_g, rel_g = chain.store_blob(tmp, wfn_g)
-        chain.write_block(tmp, "Cu", 2, sha_g, rel_g,
-                          [chain.make_coinbase(1, "a" * 64),
-                           chain.template_tx(obj)],
-                          dft=block_dft(tmp, n_atoms=2))
-        main.CONFIG["templates"] = [obj]
-        tmpl_task = {"struct_id": "n2_g2", "n_atoms": 2, "dim": 3,
-                     "seed": 5, "attempts": 0}
-        g = main._issue_geometry(dict(tmpl_task))
-        pts = np.asarray(g["coords"])
-        d = float(np.linalg.norm(pts[0] - pts[1]))
-        check("шаблон: расстояние около исходного (2.5 Å)", 2.0 <= d <= 3.5, f"d={d:.2f}")
-        check("шаблон: в задании есть ссылка на зарегистрированный шаблон",
-              g.get("template_sha") == chain.template_sha(obj))
-        again = structure_generator.generate_from_template(
-            2, 3, main.CONFIG,
-            {"frames": [{"coords": np.asarray(obj["coords"], dtype=float)}]},
-            seed=g["seed"])
-        check("шаблон: геометрия воспроизводится по выданному seed",
-              np.allclose(np.asarray(again), pts, atol=1e-9))
+        g0 = main._issue_geometry(dict(task, nonce=4242))
+        check("геометрия задания без шаблонов",
+              "template_sha" not in g0 and "template_obj" not in g0)
     finally:
         main.pending_tasks.clear()
         main.active_tasks.clear()
