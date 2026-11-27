@@ -80,6 +80,17 @@ WORKER_LEASE_SEC = 180
 # Через сколько забываем мёртвого воркера целиком (освобождает worker_id и pubkey)
 WORKER_FORGET_SEC = 1800
 
+# --- удостоверение воркера ---
+# worker_id — публичный номер: он есть в /queue-status и в блоках, поэтому
+# как пропуск он не годится. Право говорить за воркера даёт только session,
+# который мастер выдаёт при регистрации с подписью nonce (/register-challenge).
+WORKER_SESSION_MAX = 4        # сколько живых сессий держим (мастеров у воркера несколько)
+
+# --- предохранители регистрации ---
+MAX_REGISTERED_WORKERS = 200  # потолок памяти мастера
+REG_LIMIT_PER_IP = 60         # challenge+register с одного IP в минуту (~30 регистраций)
+REG_WINDOW_SEC = 60.0
+
 
 def _task_timeout() -> int:
     """Жёсткий предел удержания задачи: config.json → task_timeout_sec.
@@ -1189,6 +1200,27 @@ async def _body_guard(request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def _reg_guard(request, call_next):
+    """
+    Лимит регистраций по IP: регистрация даёт право на DFT-прогоны за счёт
+    мастера, поэтому бесплатно набивать воркеров нельзя ни ключами, ни
+    скриптом. Счётчик по IP (ключи бесплатны), окно — REG_WINDOW_SEC.
+    """
+    try:
+        path = (request.url.path or "").rstrip("/") or "/"
+        ip = request.client.host if getattr(request, "client", None) else "?"
+    except Exception:  # noqa: BLE001
+        return await call_next(request)
+    if path in ("/register-worker", "/register-challenge") and not _reg_rate_ok(ip):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"detail": f"слишком много регистраций с {ip}: не больше "
+                       f"{REG_LIMIT_PER_IP} запросов в {int(REG_WINDOW_SEC)} с"},
+            status_code=429)
+    return await call_next(request)
+
+
 def _admin_allowed(host: str, token: str | None = None) -> bool:
     """
     Админ-API: локально — всегда, снаружи — только по MASTER_ADMIN_TOKEN.
@@ -1445,27 +1477,150 @@ class WorkerRegistration(BaseModel):
     signature: str | None = None
 
 
-def _register_worker(name: str | None, pubkey_hash: str | None,
-                     public_key: str | None, verified: bool = False) -> dict:
-    """
-    Регистрация воркера.
+# ---------- сессия воркера: право говорить за worker_id ----------
+_REG_IP_LOCK = threading.Lock()
+_REG_IP_HITS: dict[str, list[float]] = {}
+_REG_IP_MAX_KEYS = 4096
 
-    verified=True — воркер подписал nonce (доказал владение ключом): только
-    тогда переиспользуем worker_id и снимаем его текущую задачу. Без
-    доказательства выдаём отдельную сессию и чужую не трогаем — иначе любой
-    мог бы занять адрес и валить/снимать задачи жертвы.
+
+def _reset_reg_rate():
+    """Сбросить счётчики регистраций по IP (тесты, диагностика)."""
+    with _REG_IP_LOCK:
+        _REG_IP_HITS.clear()
+
+
+def _reg_rate_ok(ip: str) -> bool:
+    """
+    Скользящее окно: не больше REG_LIMIT_PER_IP запросов регистрации в минуту
+    с одного IP. Считаем по IP, а не по ключу: ключи бесплатны, а IP — нет.
+    """
+    now = time.time()
+    key = str(ip or "?")
+    with _REG_IP_LOCK:
+        if len(_REG_IP_HITS) > _REG_IP_MAX_KEYS:
+            for k, v in list(_REG_IP_HITS.items()):
+                if not v or now - v[-1] > REG_WINDOW_SEC:
+                    _REG_IP_HITS.pop(k, None)
+        hits = [t for t in _REG_IP_HITS.get(key, []) if now - t < REG_WINDOW_SEC]
+        if len(hits) >= REG_LIMIT_PER_IP:
+            _REG_IP_HITS[key] = hits
+            return False
+        hits.append(now)
+        _REG_IP_HITS[key] = hits
+    return True
+
+
+def _session_add_locked(worker_id: str) -> str:
+    """
+    Новый session-токен воркера. В памяти держим только sha256: дамп памяти
+    мастера не даёт играть за воркера. Старые сессии живут, пока их не
+    вытеснят новые — воркер одновременно ходит к нескольким мастерам.
+    """
+    token = secrets.token_urlsafe(32)
+    rec = registered_workers[worker_id]
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    sessions = rec.setdefault("sessions", [])
+    sessions.append(digest)
+    del sessions[:-WORKER_SESSION_MAX]
+    return token
+
+
+def _auth_worker(worker_id: str, session: str | None) -> dict:
+    """
+    Проверяет право говорить за worker_id.
+
+    worker_id публичен (/queue-status, блоки), поэтому без session задача не
+    выдаётся и результат не принимается: иначе знающий номер брал бы задачи
+    жертвы, держал их heartbeat'ом и останавливал очередь.
+    """
+    rec = registered_workers.get(worker_id)
+    if not rec:
+        raise HTTPException(status_code=400,
+                            detail="Неизвестный воркер. Сначала пройдите регистрацию.")
+    given = (session or "").strip()
+    if not given:
+        raise HTTPException(
+            status_code=403,
+            detail="нужен session: он выдаётся при регистрации с подписью "
+                   "(GET /register-challenge → POST /register-worker)")
+    digest = hashlib.sha256(given.encode("utf-8", "ignore")).hexdigest()
+    if not any(hmac.compare_digest(digest, s) for s in rec.get("sessions") or []):
+        # Перебирать 256-битный токен бессмысленно, поэтому троттлинг не нужен:
+        # проверка — сравнение двух хэшей, а отказ должен быть понятным.
+        raise HTTPException(status_code=403, detail="неверный session")
+    rec["last_seen"] = time.time()
+    return rec
+
+
+def _drop_worker_locked(worker_id: str, reason: str) -> None:
+    """Снимает воркера с учёта; его задачи возвращаются в очередь."""
+    rec = registered_workers.pop(worker_id, None)
+    if not rec:
+        return
+    pk = rec.get("pubkey_hash")
+    if pk and worker_by_pubkey.get(pk) == worker_id:
+        worker_by_pubkey.pop(pk, None)
+    _requeue_worker_tasks(worker_id, f"воркер снят с учёта: {reason}")
+
+
+def _evict_workers_locked(now: float) -> int:
+    """
+    Освобождает место под новых воркеров: сначала молчащие дольше
+    WORKER_FORGET_SEC, затем самые старые бесключевые.
+    """
+    dropped = 0
+    for wid, rec in list(registered_workers.items()):
+        if len(registered_workers) < MAX_REGISTERED_WORKERS:
+            break
+        if now - float(rec.get("last_seen") or 0.0) > WORKER_FORGET_SEC:
+            _drop_worker_locked(wid, "нет связи")
+            dropped += 1
+    if len(registered_workers) >= MAX_REGISTERED_WORKERS:
+        for wid, rec in sorted(registered_workers.items(),
+                               key=lambda kv: float(kv[1].get("registered_at") or 0.0)):
+            if len(registered_workers) < MAX_REGISTERED_WORKERS:
+                break
+            if not rec.get("pubkey_hash"):
+                _drop_worker_locked(wid, "нет ключа, мастер перегружен")
+                dropped += 1
+    return dropped
+
+
+def _register_worker(name: str | None, pubkey_hash: str | None,
+                     public_key: str | None, verified: bool = False,
+                     requeue: bool = True) -> dict:
+    """
+    Регистрация воркера. Возвращает worker_id и session.
+
+    verified=True — воркер подписал одноразовый nonce. HTTP-слой принимает
+    только такие регистрации: без подписи worker_id выдавался бы бесплатно,
+    а с ним — право на DFT-прогоны за счёт мастера.
     """
     global next_worker_id
     with task_queue_lock:
         now = time.time()
         if verified and pubkey_hash and pubkey_hash in worker_by_pubkey:
             worker_id = worker_by_pubkey[pubkey_hash]
-            registered_workers[worker_id].update({"last_seen": now, "name": name or registered_workers[worker_id].get("name")})
+            rec = registered_workers[worker_id]
+            rec.update({"last_seen": now,
+                        "name": name or rec.get("name"),
+                        "public_key": public_key or rec.get("public_key")})
+            session = _session_add_locked(worker_id)
             print(f"[Master] Воркер {worker_id} переподключился (pubkey {pubkey_hash[:12]}…)")
             # Воркер перезапустился: задачу, которую он держал, он уже не посчитает
-            moved = _requeue_worker_tasks(worker_id, "воркер перезапустился")
+            moved = (_requeue_worker_tasks(worker_id, "воркер перезапустился")
+                     if requeue else [])
             return {"status": "ok", "worker_id": worker_id, "known": True,
-                    "requeued": moved}
+                    "requeued": moved, "session": session}
+
+        if len(registered_workers) >= MAX_REGISTERED_WORKERS:
+            _evict_workers_locked(now)
+            if len(registered_workers) >= MAX_REGISTERED_WORKERS:
+                print(f"[Master] ✗ отказ в регистрации: {len(registered_workers)} "
+                      f"воркеров, лимит {MAX_REGISTERED_WORKERS}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="мастер перегружен воркерами: повторите позже")
 
         worker_id = f"worker_{next_worker_id}"
         next_worker_id += 1
@@ -1475,13 +1630,16 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
             "public_key": public_key,
             "registered_at": now,
             "last_seen": now,
+            "sessions": [],
         }
         if verified and pubkey_hash:
             worker_by_pubkey[pubkey_hash] = worker_id
+        session = _session_add_locked(worker_id)
 
         print(f"[Master] Зарегистрирован воркер {worker_id}"
               + (f" (name={name}, pubkey={pubkey_hash[:12]}…)" if pubkey_hash else " (без ключа)"))
-        return {"status": "ok", "worker_id": worker_id, "known": False}
+        return {"status": "ok", "worker_id": worker_id, "known": False,
+                "session": session}
 
 
 @app.get("/register-challenge")
@@ -1493,16 +1651,34 @@ def register_challenge():
 
 @app.post("/register-worker")
 def register_worker(reg: WorkerRegistration):
-    if reg.nonce or reg.signature:
-        reason = _verify_registration(reg.nonce, reg.public_key,
-                                      reg.pubkey_hash, reg.signature)
-        if reason:
-            raise HTTPException(status_code=403,
-                                detail=f"регистрация не подтверждена: {reason}")
-        return _register_worker(reg.name, reg.pubkey_hash, reg.public_key,
-                                verified=True)
-    # без доказательства — отдельная сессия, без переиспользования чужой
-    return _register_worker(reg.name, reg.pubkey_hash, reg.public_key)
+    """
+    Регистрация только с доказательством ключа: nonce с /register-challenge,
+    подписанный приватным ключом адреса pubkey_hash.
+
+    Без подписи регистрация бесплатна: скрипт набивает тысячи воркеров
+    (память мастера), занимает задачи и не считает их. Поэтому 403.
+    """
+    if not (reg.nonce and reg.signature and reg.public_key and reg.pubkey_hash):
+        raise HTTPException(
+            status_code=403,
+            detail="регистрация требует подписи nonce: GET /register-challenge → "
+                   "подписать «cp2k-mace-register:»+nonce → POST сюда")
+    reason = _verify_registration(reg.nonce, reg.public_key,
+                                  reg.pubkey_hash, reg.signature)
+    if reason:
+        raise HTTPException(status_code=403,
+                            detail=f"регистрация не подтверждена: {reason}")
+    return _register_worker(reg.name, reg.pubkey_hash, reg.public_key,
+                            verified=True)
+
+
+@app.get("/register-worker")
+def register_worker_get():
+    """Старый путь протокола v1 (worker_id без ключа) закрыт."""
+    raise HTTPException(
+        status_code=410,
+        detail="GET /register-worker больше не выдаёт worker_id: используйте "
+               "POST с подписью nonce (GET /register-challenge)")
 
 
 def _expire_tasks(now: float | None = None) -> list[str]:
@@ -1563,23 +1739,12 @@ def _watchdog_loop(interval: int = 30):
             print(f"[Master Watchdog] ошибка: {e}")
 
 
-@app.get("/register-worker")
-def register_worker_get(name: str | None = None, pubkey_hash: str | None = None,
-                        public_key: str | None = None):
-    return _register_worker(name, pubkey_hash, public_key)
-
-
 @app.get("/get-task")
-def get_task(worker_id: str, pubkey_hash: str | None = None):
+def get_task(worker_id: str, session: str | None = None):
     global pending_tasks, active_tasks, PAUSED
     with task_queue_lock:
-        if worker_id not in registered_workers:
-            raise HTTPException(status_code=400, detail="Неизвестный воркер. Сначала пройдите регистрацию.")
-
-        rec = registered_workers[worker_id]
-        if pubkey_hash and rec.get("pubkey_hash") and pubkey_hash != rec["pubkey_hash"]:
-            raise HTTPException(status_code=403, detail="pubkey_hash не совпадает с регистрацией")
-        rec["last_seen"] = time.time()
+        # Знать worker_id недостаточно: номер публичен, сессия — нет
+        _auth_worker(worker_id, session)
 
         if PAUSED:
             return {"status": "paused", "message": "Мастер на паузе: задачи не выдаются"}
@@ -1667,17 +1832,20 @@ def get_task(worker_id: str, pubkey_hash: str | None = None):
         return {"status": "ok", "task": task_payload}
 
 @app.get("/heartbeat")
-def heartbeat(worker_id: str):
+def heartbeat(worker_id: str, session: str | None = None):
     """Признак жизни воркера (раз в 30 с, в том числе во время расчёта CP2K).
 
     Без heartbeat мастер считает воркера пропавшим через WORKER_LEASE_SEC и
-    возвращает его задачу в очередь.
+    возвращает его задачу в очередь. Сессия обязательна: чужой heartbeat
+    продлевал бы удержание чужой задачи.
     """
     with task_queue_lock:
-        rec = registered_workers.get(worker_id)
-        if not rec:
+        if worker_id not in registered_workers:
             return {"status": "unknown", "message": "воркер не зарегистрирован"}
-        rec["last_seen"] = time.time()
+        try:
+            _auth_worker(worker_id, session)
+        except HTTPException as e:  # noqa: PERF203
+            return {"status": "unauthorized", "message": str(e.detail)}
         return {
             "status": "ok",
             "lease_sec": WORKER_LEASE_SEC,
@@ -1768,6 +1936,7 @@ def _verify_registration(nonce, public_key, pubkey_hash, signature) -> str | Non
 
 class TaskResult(BaseModel):
     worker_id: str
+    session: str | None = None   # выдаётся при регистрации с подписью ключа
     struct_id: str
     success: bool
     data: dict = None
@@ -1790,6 +1959,7 @@ def submit_result(result: TaskResult):
     w_id = result.worker_id
     if not isinstance(sid, str) or not STRUCT_ID_RE.match(sid):
         return {"status": "rejected", "reason": "недопустимый struct_id"}
+    _auth_worker(w_id, result.session)
     _rate_limit("submit", str(w_id))
 
     # ---------- готовый результат от воркера (задание было у другого мастера) ----------
@@ -2462,24 +2632,22 @@ def tx_mempool():
 
 
 @app.get("/work/height")
-def work_height(element: str, pubkey_hash: str | None = None,
-                name: str | None = None):
+def work_height(element: str):
     """
-    Воркер спрашивает у мастера: «поддерживаешь элемент и дай высоту цепочки?».
-    Это запрос на работу: мастер регистрирует воркера и ждёт готовый результат.
+    Публичная справка: «поддерживаешь элемент, какая высота цепочки?».
+
+    Воркера здесь НЕ регистрируем: worker_id без подписи — это бесплатное
+    право на DFT-прогоны за счёт мастера. Доставка готового результата
+    другому мастеру: POST /register-worker (с подписью) → /submit-result ready.
     """
     if element != CONFIG["element"]:
         raise HTTPException(status_code=404,
                             detail=f"элемент {element} не поддерживается")
     if BUSY.is_set():
         return {"status": "busy", "reason": "master is syncing"}
-
-    reg = _register_worker(name, pubkey_hash, None)
     h, sha = _local_head()
-    print(f"[Master] воркер {reg['worker_id']} ищет работу по {element}: "
-          f"высота {h}, адрес {reg['worker_id']}")
     return {"status": "ok", "element": element, "height": h,
-            "head_sha256": sha, "worker_id": reg["worker_id"]}
+            "head_sha256": sha}
 
 
 @app.get("/peers")

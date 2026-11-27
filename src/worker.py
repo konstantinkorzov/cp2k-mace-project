@@ -75,44 +75,51 @@ def setup_logger(worker_id: str, log_dir: str):
     return logger
 
 
-def register_with_retry(reg_url: str, name: str, pubkey_hash: str, public_key: str,
-                        wallet=None, retry_delay: int = RETRY_DELAY) -> str:
-    """Регистрируется на сервере и доказывает владение ключом.
-
-    Мастер выдаёт одноразовый nonce, воркер подписывает его своим приватным
-    ключом. Без этого чужой адрес можно было бы «занять» и снимать задачи.
+def _register_once(reg_url: str, name: str, pubkey_hash: str, public_key: str,
+                   wallet=None) -> dict | None:
     """
+    Одна попытка регистрации с доказательством ключа.
+
+    Мастер выдаёт одноразовый nonce, воркер подписывает его приватным ключом
+    и получает worker_id + session. Session — единственное удостоверение:
+    сам worker_id публичен (/queue-status), по нему задачи не выдают.
+    Возвращает {"worker_id", "session", ...} или None.
+    """
+    payload = {"name": name, "pubkey_hash": pubkey_hash, "public_key": public_key}
+    if wallet is not None:
+        ch = requests.get(
+            reg_url.replace("/register-worker", "/register-challenge"), timeout=10)
+        ch.raise_for_status()
+        nonce = str((ch.json() or {}).get("nonce") or "")
+        if not nonce:
+            return None
+        payload["nonce"] = nonce
+        payload["signature"] = wallet.sign(
+            pubkey_hash, b"cp2k-mace-register:" + bytes.fromhex(nonce)).hex()
+    reg_resp = requests.post(reg_url, json=payload, timeout=10)
+    reg_resp.raise_for_status()
+    reg_data = reg_resp.json() or {}
+    if reg_data.get("worker_id") and reg_data.get("session"):
+        return reg_data
+    return None
+
+
+def register_with_retry(reg_url: str, name: str, pubkey_hash: str, public_key: str,
+                        wallet=None, retry_delay: int = RETRY_DELAY) -> dict:
+    """Регистрируется, пока мастер не выдаст worker_id и session."""
     while True:
-        payload = {"name": name, "pubkey_hash": pubkey_hash, "public_key": public_key}
-        if wallet is not None:
-            try:
-                ch = requests.get(
-                    reg_url.replace("/register-worker", "/register-challenge"),
-                    timeout=10)
-                if ch.status_code == 200:
-                    nonce = str(ch.json().get("nonce") or "")
-                    if nonce:
-                        payload["nonce"] = nonce
-                        payload["signature"] = wallet.sign(
-                            pubkey_hash,
-                            b"cp2k-mace-register:" + bytes.fromhex(nonce)).hex()
-            except Exception:  # noqa: BLE001
-                pass      # старый мастер: регистрируемся без подписи (unverified)
+        print(f"Регистрируюсь на сервере {reg_url} "
+              f"(name={name}, pubkey={pubkey_hash[:12]}...)")
         try:
-            print(f"Регистрируюсь на сервере {reg_url} "
-                  f"(name={name}, pubkey={pubkey_hash[:12]}...)")
-            reg_resp = requests.post(reg_url, json=payload, timeout=10)
-            reg_resp.raise_for_status()
-            reg_data = reg_resp.json()
-            worker_id = reg_data.get("worker_id")
-            if worker_id:
-                return worker_id
-            print(f"⚠ Сервер вернул ответ без worker_id: {reg_data}. Повтор через {retry_delay} с...")
+            reg = _register_once(reg_url, name, pubkey_hash, public_key, wallet)
+            if reg:
+                return reg
+            print(f"⚠ Сервер не выдал worker_id/session. Повтор через {retry_delay} с...")
         except KeyboardInterrupt:
             print("\nВоркер остановлен пользователем до регистрации.")
             sys.exit(0)
-        except Exception as e:
-            print(f"✗ Сервер недоступен при регистрации: {e}. Повтор через {retry_delay} с...")
+        except Exception as e:  # noqa: BLE001
+            print(f"✗ Регистрация не удалась: {e}. Повтор через {retry_delay} с...")
 
         try:
             time.sleep(retry_delay)
@@ -302,27 +309,36 @@ def _masters_list(base_url: str, extra: list[str] | None) -> list[str]:
 
 def deliver_result(masters: list[str], primary: str, element: str, name: str,
                    pubkey_hash: str, struct_id: str, data: dict, logger,
-                   attempts: int = 30, delay: int = 10):
+                   attempts: int = 30, delay: int = 10,
+                   wallet=None, public_key: str | None = None):
     """
     Ищет мастера, который возьмёт готовый результат (ready):
-    GET /work/height (регистрация + высота) → POST /submit-result ready.
+    GET /work/height (поддерживает ли элемент) → POST /register-worker с
+    подписью nonce (worker_id + session) → POST /submit-result ready.
+
+    Регистрация у каждого мастера своя: worker_id другого мастера ничего не
+    доказывает, а без подписи ключа готовый результат не примет никто.
     """
     order = [primary] + [m for m in masters if m != primary]
     for attempt in range(1, attempts + 1):
         for url in order:
             try:
                 r = requests.get(url + "/work/height",
-                                 params={"element": element, "name": name,
-                                         "pubkey_hash": pubkey_hash},
-                                 timeout=10)
+                                 params={"element": element}, timeout=10)
                 if r.status_code != 200:
                     continue
                 info = r.json()
                 if info.get("status") != "ok":
                     logger.info(f"{url}: {info.get('status')} — пропускаю")
                     continue
+                reg = _register_once(url + "/register-worker", name, pubkey_hash,
+                                     public_key, wallet)
+                if not reg:
+                    logger.warning(f"{url}: регистрация с подписью не удалась")
+                    continue
                 sub = requests.post(url + "/submit-result", json={
-                    "worker_id": info["worker_id"],
+                    "worker_id": reg["worker_id"],
+                    "session": reg["session"],
                     "struct_id": struct_id,
                     "success": True,
                     "data": data,
@@ -357,7 +373,9 @@ def start_heartbeat(base_url: str, holder: dict, logger,
             if wid:
                 try:
                     r = requests.get(base_url + "/heartbeat",
-                                     params={"worker_id": wid}, timeout=5)
+                                     params={"worker_id": wid,
+                                             "session": holder.get("session")},
+                                     timeout=5)
                     if r.status_code == 200 and r.json().get("status") == "unknown":
                         # Перерегистрацию делает основной цикл (400 от /get-task) —
                         # heartbeat не должен гонки ради сам создавать воркера
@@ -442,9 +460,10 @@ def main():
 
     # Регистрация воркера (POST с name + адресом кошелька)
     reg_url = f"{base_url}/register-worker"
-    worker_id = register_with_retry(reg_url, worker_name, pubkey_hash,
-                                    public_key, wallet=wallet,
-                                    retry_delay=args.retry_delay)
+    reg = register_with_retry(reg_url, worker_name, pubkey_hash,
+                              public_key, wallet=wallet,
+                              retry_delay=args.retry_delay)
+    worker_id, session = reg["worker_id"], reg["session"]
 
     logger = setup_logger(worker_id, log_dir)
     logger.info(f"Воркер {worker_id} зарегистрирован (name={worker_name}, "
@@ -457,7 +476,7 @@ def main():
 
     # heartbeat стартует ДО цикла задач: пока идёт CP2K (минуты-часы),
     # мастер видит, что воркер жив, и не отбирает у него задачу
-    holder = {"worker_id": worker_id, "stop": False,
+    holder = {"worker_id": worker_id, "session": session, "stop": False,
               "stop_event": threading.Event()}
     start_heartbeat(base_url, holder, logger)
     logger.info(f"Heartbeat каждые {HEARTBEAT_SEC} с — мастер увидит пропажу воркера "
@@ -475,7 +494,7 @@ def main():
 
                 response = requests.get(
                     task_url,
-                    params={"worker_id": worker_id, "pubkey_hash": pubkey_hash},
+                    params={"worker_id": worker_id, "session": session},
                     timeout=10,
                 )
                 response.raise_for_status()
@@ -518,6 +537,7 @@ def main():
 
                 payload = {
                     "worker_id": worker_id,
+                    "session": session,
                     "struct_id": struct_id,
                     "success": success,
                     "data": data,
@@ -533,7 +553,8 @@ def main():
                     if success:
                         target, res = deliver_result(
                             masters, base_url, cfg["element"], worker_name,
-                            pubkey_hash, struct_id, data, logger)
+                            pubkey_hash, struct_id, data, logger,
+                            wallet=wallet, public_key=public_key)
                         if target:
                             logger.info(f"Готовый результат {struct_id} принят мастером "
                                         f"{target} ({res.get('kept')})")
@@ -547,13 +568,18 @@ def main():
                                    if sub_data.get("reason") else ""))
 
             except requests.exceptions.HTTPError as http_err:
-                # 400 от /get-task — мастер перезапустился и не знает наш worker_id
-                if http_err.response is not None and http_err.response.status_code == 400:
-                    logger.warning("Мастер не знает воркера — прохожу регистрацию заново")
-                    worker_id = register_with_retry(reg_url, worker_name, pubkey_hash,
-                                                    public_key, wallet=wallet,
-                                                    retry_delay=args.retry_delay)
+                # 400/403 от /get-task — мастер перезапустился (нет нашего worker_id)
+                # или не признал сессию: проходим регистрацию заново
+                code = (http_err.response.status_code
+                        if http_err.response is not None else None)
+                if code in (400, 403):
+                    logger.warning("Мастер не знает воркера/сессию — прохожу регистрацию заново")
+                    reg = register_with_retry(reg_url, worker_name, pubkey_hash,
+                                              public_key, wallet=wallet,
+                                              retry_delay=args.retry_delay)
+                    worker_id, session = reg["worker_id"], reg["session"]
                     holder["worker_id"] = worker_id
+                    holder["session"] = session
                     logger.info(f"Новый worker_id: {worker_id}")
                 else:
                     logger.warning(f"HTTP-ошибка связи с сервером: {http_err}. "

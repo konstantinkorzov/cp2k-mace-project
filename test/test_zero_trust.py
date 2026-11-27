@@ -397,12 +397,13 @@ def restart_tests():
         print("\n--- 17. Цикл мастера в режиме restart ---")
         main.pending_tasks.clear(); main.active_tasks.clear()
         main.completed_tasks.clear(); main.failed_tasks.clear(); main.registered_workers.clear()
-        wid = main._register_worker("test", None, None)["worker_id"]
+        reg = main._register_worker("test", None, None)
+        wid, sess = reg["worker_id"], reg["session"]
         # В v4 сверка геометрии включается для блоков с зарегистрированным
         # шаблоном (это проверяется отдельным тестом); здесь — сам механизм.
         t = {**task, "struct_id": "n2_d3_0007", "attempts": 0}
         main.pending_tasks.append(t)
-        got = main.get_task(wid)
+        got = main.get_task(wid, session=sess)
         check("мастер не передаёт режим проверки (он всегда restart)",
               "verify_mode" not in got["task"]["cfg"])
         issued = got["task"]
@@ -410,38 +411,42 @@ def restart_tests():
                  "species": issued["species"],
                  "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
         bad = main.submit_result(main.TaskResult(
-            worker_id=wid, struct_id=issued["struct_id"], success=True, data=wrong))
+            worker_id=wid, session=sess, struct_id=issued["struct_id"],
+            success=True, data=wrong))
         check("подменённая геометрия отклоняется до CP2K",
               bad.get("status") == "rejected" and "не та" in str(bad.get("reason")), str(bad))
 
         # задание вернулось в очередь — выдаём снова (новый seed → новая геометрия)
-        got = main.get_task(wid)
+        got = main.get_task(wid, session=sess)
         issued = got["task"]
         good = {"geometry": issued["geometry"],
                 "species": issued["species"],
                 "energy_ev": -2614.38,
                 "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
-        resp = main.submit_result(main.TaskResult(worker_id=wid,
+        resp = main.submit_result(main.TaskResult(worker_id=wid, session=sess,
                                                   struct_id=issued["struct_id"],
                                                   success=True, data=good))
         check("submit-result принял состояние", resp["status"] == "accepted", str(resp))
 
-        main.submit_result(main.TaskResult(worker_id=wid, struct_id="n2_d3_0008",
-                                           success=True, data=good))
-        check("результат для неизвестной задачи не принимается", True)
+        unknown = main.submit_result(main.TaskResult(
+            worker_id=wid, session=sess, struct_id="n2_d3_0008",
+            success=True, data=good))
+        check("результат для неизвестной задачи не принимается",
+              unknown.get("status") == "not_found", str(unknown))
 
         # шаблонов больше нет, но геометрия всё равно сверяется с выданной:
         # мастер выдал координаты сам, воркер обязан считать ровно их
         main.pending_tasks.clear(); main.active_tasks.clear()
         main.pending_tasks.append({**task, "struct_id": "n2_d3_0010", "attempts": 0})
-        issued2 = main.get_task(wid)["task"]
+        issued2 = main.get_task(wid, session=sess)["task"]
         check("без шаблона задание тоже содержит геометрию",
               len(issued2.get("geometry") or []) == 2)
         free = {"geometry": [[0.0, 0.0, 0.0], [3.4, 0.0, 0.0]],
                 "species": issued2["species"],
                 "wfn_b64": base64.b64encode(open(p, "rb").read()).decode("ascii")}
         free_resp = main.submit_result(main.TaskResult(
-            worker_id=wid, struct_id=issued2["struct_id"], success=True, data=free))
+            worker_id=wid, session=sess, struct_id=issued2["struct_id"],
+            success=True, data=free))
         check("подменённая геометрия отклоняется без всяких шаблонов",
               free_resp.get("status") == "rejected", str(free_resp))
 
@@ -1004,23 +1009,24 @@ def busy_tests():
         main.active_tasks.clear()
         main.BUSY.clear()
         r = main._register_worker("busy_t", "hash_busy", None)
-        wid = r["worker_id"]
+        wid, sess = r["worker_id"], r["session"]
 
         main.BUSY.set()
         check("busy: задача не выдаётся",
-              main.get_task(wid).get("status") == "busy")
+              main.get_task(wid, session=sess).get("status") == "busy")
 
         main.BUSY.clear()
         main.pending_tasks.append({"struct_id": "b1", "task_index": 0,
                                    "n_atoms": 2, "dim": 3, "attempts": 0})
-        got = main.get_task(wid)
+        got = main.get_task(wid, session=sess)
         check("задача выдана до занятости", got.get("status") == "ok")
         sid = got["task"]["struct_id"]
 
         main.BUSY.set()
         payload = {"geometry": [[0.0, 0.0, 0.0], [0.0, 0.0, 3.0]],
                    "n_atoms": 2, "wfn_b64": "AA=="}
-        busy = main.submit_result(main.TaskResult(worker_id=wid, struct_id=sid,
+        busy = main.submit_result(main.TaskResult(worker_id=wid, session=sess,
+                                                  struct_id=sid,
                                                   success=True, data=payload))
         check("submit на занятом мастере → busy", busy.get("status") == "busy", busy)
         check("задача НЕ вернулась в очередь сразу",
@@ -1039,27 +1045,29 @@ def busy_tests():
 
         main.BUSY.clear()
         ready = main.submit_result(main.TaskResult(
-            worker_id=wid, struct_id="b_ready", success=True,
+            worker_id=wid, session=sess, struct_id="b_ready", success=True,
             data=payload, ready=True))
         check("ready-результат принимается без задачи",
               ready.get("status") == "accepted", ready)
 
         main.BUSY.set()
         ready_busy = main.submit_result(main.TaskResult(
-            worker_id=wid, struct_id="b_ready2", success=True,
+            worker_id=wid, session=sess, struct_id="b_ready2", success=True,
             data=payload, ready=True))
         check("ready на занятом мастере → busy",
               ready_busy.get("status") == "busy", ready_busy)
         main.BUSY.clear()
 
         try:
-            main.work_height(element="Fe", pubkey_hash="h", name="n")
+            main.work_height(element="Fe")
             check("work/height: чужой элемент отклонён", False)
         except Exception:
             check("work/height: чужой элемент отклонён", True)
-        wh = main.work_height(element="Cu", pubkey_hash="hash_wh", name="nw")
-        check("work/height регистрирует воркера",
-              wh.get("status") == "ok" and wh.get("worker_id"), wh)
+        before = len(main.registered_workers)
+        wh = main.work_height(element="Cu")
+        check("work/height — справка, воркера не регистрирует",
+              wh.get("status") == "ok" and "worker_id" not in wh
+              and len(main.registered_workers) == before, wh)
 
         # --- воркер: занятый мастер → другой мастер ---
         class R:
@@ -1070,17 +1078,27 @@ def busy_tests():
             def json(self):
                 return self._d
 
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
         seen = []
 
         def fake_get(url, params=None, timeout=None):
             seen.append(("get", url))
             if "p2" in url:
-                return R(200, {"status": "ok", "worker_id": "w2"})
+                if url.endswith("/register-challenge"):
+                    return R(200, {"nonce": "11" * 32})
+                return R(200, {"status": "ok", "height": 0, "element": "Cu"})
             return R(200, {"status": "busy"})
 
         def fake_post(url, json=None, timeout=None):
             seen.append(("post", url))
             if "p2" in url:
+                if url.endswith("/register-worker"):
+                    return R(200, {"status": "ok", "worker_id": "w2",
+                                   "session": "sess_w2"})
+                assert (json or {}).get("session") == "sess_w2", json
                 return R(200, {"status": "accepted", "kept": "accepted"})
             return R(200, {"status": "busy"})
 
@@ -1112,11 +1130,12 @@ def lease_tests():
         main.active_tasks.clear()
         main.registered_workers.clear()
         main.worker_by_pubkey.clear()
-        wid = main._register_worker("lease_t", "hash_lease", None, verified=True)["worker_id"]
+        reg_l = main._register_worker("lease_t", "hash_lease", None, verified=True)
+        wid, sess = reg_l["worker_id"], reg_l["session"]
 
         main.pending_tasks.append({"struct_id": "L1", "task_index": 0,
                                    "n_atoms": 2, "dim": 3, "attempts": 0})
-        main.get_task(wid)
+        main.get_task(wid, session=sess)
         t0 = main.active_tasks["L1"]["time_sent"]
 
         # воркер шлёт heartbeat → задача не снимается
@@ -1134,7 +1153,7 @@ def lease_tests():
         main.pending_tasks.clear()
         main.pending_tasks.append({"struct_id": "L2", "task_index": 0,
                                    "n_atoms": 2, "dim": 3, "attempts": 0})
-        main.get_task(wid)
+        main.get_task(wid, session=sess)
         t1 = main.active_tasks["L2"]["time_sent"]
         late = t1 + main._task_timeout() + 1
         main.registered_workers[wid]["last_seen"] = late
@@ -1145,7 +1164,7 @@ def lease_tests():
         main.pending_tasks.clear()
         main.pending_tasks.append({"struct_id": "L3", "task_index": 0,
                                    "n_atoms": 2, "dim": 3, "attempts": 0})
-        main.get_task(wid)
+        main.get_task(wid, session=sess)
         main._register_worker("lease_t", "hash_lease", None, verified=True)
         check("lease: перерегистрация воркера возвращает его задачу",
               "L3" not in main.active_tasks
@@ -1177,12 +1196,13 @@ def master_geometry_tests():
         main.active_tasks.clear()
         main.registered_workers.clear()
         main.worker_by_pubkey.clear()
-        wid = main._register_worker("geom_t", "hash_geom", None)["worker_id"]
+        reg_g = main._register_worker("geom_t", "hash_geom", None)
+        wid, sess = reg_g["worker_id"], reg_g["session"]
 
         task = {"struct_id": "n2_g1", "task_index": 0, "n_atoms": 2, "dim": 3,
                 "seed": 777, "attempts": 0}
         main.pending_tasks.append(dict(task))
-        got = main.get_task(wid)
+        got = main.get_task(wid, session=sess)
         payload = got.get("task") or {}
         check("задание содержит готовую геометрию и сорт атомов",
               len(payload.get("geometry") or []) == 2
@@ -1471,34 +1491,122 @@ def worker_registry_tests():
     r1b = main._register_worker("alpha", "hash_a", "pub_a", verified=True)
     check("тот же ключ — тот же worker_id",
           r1b["worker_id"] == r1["worker_id"] and r1b["known"])
+    check("регистрация выдаёт session",
+          bool(r1.get("session")) and bool(r1b.get("session"))
+          and r1["session"] != r1b["session"], "старая сессия остаётся живой")
 
     main.pending_tasks.append({"struct_id": "reg_0001", "task_index": 0,
                                "n_atoms": 2, "dim": 3, "attempts": 0})
     main.pending_tasks.append({"struct_id": "reg_0002", "task_index": 1,
                                "n_atoms": 2, "dim": 3, "attempts": 0})
 
-    got1 = main.get_task(r1["worker_id"])
+    got1 = main.get_task(r1["worker_id"], session=r1["session"])
     check("первая задача выдана", got1.get("status") == "ok")
-    busy = main.get_task(r1["worker_id"])
+    busy = main.get_task(r1["worker_id"], session=r1["session"])
     check("вторую задачу воркер не получает", busy.get("status") == "busy",
           busy.get("struct_id"))
-    got2 = main.get_task(r2["worker_id"])
+    got2 = main.get_task(r2["worker_id"], session=r2["session"])
     check("другой уникальный воркер получает задачу", got2.get("status") == "ok")
 
+    # H2: worker_id публичен (/queue-status), поэтому пропуск — только session
     try:
-        main.get_task(r1["worker_id"], pubkey_hash="чужой")
-        check("чужой pubkey отклонён", False)
-    except Exception:
-        check("чужой pubkey отклонён", True)
+        main.get_task(r2["worker_id"], session=r1["session"])
+        check("чужой session отклонён", False)
+    except Exception as e:
+        check("чужой session отклонён", getattr(e, "status_code", None) == 403, str(e))
+    try:
+        main.get_task(r2["worker_id"])
+        check("без session задача не выдаётся", False)
+    except Exception as e:
+        check("без session задача не выдаётся",
+              getattr(e, "status_code", None) == 403, str(e))
+    try:
+        main.submit_result(main.TaskResult(worker_id=r2["worker_id"],
+                                           struct_id="reg_0002",
+                                           success=False, data={}))
+        check("без session результат не принимается", False)
+    except Exception as e:
+        # повторная попытка без session может упереться в троттлинг (429) —
+        # это тоже отказ, поэтому принимаем 403 и 429
+        check("без session результат не принимается",
+              getattr(e, "status_code", None) in (403, 429), str(e))
+
+    hb = main.heartbeat(r2["worker_id"], session="подделка")
+    check("чужой heartbeat не продлевает lease", hb.get("status") == "unauthorized", hb)
 
     main.PAUSED = True
-    check("пауза блокирует выдачу", main.get_task(r1["worker_id"]).get("status") == "paused")
+    check("пауза блокирует выдачу",
+          main.get_task(r1["worker_id"], session=r1["session"]).get("status") == "paused")
     main.PAUSED = False
 
     main.pending_tasks.clear()
     main.active_tasks.clear()
     main.registered_workers.clear()
     main.worker_by_pubkey.clear()
+
+    # --- регистрация в HTTP-слое требует подписи ключа ---
+    try:
+        main.register_worker(main.WorkerRegistration(name="anon"))
+        check("регистрация без подписи отклонена", False)
+    except Exception as e:
+        check("регистрация без подписи отклонена",
+              getattr(e, "status_code", None) == 403, str(e))
+
+    try:
+        main.register_worker_get()
+        check("GET /register-worker закрыт (410)", False)
+    except Exception as e:
+        check("GET /register-worker закрыт (410)",
+              getattr(e, "status_code", None) == 410, str(e))
+
+    seed = b"\x11" * 32
+    pub = crypto.public_key_from_seed(seed)
+    addr = crypto.address_from_public(pub)
+    nonce = main._issue_registration_nonce()
+    sig = crypto.sign(seed, b"cp2k-mace-register:" + bytes.fromhex(nonce))
+    signed = main.register_worker(main.WorkerRegistration(
+        name="signed", pubkey_hash=addr, public_key=pub.hex(),
+        nonce=nonce, signature=sig.hex()))
+    check("регистрация с подписью принята",
+          signed.get("status") == "ok" and bool(signed.get("session")), str(signed))
+    try:
+        main.register_worker(main.WorkerRegistration(
+            name="signed", pubkey_hash=addr, public_key=pub.hex(),
+            nonce=nonce, signature=sig.hex()))
+        check("повтор nonce (replay) отклонён", False)
+    except Exception as e:
+        check("повтор nonce (replay) отклонён",
+              getattr(e, "status_code", None) == 403, str(e))
+
+    # --- потолок числа воркеров ---
+    saved_cap = main.MAX_REGISTERED_WORKERS
+    main.registered_workers.clear()
+    main.worker_by_pubkey.clear()
+    try:
+        main.MAX_REGISTERED_WORKERS = 2
+        main._register_worker("c1", "cap_a", "p1", verified=True)
+        main._register_worker("c2", "cap_b", "p2", verified=True)
+        try:
+            main._register_worker("c3", "cap_c", "p3", verified=True)
+            check("потолок воркеров соблюдается", False)
+        except Exception as e:
+            check("потолок воркеров соблюдается",
+                  getattr(e, "status_code", None) == 503, str(e))
+        check("при отказе старые воркеры целы", len(main.registered_workers) == 2)
+    finally:
+        main.MAX_REGISTERED_WORKERS = saved_cap
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+
+    # --- лимит регистраций по IP ---
+    main._reset_reg_rate()
+    taken = sum(1 for _ in range(main.REG_LIMIT_PER_IP) if main._reg_rate_ok("10.0.0.1"))
+    check("лимит регистраций по IP",
+          taken == main.REG_LIMIT_PER_IP
+          and not main._reg_rate_ok("10.0.0.1")
+          and main._reg_rate_ok("10.0.0.2"),
+          f"взято {taken} из {main.REG_LIMIT_PER_IP}")
+    main._reset_reg_rate()
 
 
 def run():
