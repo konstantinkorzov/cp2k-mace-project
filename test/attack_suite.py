@@ -372,14 +372,23 @@ def test_admin_api_without_token():
     except Exception as e:  # noqa: BLE001
         check("admin: импорт main", False, str(e))
         return
-    if main.ADMIN_TOKEN:
-        check("admin: токен задан, внешний доступ по токену", True,
-              "MASTER_ADMIN_TOKEN установлен")
-        return
-    outside = main._admin_allowed("203.0.113.5")
-    local = main._admin_allowed("127.0.0.1")
-    check("админ-API без токена закрыт снаружи", not outside and local,
-          f"outside={outside}, local={local}", attack=True)
+    saved = main.ADMIN_TOKEN
+    try:
+        main.ADMIN_TOKEN = ""
+        check("админ-API без токена: локально можно, снаружи нельзя",
+              main._admin_allowed("127.0.0.1")
+              and not main._admin_allowed("203.0.113.5"),
+              attack=True)
+        main.ADMIN_TOKEN = "s3cret-token"
+        check("админ-API с токеном: снаружи по верному токену",
+              main._admin_allowed("203.0.113.5", "s3cret-token"), attack=True)
+        check("админ-API с токеном: без токена и с неверным — отказ",
+              not main._admin_allowed("203.0.113.5")
+              and not main._admin_allowed("203.0.113.5", "bad"), attack=True)
+        check("админ-API: локально без токена по-прежнему можно",
+              main._admin_allowed("127.0.0.1"), attack=True)
+    finally:
+        main.ADMIN_TOKEN = saved
 
 
 def main_run():

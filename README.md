@@ -168,7 +168,32 @@ python3 src/main.py --port 8000 --wallet master --password root \
 | `--password` / `MASTER_PASSWORD` | запрос в консоли | пароль этого кошелька |
 | `--peer URL` (можно несколько) / `MASTER_PEERS` | пусто | другие мастера для синхронизации |
 | `--results-dir` / `MASTER_RESULTS_DIR` | `results` | каталог цепочки, кошельков и логов |
-| `MASTER_ADMIN_TOKEN` | — | **устарел:** админ-API теперь только с localhost |
+| `MASTER_ADMIN_TOKEN` | пусто | токен для **удалённого** админ-API; пусто — админка только с localhost |
+
+### Удалённое управление мастером
+
+По умолчанию админ-API (`/admin/*`, его использует `master-cli.py`) доступен
+только с localhost — панели и `master-cli` на той же машине этого достаточно.
+Чтобы управлять мастером с другой машины, задайте длинный случайный токен:
+
+```bash
+MASTER_ADMIN_TOKEN="$(openssl rand -hex 32)" python3 src/main.py \
+    --wallet master --password root
+```
+
+и передайте его клиенту (заголовок `X-Admin-Token`):
+
+```bash
+python3 src/master-cli.py --url http://203.0.113.10:8000 --token <тот же токен> status
+```
+
+Токен в `master-cli.py` можно не писать в argv, а положить в `MASTER_ADMIN_TOKEN`.
+
+⚠️ Порт мастера — **HTTP**: токен и ответы идут открытым текстом. Для управления
+через интернет используйте SSH-туннель (`ssh -L 8000:127.0.0.1:8000 host`) или
+VPN; тогда `--url http://127.0.0.1:8000` и токен вообще не нужен. Публичный
+`GET /peers` (список адресов мастеров) открыт всем — это нужно воркерам для
+gossip, секрета там нет.
 
 ### Воркер: worker.py
 

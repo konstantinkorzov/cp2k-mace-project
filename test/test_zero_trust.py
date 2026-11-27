@@ -1155,7 +1155,7 @@ def lease_tests():
 
 
 def master_geometry_tests():
-    print("\n--- 27. Мастер — источник геометрии (и шаблон) ---")
+    print("\n--- 27. Мастер — источник геометрии ---")
     import tempfile as _tempfile
 
     tmp = _tempfile.mkdtemp(prefix="geom_")
@@ -1190,6 +1190,29 @@ def master_geometry_tests():
         g0 = main._issue_geometry(dict(task, nonce=4242))
         check("геометрия задания без шаблонов",
               "template_sha" not in g0 and "template_obj" not in g0)
+
+        # --- админ-API: локально или по токену ---
+        saved_token = main.ADMIN_TOKEN
+        try:
+            main.ADMIN_TOKEN = ""
+            check("админка: локально без токена",
+                  main._admin_allowed("127.0.0.1"))
+            check("админка: снаружи без токена закрыта",
+                  not main._admin_allowed("203.0.113.5"))
+            main.ADMIN_TOKEN = "s3cret-token"
+            check("админка: снаружи по верному токену",
+                  main._admin_allowed("203.0.113.5", "s3cret-token"))
+            check("админка: неверный токен отклонён",
+                  not main._admin_allowed("203.0.113.5", "bad"))
+        finally:
+            main.ADMIN_TOKEN = saved_token
+        check("форк: распознаётся сообщение v5",
+              main._is_fork_conflict(
+                  "prev_id не совпадает с головой локальной цепочки"))
+        check("форк: распознаётся старое сообщение v1",
+              main._is_fork_conflict("prev_sha256 не совпадает"))
+        check("публичный /peers отдаёт список",
+              isinstance(main.peers_public().get("peers"), list))
     finally:
         main.pending_tasks.clear()
         main.active_tasks.clear()

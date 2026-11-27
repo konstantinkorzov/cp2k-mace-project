@@ -30,6 +30,7 @@ import re
 import shutil
 import glob
 import hashlib
+import hmac
 import tempfile
 import argparse
 import asyncio
@@ -1168,26 +1169,32 @@ async def _body_guard(request, call_next):
     return await call_next(request)
 
 
-def _admin_allowed(host: str) -> bool:
-    """Админ-API без MASTER_ADMIN_TOKEN — только с localhost.
-
-    Иначе любой, кто видит порт мастера, может менять config.json (в т.ч.
-    atom_diameter — параметр консенсуса), ставить паузу, добавлять пиров и
-    запускать тяжёлую перекачку цепочки.
+def _admin_allowed(host: str, token: str | None = None) -> bool:
     """
-    # Токен не нужен: админка — только изнутри узла (localhost).
-    # Для этого и middleware ниже; внешние вызовы не проходят никогда.
-    return (host or "") in ("127.0.0.1", "::1", "localhost")
+    Админ-API: локально — всегда, снаружи — только по MASTER_ADMIN_TOKEN.
+
+    Локальный доступ нужен панели и master-cli на той же машине. Удалённое
+    управление (--url http://host:8000) требует токена: без него любой, кто
+    видит порт мастера, менял бы config.json, паузу и пиров.
+    """
+    if (host or "") in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if not ADMIN_TOKEN or not token:
+        return False
+    return hmac.compare_digest(str(token), ADMIN_TOKEN)
 
 
 @app.middleware("http")
 async def _admin_guard(request, call_next):
     if request.url.path.startswith("/admin"):
         host = (request.client.host if request.client else "") or ""
-        if not _admin_allowed(host):
+        token = (request.headers.get("x-admin-token")
+                 or request.query_params.get("token"))
+        if not _admin_allowed(host, token):
             from fastapi.responses import JSONResponse
             return JSONResponse(
-                {"detail": "admin API: задайте MASTER_ADMIN_TOKEN для внешнего доступа"},
+                {"detail": "admin API: нужен MASTER_ADMIN_TOKEN (заголовок "
+                           "X-Admin-Token или ?token=)"},
                 status_code=401)
     return await call_next(request)
 
@@ -2173,6 +2180,11 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
         return {"accepted": 0, "errors": [str(e)]}
 
 
+def _is_fork_conflict(text: str) -> bool:
+    """Ошибка = расхождение ветвей (v5: prev_id; старые: prev_sha256)."""
+    return "prev_id не совпадает" in text or "prev_sha256" in text
+
+
 def sync_from_peer(peer: str) -> dict:
     peer = _normalize_peer(peer)
     try:
@@ -2206,7 +2218,7 @@ def sync_from_peer(peer: str) -> dict:
             break
         if not ok:
             text = "; ".join(why)
-            if "prev_sha256" in text and remote > local:
+            if _is_fork_conflict(text) and remote > local:
                 ancestor = _find_fork_ancestor(peer, local)
                 if ancestor is not None:
                     print(f"[Fork] {peer} предлагает другую ветку, общий предок {ancestor}")
@@ -2448,6 +2460,17 @@ def work_height(element: str, pubkey_hash: str | None = None,
           f"высота {h}, адрес {reg['worker_id']}")
     return {"status": "ok", "element": element, "height": h,
             "head_sha256": sha, "worker_id": reg["worker_id"]}
+
+
+@app.get("/peers")
+def peers_public():
+    """
+    Публичный список адресов мастеров — то, что нужно воркерам для gossip.
+    Секрета нет: ровно эти URL мастер и так сообщает воркерам.
+    """
+    height, _sha = _local_head()
+    peers = [str(p) for p in (CONFIG.get("peers") or []) if str(p).strip()]
+    return {"element": CONFIG["element"], "height": height, "peers": peers}
 
 
 @app.get("/chain/height")

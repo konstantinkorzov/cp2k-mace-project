@@ -266,7 +266,10 @@ def discover_peers(masters: list[str], logger) -> list[str]:
     added = []
     for url in list(masters):
         try:
-            r = requests.get(url.rstrip("/") + "/admin/peers", timeout=5)
+            r = requests.get(url.rstrip("/") + "/peers", timeout=5)
+            if r.status_code != 200:
+                # старый мастер: список пиров был только в админ-API
+                r = requests.get(url.rstrip("/") + "/admin/peers", timeout=5)
             if r.status_code != 200:
                 continue
             for peer in (r.json().get("peers") or []):

@@ -39,7 +39,10 @@ def _request(args, method: str, path: str, **kwargs):
     url = args.url.rstrip("/") + path
     params = dict(kwargs.pop("params", {}))
     if args.token:
-        params["token"] = args.token
+        # заголовок, а не ?token=: query попадает в логи и историю прокси
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["X-Admin-Token"] = args.token
+        kwargs["headers"] = headers
     timeout = kwargs.pop("timeout", args.timeout)
     try:
         resp = requests.request(method, url, params=params, timeout=timeout, **kwargs)
