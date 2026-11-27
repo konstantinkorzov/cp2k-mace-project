@@ -88,8 +88,14 @@ function pickDir(port) {
 }
 
 function resolveDir(dir) {
+    // каталоги, которые запускает панель, обязаны быть внутри проекта:
+    // иначе имя/путь из веб-формы выводит запись за его пределы
     if (!dir) return null;
-    return path.isAbsolute(dir) ? dir : path.join(ROOT, dir);
+    const abs = path.resolve(ROOT, String(dir));
+    if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) {
+        throw new Error('каталог должен быть внутри проекта');
+    }
+    return abs;
 }
 
 /** Порт мастера по умолчанию из src/config.json (ключ "port"). */
@@ -224,9 +230,16 @@ async function startWorker(opts = {}) {
     return publicRecord(rec);
 }
 
+const ELEMENT_RE = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/;
+
 function startMace(opts = {}) {
     const args = ['mace_pipeline/run_mace.py'];
-    if (opts.element) args.push('--element', String(opts.element));
+    if (opts.element) {
+        if (!ELEMENT_RE.test(String(opts.element))) {
+            throw new Error('недопустимое имя системы (латиница/цифры/._-)');
+        }
+        args.push('--element', String(opts.element));
+    }
     if (opts.resultsDir) args.push('--results-dir', resolveDir(opts.resultsDir));
     if (opts.outputDir) args.push('--output-dir', resolveDir(opts.outputDir));
     if (opts.model) args.push('--model', String(opts.model));

@@ -791,6 +791,54 @@ def chain_tests():
             for name, data in entries.items():
                 z.writestr(name, data)
         check("подмена dft внутри блока ловится", not chain.verify_chain(tmp, "Cu")["ok"])
+
+        # --- аудит: txid — обязательство на тело транзакции ---
+        tx_bad = {"version": 1, "type": "transfer",
+                  "inputs": [{"txid": "a" * 64, "vout": 0}],
+                  "outputs": [{"value": 100, "address": "b" * 64}],
+                  "txid": "c" * 64}
+        ok_bad, probs = chain.validate_tx(tx_bad, tmp, utxo={})
+        check("txid, не совпадающий с телом, отклоняется",
+              not ok_bad and any("txid не совпадает" in x for x in probs), probs[:2])
+
+        # --- аудит: мусор в coinbase не роняет проверку блока ---
+        tmpv = tempfile.mkdtemp(prefix="chain_txid_")
+        try:
+            wfnv = os.path.join(tmpv, "state.wfn")
+            make_wfn(wfnv)
+            shav, relv = chain.store_blob(tmpv, wfnv)
+            cb_bad = {"version": 1, "type": "coinbase", "height": 1,
+                      "inputs": [{"coinbase": "block-000001"}],
+                      "outputs": [{"value": None, "address": master}],
+                      "txid": "c" * 64}
+            pv = chain.write_block(tmpv, "Cu", 2, shav, relv, [cb_bad],
+                                   dft=block_dft(tmpv, n_atoms=2), **cp2k)
+            vb = chain.verify_block(tmpv, pv)
+            check("coinbase с нечисловой суммой не роняет проверку",
+                  vb["ok"] is False
+                  and any("не целое" in x for x in vb["problems"]),
+                  vb["problems"][:2])
+            # записанный txid канонический, а tx_root считается по нему же
+            stored = chain.read_block_txs(pv)[0]
+            check("write_block пересчитывает txid, tx_root согласован",
+                  stored["txid"] == chain.txid_of(stored)
+                  and stored["txid"] != cb_bad["txid"]
+                  and chain.tx_root_of([stored]) == chain.read_block(pv)[0]["tx_root"])
+        finally:
+            shutil.rmtree(tmpv, ignore_errors=True)
+
+        # --- аудит: zip-бомба по числу записей ---
+        import io as _io
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zb:
+            for i in range(chain.MAX_BLOCK_ENTRIES + 1):
+                zb.writestr(f"tx-{i:04d}-coinbase.json", "{}")
+        too_many = False
+        try:
+            chain.read_block_bytes(buf.getvalue())
+        except ValueError:
+            too_many = True
+        check("архив с лишними записями отбивается", too_many)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.rmtree(tmp2, ignore_errors=True)

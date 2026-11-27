@@ -316,6 +316,7 @@ def block_name(seq: int, element: str, n_atoms: int) -> str:
 def read_block_txs(path: str) -> list[dict]:
     txs = []
     with zipfile.ZipFile(path) as z:
+        _zip_guard(z)
         for name in sorted(z.namelist()):
             if name.startswith("tx-") and name.endswith(".json"):
                 tx = json.loads(z.read(name).decode("utf-8"))
@@ -413,7 +414,12 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
     if utxo is None:
         utxo = utxo_set(element_dir)
 
-    tid = tx.get("txid") or txid_of(tx)
+    # txid — обязательство на тело: подпись проверяется по нему, поэтому
+    # присланное значение обязано совпадать с каноническим хэшем.
+    canonical = txid_of(tx)
+    if tx.get("txid") is not None and tx["txid"] != canonical:
+        return False, ["txid не совпадает с телом транзакции"]
+    tid = canonical
     inputs = tx.get("inputs") or []
     if not inputs:
         problems.append("нет входов")
@@ -480,7 +486,7 @@ def build_wallet_transfer(wallet, element_dir: str, to_address: str,
 
 
 def height_of_hash(element_dir: str, sha: str) -> int | None:
-    """Высота блока с данным sha256 (для поиска общего предка при форке)."""
+    """Высота блока с данным sha256 ФАЙЛА (не block_id)."""
     for b in list_blocks(element_dir):
         if b["sha256"] == sha:
             return b["seq"]
@@ -552,6 +558,15 @@ def write_block(element_dir: str, system: str, n_atoms: int,
         composition = {str(system): 1}
     composition = {str(k): int(v) for k, v in composition.items()}
 
+    # Канонизируем txid ДО расчёта tx_root: иначе корень считался бы по
+    # присланному полю, а в архив попадал пересчитанный — блок терял валидность.
+    txs = []
+    for tx in transactions:
+        tx = dict(tx)
+        tx["txid"] = txid_of(tx)
+        txs.append(tx)
+    transactions = txs
+
     d = blocks_dir(element_dir)
     os.makedirs(d, exist_ok=True)
     seq = next_seq(element_dir)
@@ -593,8 +608,6 @@ def write_block(element_dir: str, system: str, n_atoms: int,
         if dft is not None:
             z.writestr(DFT_NAME, json.dumps(dft, ensure_ascii=False, indent=2))
         for idx, tx in enumerate(transactions):
-            tx = dict(tx)
-            tx["txid"] = txid_of(tx)
             fname = f"tx-{idx:04d}-{tx.get('type', 'tx')}.json"
             z.writestr(fname, json.dumps(tx, ensure_ascii=False, indent=2))
     os.replace(tmp, path)
@@ -628,6 +641,10 @@ SYMBOL_RE = re.compile(r"^[A-Z][a-z]?$")
 # берём его жадно, а n_atoms — последний _<число>.zip.
 BLOCK_NAME_RE = re.compile(r"^(\d{6})_(.+)_(\d+)\.zip$")
 MAX_NONCE = 2 ** 64 - 1
+
+# Ограничения на содержимое блока: легитимный блок — единицы-десятки КБ.
+MAX_BLOCK_ENTRIES = 64                  # header + dft + транзакции
+MAX_BLOCK_UNPACKED = 128 * 1024 * 1024   # суммарный распакованный размер
 
 
 def _is_number(value) -> bool:
@@ -752,9 +769,24 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
     return problems
 
 
+def _zip_guard(z: zipfile.ZipFile) -> None:
+    """Отсекает архивы с подозрительно большим распакованным содержимым."""
+    infos = z.infolist()
+    if len(infos) > MAX_BLOCK_ENTRIES:
+        raise ValueError(f"в блоке {len(infos)} записей > {MAX_BLOCK_ENTRIES}")
+    total = 0
+    for info in infos:
+        if info.file_size > MAX_BLOCK_UNPACKED:
+            raise ValueError(f"{info.filename}: распакованный размер слишком велик")
+        total += info.file_size
+        if total > MAX_BLOCK_UNPACKED:
+            raise ValueError("суммарный распакованный размер блока слишком велик")
+
+
 def read_block_bytes(data: bytes) -> tuple[dict, dict, list[dict], set]:
     """Разбирает zip-блок из памяти (для пиров и тестов)."""
     with zipfile.ZipFile(io.BytesIO(data)) as z:
+        _zip_guard(z)
         names = set(z.namelist())
         header = json.loads(z.read(HEADER_NAME).decode("utf-8")) if HEADER_NAME in names else {}
         dft = json.loads(z.read(DFT_NAME).decode("utf-8")) if DFT_NAME in names else {}
@@ -827,7 +859,9 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         block_fee += max(0.0, total_in - total_out)
 
     if coinbases:
-        cb_value = sum(int(o["value"]) for o in coinbases[0].get("outputs", []))
+        # sum_outputs не падает на мусоре: блок всё равно отклонится
+        # invalid_outputs, но исключения из проверки быть не должно.
+        cb_value = sum_outputs(coinbases[0])
         if cb_value > COINBASE_VALUE + block_fee:
             problems.append(
                 f"{label}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee}")
@@ -845,7 +879,22 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
 
 def verify_block(element_dir: str, block_path: str,
                  expected_seq: int | None = None,
-                 expected_prev: str | None = None) -> dict:
+                 expected_prev: str | None = None,
+                 utxo: dict | None = None) -> dict:
+    """Обёртка: невалидный/битый блок возвращает ok=False, а не исключение."""
+    try:
+        return _verify_block(element_dir, block_path, expected_seq=expected_seq,
+                             expected_prev=expected_prev, utxo=utxo)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False,
+                "problems": [f"блок не проверяется: {type(e).__name__}: {e}"],
+                "header": {}, "dft": {}, "txs": []}
+
+
+def _verify_block(element_dir: str, block_path: str,
+                  expected_seq: int | None = None,
+                  expected_prev: str | None = None,
+                  utxo: dict | None = None) -> dict:
     """
     Проверяет ОДИН скачанный блок, ничего не записывая:
     схема/block_id, prev_id, tx_root, dft_sha, воспроизводимость геометрии,
@@ -921,7 +970,11 @@ def verify_block(element_dir: str, block_path: str,
             except Exception as e:  # noqa: BLE001
                 problems.append(f"виды атомов нельзя воспроизвести: {e}")
 
-    utxo = utxo_set(element_dir)
+    if utxo is None:
+        utxo = utxo_set(element_dir)
+    else:
+        utxo = dict(utxo)
+
     for key in list(utxo):
         info = utxo[key]
         utxo[key] = {"value": info["value"], "address": info["address"],

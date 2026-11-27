@@ -169,6 +169,11 @@ def main():
     cfg = load_config(args.config)
     if args.element:
         cfg["element"] = args.element
+    # element — слаг системы и часть путей (results/<element>): без проверки
+    # "../../.." читает и пишет вне каталога проекта
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,63}", str(cfg.get("element") or "")):
+        raise SystemExit("элемент/система: латиница, цифры, . _ - (например cu3, al2o3)")
     if args.results_dir:
         cfg["results_dir"] = os.path.abspath(args.results_dir)
     if args.output_dir:

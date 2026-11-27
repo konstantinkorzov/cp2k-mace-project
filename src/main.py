@@ -979,6 +979,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     dft.update(props)
     dft["props_version"] = cp2k_runner.PROPS_VERSION
 
+    utxo_before = chain_mod.utxo_set(CONFIG["output_dir"])
     path = chain_mod.write_block(
         CONFIG["output_dir"], CONFIG["element"], n_atoms, state_sha, state_rel, txs,
         cp2k_version=CONFIG.get("cp2k_version", "unknown"),
@@ -990,6 +991,18 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
         atom_diameter=float(CONFIG.get("atom_diameter") or 2.0),
         composition=CONFIG.get("composition"),
     )
+
+    v = chain_mod.verify_block(CONFIG["output_dir"], path, expected_seq=seq,
+                               utxo=utxo_before)
+    if not v["ok"]:
+        bad = path + ".bad"
+        try:
+            os.replace(path, bad)
+        except OSError:
+            pass
+        print("[Master] ✗ собранный блок не прошёл проверку и не опубликован: "
+              + "; ".join(v["problems"][:3]))
+        return None
 
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
           f"coinbase {chain_mod.COINBASE_VALUE + fee + mem_fee:d} → {latest['address'][:12]}…")
@@ -1952,6 +1965,31 @@ def _fetch_blob(peer: str, sha: str) -> bytes | None:
         return None
 
 
+BLOCK_MAX_MB = 64          # легитимный блок — десятки КБ; больше — мусор
+
+
+def _fetch_block(peer: str, seq: int) -> bytes | None:
+    """Скачивает блок с ограничением размера (как _fetch_blob для wfn)."""
+    limit = BLOCK_MAX_MB * 1024 * 1024
+    try:
+        with requests.get(f"{peer}/chain/block/{seq}", timeout=120,
+                          stream=True) as r:
+            if r.status_code != 200:
+                return None
+            declared = r.headers.get("Content-Length")
+            if declared and declared.isdigit() and int(declared) > limit:
+                return None
+            chunks, total = [], 0
+            for chunk in r.iter_content(1 << 20):
+                total += len(chunk)
+                if total > limit:
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _expected_n_atoms(seq: int) -> int:
     """Размер кластера для высоты seq по расписанию (консенсус)."""
     return int(stage_for_height(max(0, int(seq) - 1), CONFIG)["n_atoms"])
@@ -2067,14 +2105,11 @@ def _find_fork_ancestor(peer: str, local_height: int) -> int | None:
     """
     mine = {b["seq"]: b["block_id"] for b in chain_mod.list_blocks(CONFIG["output_dir"])}
     for seq in range(local_height, 0, -1):
-        try:
-            r = requests.get(f"{peer}/chain/block/{seq}", timeout=60)
-        except Exception:  # noqa: BLE001
-            return None
-        if r.status_code != 200:
+        data = _fetch_block(peer, seq)
+        if data is None:
             continue
         try:
-            header, _dft, _txs, _names = chain_mod.read_block_bytes(r.content)
+            header, _dft, _txs, _names = chain_mod.read_block_bytes(data)
         except Exception:  # noqa: BLE001
             continue
         if header.get("block_id") and header["block_id"] == mine.get(seq):
@@ -2114,10 +2149,10 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
             local, head = _local_head()
             if local >= seq:
                 continue
-            rb = requests.get(f"{peer}/chain/block/{seq}", timeout=120)
-            if rb.status_code != 200:
-                raise RuntimeError(f"блок {seq}: HTTP {rb.status_code}")
-            ok, why = _accept_peer_block(peer, seq, head, rb.content)
+            data = _fetch_block(peer, seq)
+            if data is None:
+                raise RuntimeError(f"блок {seq}: не скачан или слишком большой")
+            ok, why = _accept_peer_block(peer, seq, head, data)
             if not ok:
                 raise RuntimeError(f"блок {seq}: {'; '.join(why)}")
             accepted += 1
@@ -2158,15 +2193,17 @@ def sync_from_peer(peer: str) -> dict:
         if local >= remote:
             break
         seq = local + 1
+        data = _fetch_block(peer, seq)
+        if data is None:
+            errors.append(f"блок {seq}: не скачан (HTTP или размер)")
+            break
         try:
-            rb = requests.get(f"{peer}/chain/block/{seq}", timeout=120)
+            ok, why = _accept_peer_block(peer, seq, head, data)
         except Exception as e:  # noqa: BLE001
-            errors.append(f"блок {seq}: {e}")
+            # битый блок не должен ронять приём работы: исключение = вина пира
+            errors.append(f"блок {seq}: {type(e).__name__}: {e}")
+            _BAD_PEERS[peer] = time.time() + BAD_PEER_COOLDOWN
             break
-        if rb.status_code != 200:
-            errors.append(f"блок {seq}: HTTP {rb.status_code}")
-            break
-        ok, why = _accept_peer_block(peer, seq, head, rb.content)
         if not ok:
             text = "; ".join(why)
             if "prev_sha256" in text and remote > local:
@@ -2325,8 +2362,11 @@ def tx_submit(req: TxSubmit):
     if not ok:
         return {"status": "rejected", "reason": "; ".join(problems[:5])}
 
-    tid = tx.get("txid") or chain_mod.txid_of(tx)
-    tx["txid"] = tid
+    canonical = chain_mod.txid_of(tx)
+    if tx.get("txid") and tx["txid"] != canonical:
+        return {"status": "rejected", "reason": "txid не совпадает с телом"}
+    tx["txid"] = canonical
+    tid = canonical
     fee = chain_mod.tx_fee_safe(tx, utxo)
     fee = 0 if fee is None else fee
     keys = _tx_input_keys(tx)

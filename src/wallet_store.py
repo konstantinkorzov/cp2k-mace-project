@@ -25,6 +25,7 @@
 Криптография только stdlib (scrypt/HMAC/SHA-256/Ed25519 из crypto.py).
 """
 
+import hmac
 import os
 import re
 import secrets
@@ -196,7 +197,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def _check_password(row: sqlite3.Row, password: str) -> bool:
     _, digest = crypto.hash_password(password, row["password_salt"])
-    return digest == row["password_hash"]
+    return hmac.compare_digest(digest, row["password_hash"])
 
 
 MIN_PASSWORD = 4
