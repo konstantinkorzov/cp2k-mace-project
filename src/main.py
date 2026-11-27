@@ -102,6 +102,12 @@ MAX_TASK_ATTEMPTS = 5      # сколько раз задача возвраща
 MIN_ATOM_DISTANCE_ANG = 0.5
 MIN_DIST_TOLERANCE = 0.9   # только для проверки шаблона при старте (генерация)
 
+# Потолок размера задачи для приёмки: n_atoms приходит из запроса, поэтому
+# всё, что больше, отбивается ДО аллокаций numpy и запуска CP2K. Расписание
+# растёт медленно; 2000 атомов — далеко за пределами практичного кластера,
+# и такой запрос — попытка съесть память мастера, а не работа.
+MAX_TASK_ATOMS = 2000
+
 
 
 # ---------- Пути ----------
@@ -550,9 +556,20 @@ def _check_geometry(coords: np.ndarray, n_atoms: int, cfg) -> tuple[bool, str]:
     if not np.isfinite(coords).all():
         return False, "non-finite coordinates"
     if n_atoms >= 2:
-        d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
-        np.fill_diagonal(d, np.inf)
-        d_min = float(d.min())
+        # Блочно: матрица N×N×3 для n=10⁴ — это гигабайты, а нам нужен только
+        # минимум. Память O(block²), время то же O(N²).
+        step = 512
+        d_min = float("inf")
+        for i0 in range(0, n_atoms, step):
+            a = coords[i0:i0 + step]
+            for j0 in range(i0, n_atoms, step):
+                b = coords[j0:j0 + step]
+                d = np.linalg.norm(a[:, None, :] - b[None, :, :], axis=-1)
+                if i0 == j0:
+                    np.fill_diagonal(d, np.inf)
+                m = float(d.min()) if d.size else float("inf")
+                if m < d_min:
+                    d_min = m
         if d_min < MIN_ATOM_DISTANCE_ANG:
             return False, (f"atoms too close: d_min={d_min:.4f} < "
                            f"{MIN_ATOM_DISTANCE_ANG} Å")
@@ -676,6 +693,13 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
         print(f"  [Master] ✗ {struct_id}: {reason}")
         return res
 
+    # Потолок и этап — до геометрии, numpy и CP2K: размер приходит из запроса.
+    if not 1 <= n_atoms <= MAX_TASK_ATOMS:
+        return fail(f"n_atoms {n_atoms} вне диапазона 1..{MAX_TASK_ATOMS}")
+    stale = _stale_reason(n_atoms)
+    if stale:
+        return fail(stale)
+
     print(f"\n[Master] Приёмка состояния '{struct_id}' (n_atoms={n_atoms})...")
 
     if not payload.get("geometry"):
@@ -692,10 +716,6 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
         same, why = _same_geometry(coords, payload.get("species"), issued)
         if not same:
             return fail(f"геометрия не та, что выдана в задании: {why}")
-
-    stale = _stale_reason(n_atoms)
-    if stale:
-        return fail(stale)
 
     # Состав. При обычной выдаче эталон — species от мастера; в ready-пути
     # (результат принесён другому мастеру) проверяем только количество.

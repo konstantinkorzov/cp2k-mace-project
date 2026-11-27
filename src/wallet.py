@@ -501,6 +501,10 @@ def main():
         if args.amount is None or args.amount <= 0:
             print("✗ Нужна положительная сумма: --amount", file=sys.stderr)
             sys.exit(2)
+        if not chain.ADDRESS_RE.match(str(args.send_to)):
+            print("✗ Адрес получателя должен быть 64 hex (sha256 ключа)",
+                  file=sys.stderr)
+            sys.exit(2)
         masters = [m.rstrip("/") for m in (args.master or
                    [os.environ.get("MASTER_URL", "http://127.0.0.1:8000")]) if m]
         sys.exit(send_coins(wallet, element_dir, args.send_to, args.amount,

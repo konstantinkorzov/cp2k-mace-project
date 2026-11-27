@@ -168,6 +168,9 @@ def make_transfer(inputs: list[dict], outputs: list[dict]) -> dict:
 
 STATE_PATH_RE = re.compile(r"^blobs/[0-9a-f]{64}\.wfn$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+# Адрес — sha256 открытого ключа. Мягкая проверка («непустая строка») пропускала
+# опечатки и перевод в никуда; в Bitcoin такой перевод не собрать из-за чексуммы.
+ADDRESS_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def invalid_outputs(tx: dict) -> list[str]:
@@ -188,8 +191,8 @@ def invalid_outputs(tx: dict) -> list[str]:
         elif value <= 0:
             problems.append(f"выход {vout}: сумма {value} должна быть > 0")
         addr = out.get("address")
-        if not isinstance(addr, str) or not addr or len(addr) > 128:
-            problems.append(f"выход {vout}: нет корректного адреса")
+        if not isinstance(addr, str) or not ADDRESS_RE.match(addr):
+            problems.append(f"выход {vout}: адрес должен быть 64 hex (sha256 ключа)")
     return problems
 
 

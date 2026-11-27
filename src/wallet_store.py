@@ -153,6 +153,11 @@ def open_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # ключи не должны читаться другими пользователями машины (было 0644)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
     _migrate(conn)
     conn.commit()
     return conn

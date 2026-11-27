@@ -419,6 +419,10 @@ def send(root: str, name: str, password: str, to: str, amount: int, fee: int,
     if not os.path.isdir(element_dir):
         return {"ok": False, "error": f"нет цепочки {element}: {element_dir}"}
 
+    if not chain.ADDRESS_RE.match(str(to or "")):
+        return {"ok": False,
+                "error": "адрес получателя должен быть 64 hex (sha256 открытого ключа)"}
+
     try:
         wallet = wallet_store.open_wallet(conn, name, password)
     except wallet_store.WalletError as e:

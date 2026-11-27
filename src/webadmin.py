@@ -39,9 +39,14 @@ CREATE TABLE IF NOT EXISTS web_admins (
 
 def _conn(root: str) -> sqlite3.Connection:
     os.makedirs(root, exist_ok=True)
-    conn = sqlite3.connect(os.path.join(root, "webui.db"))
+    db_path = os.path.join(root, "webui.db")
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute(SCHEMA)
+    try:
+        os.chmod(db_path, 0o600)      # хэш пароля панели — не для всех
+    except OSError:
+        pass
     return conn
 
 

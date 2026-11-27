@@ -792,6 +792,14 @@ def chain_tests():
                 z.writestr(name, data)
         check("подмена dft внутри блока ловится", not chain.verify_chain(tmp, "Cu")["ok"])
 
+        # --- адрес получателя: 64 hex, иначе перевод в никуда ---
+        check("адрес-опечатка отклоняется",
+              bool(chain.invalid_outputs({"outputs": [{"value": 1, "address": "abc"}]})))
+        check("адрес в верхнем регистре отклоняется",
+              bool(chain.invalid_outputs({"outputs": [{"value": 1, "address": "A" * 64}]})))
+        check("корректный адрес принимается",
+              not chain.invalid_outputs({"outputs": [{"value": 1, "address": "a" * 64}]}))
+
         # --- аудит: txid — обязательство на тело транзакции ---
         tx_bad = {"version": 1, "type": "transfer",
                   "inputs": [{"txid": "a" * 64, "vout": 0}],
@@ -856,6 +864,9 @@ def wallet_tests():
                 return e
 
         conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
+        import stat as _stat
+        _mode = _stat.S_IMODE(os.stat(os.path.join(tmp, "keys.db")).st_mode)
+        check("keys.db доступен только владельцу", _mode == 0o600, oct(_mode))
         check("свежая база — ни одного кошелька", wallet_store.list_wallets(conn) == [])
         check("несуществующий кошелёк не открывается молча",
               err(lambda: wallet_store.open_wallet(conn, "master", "root")) is not None)
@@ -1213,6 +1224,19 @@ def master_geometry_tests():
               main._is_fork_conflict("prev_sha256 не совпадает"))
         check("публичный /peers отдаёт список",
               isinstance(main.peers_public().get("peers"), list))
+
+        # --- H3: потолок n_atoms до аллокаций и блочная проверка расстояний ---
+        over = main.verify_state_payload(
+            main.CONFIG,
+            {"struct_id": "big", "n_atoms": main.MAX_TASK_ATOMS + 1, "dim": 3},
+            {"geometry": [[0.0, 0.0, 0.0]]})
+        check("n_atoms сверх потолка отклоняется до аллокаций",
+              not over["valid"] and "диапазона" in over["reason"],
+              over["reason"])
+        line = np.zeros((3000, 3))
+        line[:, 0] = np.arange(3000) * 2.0
+        ok_line, why_line = main._check_geometry(line, 3000, main.CONFIG)
+        check("геометрия 3000 атомов проверяется блочно", ok_line, why_line)
     finally:
         main.pending_tasks.clear()
         main.active_tasks.clear()
@@ -1268,11 +1292,23 @@ def rfc8032_tests():
         check(f"RFC 8032 вектор {i}: другое сообщение отклонено",
               not crypto.verify(pub, msg + b"x", sig))
 
-    # точка малого порядка (identity) как чужой публичный ключ
+    # identity как публичный ключ: при A=identity уравнение S·B = R + h·A
+    # сводится к S·B = R, поэтому подпись проходит арифметику — её обязан
+    # отбить именно фильтр малых порядков (раньше он не срабатывал).
     small = bytes([1]) + b"\x00" * 31
-    forged = bytes(32) + bytes(32)
-    check("публичный ключ малого порядка отклонён",
+    S = 1
+    R = crypto._encode_point(crypto._scalarmult(crypto._B, S))
+    forged = R + S.to_bytes(32, "little")
+    check("identity распознаётся как точка малого порядка",
+          crypto._is_small_order(small))
+    check("identity как публичный ключ: подпись не проходит",
           not crypto.verify(small, b"msg", forged))
+    check("identity с любым S не проходит",
+          all(not crypto.verify(
+                  small, b"msg",
+                  crypto._encode_point(crypto._scalarmult(crypto._B, s))
+                  + s.to_bytes(32, "little"))
+              for s in (2, 5, 12345)))
 
     # неканоническая S: S + q при том же R не должна проходить
     seed = bytes.fromhex(vectors[0][0])

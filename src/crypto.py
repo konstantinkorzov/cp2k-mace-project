@@ -140,7 +140,10 @@ def _is_small_order(encoded: bytes) -> bool:
     Q = P
     for _ in range(3):            # 2P, 4P, 8P
         Q = _edwards_add(Q, Q)
-    return Q[0] % _p == 0 and Q[1] % _p == 1
+    # Точки в расширенных координатах (X : Y : Z : T), identity — это
+    # X == 0 и Y == Z (а не только (0, 1)): без нормировки по Z проверка
+    # не срабатывала, и identity проходила как валидный публичный ключ.
+    return Q[0] % _p == 0 and (Q[1] - Q[2]) % _p == 0
 
 
 def verify(public_key: bytes, msg: bytes, signature: bytes) -> bool:
