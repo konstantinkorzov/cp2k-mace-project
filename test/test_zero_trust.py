@@ -1109,7 +1109,7 @@ def busy_tests():
         main.verify_state_payload = lambda cfg, task, payload, issued=None: {
             "valid": True, "energy_ev": -1.0, "gap": 0.0, "mag": 0.0,
             "state": {"scf": {"steps": 1}}}
-        main._persist_verified_state = lambda t, p, v, block_info=None: "accepted"
+        main._persist_verified_state = lambda t, p, v, block_info=None, sync=None: "accepted"
         main._reset_ready_quota()
 
         # ready-результат — работа для головы мастера: (prev_id, nonce)
@@ -1396,7 +1396,7 @@ def ready_binding_tests():
             "valid": True, "energy_ev": -1.0, "gap": 0.0, "mag": 0.0,
             "state": {"scf": {"steps": 1}}}
 
-        def fake_write(task_data, payload, verdict, info=None):
+        def fake_write(task_data, payload, verdict, info=None, sync=None):
             blocks.append((task_data.get("_nonce"), task_data.get("dim"),
                            payload.get("seed")))
             if info is not None:
@@ -1698,6 +1698,146 @@ def dft_units_tests():
         except ValueError:
             ok = True
         check(f"parse отвергает {bad!r}", ok)
+
+
+def audit4_tests():
+    print("\n--- 39. Аудит 4: силы, backoff, UTXO, sqlite, диаметр ---")
+    tmp = tempfile.mkdtemp(prefix="audit4_")
+    saved = {k: main.CONFIG.get(k) for k in
+             ("output_dir", "element", "composition", "formula_size",
+              "atom_diameter")}
+    old_verify = cp2k_runner.verify_state_from_wfn
+    try:
+        edir = os.path.join(tmp, "Cu")
+        os.makedirs(edir, exist_ok=True)
+        main.CONFIG.update({"output_dir": edir, "element": "Cu",
+                            "composition": {"Cu": 1}, "formula_size": 1,
+                            "atom_diameter": 2.56})
+        conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
+        wallet = wallet_store.create_wallet(conn, "m", "root")
+        master = wallet.latest_key()["address"]
+
+        wfn = os.path.join(tmp, "s.wfn")
+        with open(wfn, "wb") as f:
+            f.write(b"CP2K-WFN" + b"\x00" * 20000)
+        sha, rel = chain.store_blob(edir, wfn)
+        issued = main._issue_geometry({"n_atoms": 2, "nonce": 3,
+                                       "dim": chain.consensus.dim_for_height(0)})
+        dft1 = {"energy_ev": -1.5,
+                "forces_ev_ang": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]],
+                "geometry": issued["coords"], "species": issued["species"]}
+        p1 = chain.write_block(edir, "Cu", 2, sha, rel,
+                               [chain.make_coinbase(1, master)],
+                               cp2k_version="x", cp2k_build="y",
+                               cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                               dft=dft1, nonce=3, atom_diameter=2.56,
+                               composition={"Cu": 1})
+        data1 = open(p1, "rb").read()
+        os.remove(p1)
+
+        # ---------- M1: подкрашенные силы ----------
+        def forces(shift):
+            def fake(coords, wfn_path, cfg, project=None):
+                return {"ok": True, "energy_ev": -1.5, "gap": None, "mag": None,
+                        "props": {},
+                        "forces_ev_ang": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5 + shift]]}
+            return fake
+
+        main._BAD_PEERS.clear()
+        cp2k_runner.verify_state_from_wfn = forces(0.10)
+        ok, why = main._accept_peer_block("http://peer1:8000", 1,
+                                          chain.ZERO_HASH, data1)
+        check("M1: подкрашенные силы отвергнуты",
+              not ok and any("forces" in w for w in why), why[:2])
+        check("M3: пир с подделкой сил — в карантине",
+              "http://peer1:8000" in main._BAD_PEERS, list(main._BAD_PEERS))
+
+        cp2k_runner.verify_state_from_wfn = forces(0.0)
+        ok, why = main._accept_peer_block("http://peer2:8000", 1,
+                                          chain.ZERO_HASH, data1)
+        check("силы, совпавшие с пересчётом, принимаются", ok, why[:2])
+        for b in chain.list_blocks(edir):
+            if b["seq"] == 1:
+                os.remove(b["path"])
+
+        # ---------- M3: карантин на отказ DFT ----------
+        main._BAD_PEERS.clear()
+        cp2k_runner.verify_state_from_wfn = lambda *a, **k: {"ok": False,
+                                                             "reason": "SCF"}
+        ok, why = main._accept_peer_block("http://peer3:8000", 1,
+                                          chain.ZERO_HASH, data1)
+        check("M3: отказ DFT ставит пира в карантин",
+              (not ok) and "http://peer3:8000" in main._BAD_PEERS, why[:2])
+
+        # ---------- L4: verify_block без utxo на блоке с переводом ----------
+        cp2k_runner.verify_state_from_wfn = forces(0.0)
+        p1 = chain.write_block(edir, "Cu", 2, sha, rel,
+                               [chain.make_coinbase(1, master)],
+                               cp2k_version="x", cp2k_build="y",
+                               cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                               dft=dft1, nonce=3, atom_diameter=2.56,
+                               composition={"Cu": 1})
+        reward = chain.build_wallet_transfer(wallet, edir, "c" * 64, 1_000_000,
+                                             fee=100_000, confirmations=1,
+                                             height=2)
+        cb2 = chain.make_coinbase(2, master, chain.COINBASE_VALUE + 100_000)
+        issued2 = main._issue_geometry({"n_atoms": 2, "nonce": 4,
+                                        "dim": chain.consensus.dim_for_height(1)})
+        dft2 = {"energy_ev": -2.0,
+                "forces_ev_ang": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.1]],
+                "geometry": issued2["coords"], "species": issued2["species"]}
+        p2 = chain.write_block(edir, "Cu", 2, sha, rel, [cb2, reward],
+                               cp2k_version="x", cp2k_build="y",
+                               cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                               dft=dft2, nonce=4, atom_diameter=2.56,
+                               composition={"Cu": 1})
+        v = chain.verify_block(edir, p2)          # без utxo= — как в API/CLI
+        check("L4: verify_block без utxo не отвергает свой же перевод",
+              v["ok"], v["problems"][:2])
+
+        # ---------- L1: диаметр один на цепочку ----------
+        # геометрия под ДРУГОЙ диаметр: иначе write_block справедливо ругается
+        hdr3 = {"prev_id": chain.previous_hash(edir, 3), "nonce": 5,
+                "n_atoms": 2, "dim": chain.consensus.dim_for_height(2),
+                "atom_diameter": 2.9, "system": "Cu",
+                "composition": {"Cu": 1}}
+        geom3 = chain.expected_geometry(hdr3).tolist()
+        import structure_generator
+        spec3 = structure_generator.assign_species(
+            2, {"composition": {"Cu": 1}},
+            seed=chain.geometry_seed(hdr3["prev_id"], 5))
+        p3 = chain.write_block(edir, "Cu", 2, sha, rel,
+                               [chain.make_coinbase(3, master)],
+                               cp2k_version="x", cp2k_build="y",
+                               cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                               dft={"energy_ev": -1.0,
+                                    "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
+                                    "geometry": geom3,
+                                    "species": [str(x) for x in spec3]},
+                               nonce=5, atom_diameter=2.9,
+                               composition={"Cu": 1})
+        problems = chain.verify_chain(edir, "Cu")["problems"]
+        check("L1: другой atom_diameter в цепочке отвергается",
+              any("atom_diameter" in p for p in problems), problems[:2])
+        os.remove(p3)
+
+        # ---------- L2: sqlite WAL + busy_timeout ----------
+        conn2 = wallet_store.open_db(os.path.join(tmp, "w2.db"))
+        mode = conn2.execute("PRAGMA journal_mode").fetchone()[0]
+        busy = conn2.execute("PRAGMA busy_timeout").fetchone()[0]
+        check("L2: keys.db в WAL", str(mode).lower() == "wal", mode)
+        check("L2: busy_timeout выставлен", int(busy) == 5000, busy)
+
+        # ---------- L3: лимиты тела ----------
+        check("L3: обычный JSON-запрос ограничен 8 МБ",
+              main._body_limit_bytes("/tx/submit") == main.JSON_BODY_MAX_BYTES)
+        check("L3: /submit-result — по бюджету состояния",
+              main._body_limit_bytes("/submit-result") > main.JSON_BODY_MAX_BYTES)
+    finally:
+        cp2k_runner.verify_state_from_wfn = old_verify
+        main._BAD_PEERS.clear()
+        main.CONFIG.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def elements_catalog_tests():
@@ -2227,6 +2367,7 @@ def _run_tests():
     money_int_tests()
     dft_units_tests()
     audit3_tests()
+    audit4_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()

@@ -110,6 +110,9 @@ REG_WINDOW_SEC = 60.0
 READY_QUOTA_PER_HOUR = 12
 
 
+JSON_BODY_MAX_BYTES = 8 * 1024 * 1024   # обычные JSON-запросы (конфиг, tx)
+
+
 def _task_timeout() -> int:
     """Жёсткий предел удержания задачи: config.json → task_timeout_sec.
 
@@ -990,10 +993,29 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
 
 
 def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
-                       info: dict | None = None) -> str | None:
-    """Собирает блок под CHAIN_LOCK: не пересекается с реоргом и с пиром."""
+                       info: dict | None = None, sync: dict | None = None) -> str | None:
+    """
+    Собирает блок под CHAIN_LOCK, но сеть — вне его.
+
+    Догон пиров делается ДО блокировки (или принимается готовым `sync`),
+    анонс и пересборка этапа — после. Иначе зависший пир с таймаутом 120 с
+    держал бы task_queue_lock, и мастер переставал бы выдавать задачи.
+    """
+    cu = sync if sync is not None else _catch_up_quick()
+    if not cu.get("ok", True):
+        print("[Master] ✗ не удалось догнать самую длинную цепочку — свой блок не создаю")
+        if info is not None:
+            info["reason"] = "не удалось догнать цепочку"
+        return None
+    if cu.get("accepted"):
+        print(f"[Master] догнал сеть: высота {cu.get('height')} "
+              f"(принято {cu['accepted']} блоков)")
+
     with CHAIN_LOCK:
-        return _write_chain_block_inner(task_data, payload, verdict, info=info)
+        path = _write_chain_block_inner(task_data, payload, verdict, info=info)
+    if path:
+        _after_block_write()
+    return path
 
 
 def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
@@ -1046,15 +1068,7 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
         print("[Master] ! нет ключей мастера — блок не создан")
         _fail("у мастера нет ключей")
         return None
-    # Самая длинная цепочка: сначала догоняем пиров; свой блок — только если никто не выше
-    cu = catch_up_chain()
-    if not cu["ok"]:
-        print("[Master] ✗ не удалось догнать самую длинную цепочку — свой блок не создаю")
-        _fail("не удалось догнать цепочку")
-        return None
-    if cu["accepted"]:
-        print(f"[Master] догнал сеть: высота {cu['height']} (принято {cu['accepted']} блоков)")
-
+    # Догон сети и анонс — в обёртке _write_chain_block, вне блокировок.
     # Битый блок в цепочке = неверный UTXO-взгляд: свой блок соберётся, но
     # пиры его отвергнут (или он сам себя не пройдёт). Лучше не писать вовсе.
     broken = [p for p in chain_mod.BROKEN_BLOCKS
@@ -1066,6 +1080,15 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
         return None
 
     seq = chain_mod.next_seq(CONFIG["output_dir"])
+    # Диаметр — свойство цепочки (он в заголовке и задаёт геометрию):
+    # сменили в конфиге на середине — блок не соберём, иначе пиры его
+    # отвергнут по несогласованности датасета.
+    pinned = chain_mod.chain_diameter(CONFIG["output_dir"])
+    if pinned is not None and float(pinned) != float(CONFIG.get("atom_diameter") or 2.0):
+        print(f"[Master] ✗ atom_diameter в конфиге "
+              f"{CONFIG.get('atom_diameter')} != {pinned} (как в цепочке)")
+        _fail(f"atom_diameter {CONFIG.get('atom_diameter')} != {pinned}")
+        return None
     worker_address = (registered_workers.get(w_id) or {}).get("pubkey_hash")
     confirmations = int(CONFIG.get("coinbase_confirmations",
                                    chain_mod.DEFAULT_CONFIRMATIONS))
@@ -1083,7 +1106,7 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
     utxo = chain_mod.utxo_set(CONFIG["output_dir"])
     mem_txs, mem_fee = _drain_mempool(utxo, seq, confirmations)
 
-    subsidy = chain_mod.subsidy_for(n_atoms)      # 25 000 000 за атом
+    subsidy = chain_mod.subsidy_for(n_atoms)      # 50 000 000 за блок
     _master_share, worker_share = chain_mod.coinbase_split(n_atoms)
     total = subsidy + mem_fee                     # комиссии мемпула — мастеру
     outputs = []
@@ -1156,8 +1179,6 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
           + (f", воркер {worker_share:d} → {str(worker_address)[:12]}…"
              if worker_address else "")
           + ")")
-    _announce_to_peers(seq)
-    _sync_stage("свой блок")
     if mem_txs:
         print(f"[Master] 📦 в блок включено транзакций из мемпула: {len(mem_txs)} "
               f"(комиссия {mem_fee:g})")
@@ -1172,7 +1193,8 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
 
 
 def _persist_verified_state(task_data: dict, payload: dict, verdict: dict,
-                            block_info: dict | None = None) -> str:
+                            block_info: dict | None = None,
+                            sync: dict | None = None) -> str:
     """
     Записывает кадр в набор для MACE: E/F/gap/mag — из прогона мастера.
     Дубликаты геометрии не плодятся: для одной геометрии хранится только
@@ -1281,7 +1303,7 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict,
 
     print(f"[Master] ✓ {struct_id}: кадр принят для MACE (E={energy_ev:.6f} eV, "
           f"кадров всего {n_frames})")
-    _write_chain_block(task_data, payload, verdict, info=block_info)
+    _write_chain_block(task_data, payload, verdict, info=block_info, sync=sync)
     return "accepted"
 
 
@@ -1356,19 +1378,23 @@ def state_ticket(worker_id: str, session: str | None = None,
     return {"ticket": _issue_state_ticket(worker_id), "ttl": STATE_TICKET_TTL}
 
 
-def _body_limit_bytes() -> int:
+def _body_limit_bytes(path: str | None = None) -> int:
     """Лимит тела = base64 от максимально допустимого wfn + запас.
 
     Легитимный wfn ограничен restart_max_mb, base64 даёт 1.33×. Один knob:
     подняли restart_max_mb для 55+ атомов — поднялся и лимит.
     """
-    # Бюджет состояния зависит от размера кластера на текущей высоте:
-    # n²-рост wfn означает, что фиксированный «512 МБ» либо режет большие
-    # системы, либо позволяет маленьким запросам съесть память.
-    n = consensus.stage_for_height(
-        chain_mod.next_seq(CONFIG["output_dir"]) - 1)["n_atoms"]
-    mb = max(1, int(consensus.max_state_bytes(n) / (1024 * 1024)))
-    return int(mb * 1024 * 1024 * 1.4) + 2 * 1024 * 1024
+    # JSON-эндпоинты не бывают больше нескольких мегабайт. Большой лимит
+    # нужен только /submit-result — и то лишь для старого base64-пути;
+    # сам .wfn давно идёт потоком через /submit-state (его тело не
+    # буферизуется вовсе).
+    tail = str(path or "").rstrip("/")
+    if tail.endswith("/submit-result"):
+        n = consensus.stage_for_height(
+            chain_mod.next_seq(CONFIG["output_dir"]) - 1)["n_atoms"]
+        mb = max(1, int(consensus.max_state_bytes(n) / (1024 * 1024)))
+        return int(mb * 1024 * 1024 * 1.4) + 2 * 1024 * 1024
+    return JSON_BODY_MAX_BYTES
 
 
 @app.middleware("http")
@@ -1381,7 +1407,7 @@ async def _body_guard(request, call_next):
     except Exception:  # noqa: BLE001
         pass
     if request.method in ("POST", "PUT", "PATCH"):
-        limit = _body_limit_bytes()
+        limit = _body_limit_bytes(request.url.path)
         declared = request.headers.get("content-length")
         from fastapi.responses import JSONResponse
         if declared and declared.isdigit() and int(declared) > limit:
@@ -1452,6 +1478,42 @@ task_queue_lock = threading.RLock()   # RLock: блок пишется под э
 # реорг. Порядок захвата — всегда task_queue_lock → CHAIN_LOCK; реорг держит
 # только CHAIN_LOCK и очередь не берёт, поэтому цикла ожидания нет.
 CHAIN_LOCK = threading.RLock()
+
+# Догон сети — только вне блокировок. Не чаще раза в 5 с: серия сдач не должна
+# каждый раз ходить по сети, а зависший пир — держать очередь мастера.
+_CATCHUP_LOCK = threading.Lock()
+_LAST_CATCHUP = 0.0
+CATCHUP_MIN_INTERVAL = 5.0
+
+
+def _catch_up_quick(force: bool = False) -> dict:
+    global _LAST_CATCHUP
+    now = time.time()
+    with _CATCHUP_LOCK:
+        if not force and now - _LAST_CATCHUP < CATCHUP_MIN_INTERVAL:
+            return {"ok": True, "accepted": 0, "height": None, "debounced": True}
+        _LAST_CATCHUP = now
+    try:
+        return catch_up_chain()
+    except Exception as e:  # noqa: BLE001
+        print(f"[Master] ! догон сети: {e}")
+        return {"ok": False, "accepted": 0, "error": str(e)}
+
+
+def _after_block_write() -> None:
+    """Анонс и пересборка этапа — после снятия блокировок, в фоне."""
+    def run():
+        try:
+            _sync_stage("свой блок")
+        except Exception as e:  # noqa: BLE001
+            print(f"[Master] ! этап после блока: {e}")
+        try:
+            seq = chain_mod.next_seq(CONFIG["output_dir"]) - 1
+            _announce_to_peers(seq)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Master] ! анонс блока: {e}")
+
+    threading.Thread(target=run, daemon=True, name="post-block").start()
 pending_tasks = []      # Список нерешенных структур
 active_tasks = {}       # struct_id -> {"task": dict, "time_sent": float, "worker_id": str}
 verifying_tasks = set() # struct_id, результаты которых проверяются прямо сейчас
@@ -2413,6 +2475,7 @@ def submit_result(result: TaskResult):
             # Блок пишем под тем же lock, что и обычный путь: голова не должна
             # уйти, пока шла проверка (прогон CP2K — минуты), и два потока не
             # должны собрать два блока на одной высоте.
+            cu = _catch_up_quick()          # сеть — до блокировки
             with task_queue_lock:
                 tip = chain_mod.previous_hash(CONFIG["output_dir"],
                                               chain_mod.next_seq(CONFIG["output_dir"]))
@@ -2423,7 +2486,7 @@ def submit_result(result: TaskResult):
                     return {"status": "stale",
                             "reason": "голова мастера изменилась во время проверки"}
                 kept = _persist_verified_state(task_data, payload, verdict,
-                                               block_info=block_info)
+                                               block_info=block_info, sync=cu)
                 active_tasks.pop(sid, None)
                 completed_tasks.add(sid)
 
@@ -2501,6 +2564,9 @@ def submit_result(result: TaskResult):
         verdict = verify_state_payload(CONFIG, task_data, payload, issued=info)
         persist = _persist_verified_state
 
+        # Сеть — до блокировки: зависший пир не должен держать очередь.
+        cu = _catch_up_quick()
+
         with task_queue_lock:
             verifying_tasks.discard(sid)
             if verdict["valid"]:
@@ -2511,7 +2577,7 @@ def submit_result(result: TaskResult):
                 if info.get("prev_id") and info["prev_id"] != tip:
                     _requeue_or_fail(task_data, "голова изменилась во время проверки")
                     return {"status": "rejected", "reason": "stale head"}
-                kept = persist(task_data, payload, verdict)
+                kept = persist(task_data, payload, verdict, sync=cu)
                 completed_tasks.add(sid)
                 print(f"[Master] ✓ Воркер [{w_id}] сдал результат {sid}: проверка пройдена "
                       f"({kept})")
@@ -2548,6 +2614,10 @@ PEER_GOSSIP_INTERVAL = 120     # как часто обмениваться ад
 PEER_TOL_GAP_EV = 0.01
 PEER_TOL_MAG_UB = 0.05
 PEER_TOL_DIPOLE_DEBYE = 0.01
+# Силы попадают в датасет MACE прямо из dft.json блока, поэтому их тоже
+# сверяем: пересчёт от того же wfn даёт силы с точностью ~1e-4 эВ/Å,
+# допуск 0.02 ловит подкраску и терпит разницу машин.
+PEER_TOL_FORCE_EV_ANG = 0.02
 MAX_CATCHUP_ROUNDS = 10
 BAD_PEER_COOLDOWN = 300
 _BAD_PEERS: dict[str, float] = {}
@@ -2755,11 +2825,14 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                 res = cp2k_runner.verify_state_from_wfn(
                     coords, raw_wfn, CONFIG, project=f"peer_{seq}")
             if not res.get("ok"):
+                _bad_peer(peer, f"DFT-проверка: {res.get('reason')}")
                 return False, [f"DFT-проверка: {res.get('reason')}"]
 
             e_block = float(dft.get("energy_ev"))
             tol_e = consensus.peer_tol_energy_ev(expected_n)
             if abs(res["energy_ev"] - e_block) > tol_e:
+                _bad_peer(peer, f"энергия: блок {e_block:.4f} != "
+                                f"пересчёт {res['energy_ev']:.4f}")
                 return False, [f"энергия блока {e_block:.6f} != "
                                f"пересчёт {res['energy_ev']:.6f} eV"]
 
@@ -2777,8 +2850,33 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                 if claimed is None or mine is None:
                     continue  # старые блоки без этих полей — не повод отбраковывать
                 if abs(float(claimed) - float(mine)) > tol:
+                    _bad_peer(peer, f"{key}: блок {float(claimed):.4f} != "
+                                    f"пересчёт {float(mine):.4f}")
                     return False, [f"{key}: в блоке {float(claimed):.6f}, "
                                    f"пересчёт {float(mine):.6f} {unit}"]
+
+            # Силы: датасет MACE строится из этого dft.json, поэтому подмена
+            # сил при «честных» E/gap раньше проходила и портила обучение.
+            claimed_f = dft.get("forces_ev_ang")
+            mine_f = res.get("forces_ev_ang")
+            if claimed_f is not None and mine_f:
+                if not isinstance(claimed_f, list) or len(claimed_f) != len(mine_f):
+                    _bad_peer(peer, "forces: число атомов не совпадает")
+                    return False, ["forces: число атомов не совпадает"]
+                worst, where = 0.0, 0
+                for idx, (a, b) in enumerate(zip(claimed_f, mine_f)):
+                    try:
+                        delta = max(abs(float(x) - float(y))
+                                    for x, y in zip(a, b))
+                    except (TypeError, ValueError):
+                        _bad_peer(peer, "forces: не числа")
+                        return False, [f"forces: атом {idx} — не числа"]
+                    if delta > worst:
+                        worst, where = delta, idx
+                if worst > PEER_TOL_FORCE_EV_ANG:
+                    _bad_peer(peer, f"forces: расхождение {worst:.4f} эВ/Å")
+                    return False, [f"forces: расхождение до {worst:.4f} эВ/Å "
+                                   f"(атом {where}, допуск {PEER_TOL_FORCE_EV_ANG})"]
 
             with CHAIN_LOCK:
                 # Проверка и запись — атомарно: иначе блок, собранный
@@ -2837,10 +2935,20 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
 
     # Пока переключаем ветку, новые работы не выдаются (BUSY) и свой блок не
     # пишется: CHAIN_LOCK сериализует реорг с записью блока в submit-result.
+    # Ветку скачиваем ДО блокировки: сеть под CHAIN_LOCK замораживает и
+    # запись своих блоков, и submit-result.
+    branch = []
+    for seq in range(ancestor + 1, remote + 1):
+        data = _fetch_block(peer, seq)
+        if data is None:
+            _bad_peer(peer, f"блок {seq} не скачан")
+            return {"accepted": 0, "errors": [f"блок {seq} не скачан"]}
+        branch.append((seq, data))
+
     BUSY.set()
     try:
         with CHAIN_LOCK:
-            return _reorg_locked(peer, ancestor, remote, element_dir)
+            return _reorg_locked(peer, ancestor, remote, element_dir, branch)
     finally:
         BUSY.clear()
         # Мемпул вернулся вместе с веткой — чистим уже включённые tx, даже
@@ -2857,7 +2965,8 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
             print(f"[Reorg] ! этап: {e}")
 
 
-def _reorg_locked(peer: str, ancestor: int, remote: int, element_dir: str) -> dict:
+def _reorg_locked(peer: str, ancestor: int, remote: int, element_dir: str,
+                  branch: list | None = None) -> dict:
     removed, txs = chain_mod.truncate_chain(element_dir, ancestor)
     if removed:
         print(f"[Reorg] откатил {len(removed)} блок(ов) короткой ветки")
@@ -2871,13 +2980,10 @@ def _reorg_locked(peer: str, ancestor: int, remote: int, element_dir: str) -> di
 
     accepted = 0
     try:
-        for seq in range(ancestor + 1, remote + 1):
+        for seq, data in (branch or []):
             local, head = _local_head()
             if local >= seq:
                 continue
-            data = _fetch_block(peer, seq)
-            if data is None:
-                raise RuntimeError(f"блок {seq}: не скачан или слишком большой")
             ok, why = _accept_peer_block(peer, seq, head, data)
             if not ok:
                 raise RuntimeError(f"блок {seq}: {'; '.join(why)}")
@@ -2895,6 +3001,12 @@ def _reorg_locked(peer: str, ancestor: int, remote: int, element_dir: str) -> di
         chain_mod.restore_blocks(removed)
         print(f"[Reorg] ✗ ошибка ({e}); восстановил прежнюю ветку")
         return {"accepted": 0, "errors": [str(e)]}
+
+
+def _bad_peer(peer: str, why: str) -> None:
+    """Пир прислал блок, который не сошёлся с пересчётом — в карантин."""
+    _BAD_PEERS[_normalize_peer(peer)] = time.time() + BAD_PEER_COOLDOWN
+    print(f"[Peer] {peer}: {why} — карантин {BAD_PEER_COOLDOWN} с")
 
 
 def _is_fork_conflict(text: str) -> bool:
@@ -2964,7 +3076,9 @@ def _gossip_peers() -> list[str]:
         if len(known) >= MAX_PEERS:
             break
         try:
-            r = requests.get(f"{peer}/admin/peers", timeout=PEER_TIMEOUT)
+            # /admin/* снаружи закрыт (401), поэтому спрашиваем публичный
+            # /peers; админский путь оставлен запасным для localhost.
+            r = _peer_get(f"{peer}/peers")
             if r.status_code != 200:
                 continue
             remote = r.json().get("peers") or []

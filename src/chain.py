@@ -417,12 +417,18 @@ def read_block_txs(path: str) -> list[dict]:
 BROKEN_BLOCKS: set[str] = set()
 
 
-def utxo_set(element_dir: str) -> dict:
+def utxo_set(element_dir: str, before_seq: int | None = None) -> dict:
     """
-    Текущее множество непотраченных выходов: (txid, vout) -> {value, address, height, coinbase}.
+    Множество непотраченных выходов: (txid, vout) -> {value, address, height, coinbase}.
+
+    before_seq — учесть только блоки ВЫШЕ этой высоты меньше: нужно, чтобы
+    проверить блок N на его собственном UTXO (иначе входы, потраченные самим
+    блоком N, уже вычтены, и блок ложно отвергается).
     """
     utxo = {}
     for b in list_blocks(element_dir):
+        if before_seq is not None and b["seq"] >= int(before_seq):
+            break
         try:
             txs = read_block_txs(b["path"])
         except Exception as e:  # noqa: BLE001
@@ -982,7 +988,7 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         # sum_outputs не падает на мусоре: блок всё равно отклонится
         # invalid_outputs, но исключения из проверки быть не должно.
         cb_value = sum_outputs(coinbases[0])
-        # Эмиссия блока пропорциональна числу атомов: 25 000 000 за атом.
+        # Эмиссия фиксирована за блок (50 000 000), от числа атомов не зависит.
         cap = (subsidy_for(n_atoms) if n_atoms else COINBASE_VALUE) + block_fee
         if cb_value > cap:
             problems.append(
@@ -1098,7 +1104,8 @@ def _verify_block(element_dir: str, block_path: str,
                 problems.append(f"виды атомов нельзя воспроизвести: {e}")
 
     if utxo is None:
-        utxo = utxo_set(element_dir)
+        # UTXO на высоте seq-1: без проверяемого блока и всего, что выше
+        utxo = utxo_set(element_dir, before_seq=seq if seq > 0 else 0)
     else:
         utxo = dict(utxo)
 
@@ -1114,6 +1121,31 @@ def _verify_block(element_dir: str, block_path: str,
             "header": header, "dft": dft, "txs": txs}
 
 
+_DIAMETER_CACHE: dict[tuple, object] = {}
+
+
+def chain_diameter(element_dir: str):
+    """atom_diameter первого блока цепочки (None — цепочка пуста)."""
+    blocks = list_blocks(element_dir)
+    if not blocks:
+        return None
+    b = blocks[0]
+    try:
+        st = os.stat(b["path"])
+    except OSError:
+        return None
+    key = (b["path"], st.st_mtime_ns, st.st_size)
+    if key in _DIAMETER_CACHE:
+        return _DIAMETER_CACHE[key]
+    try:
+        header, _dft, _txs, _names = read_block(b["path"])
+        value = header.get("atom_diameter")
+    except Exception:  # noqa: BLE001
+        value = None
+    _DIAMETER_CACHE[key] = value
+    return value
+
+
 def verify_chain(element_dir: str, system: str | None = None) -> dict:
     """
     Полная проверка цепочки v2:
@@ -1127,6 +1159,7 @@ def verify_chain(element_dir: str, system: str | None = None) -> dict:
     expected_prev = ZERO_HASH
     expected_seq = 1
     chain_composition = None
+    chain_diameter = None
 
     for b in blocks:
         if b["seq"] != expected_seq:
@@ -1144,6 +1177,13 @@ def verify_chain(element_dir: str, system: str | None = None) -> dict:
         problems.extend(f"{b['name']}: {p}" for p in validate_header(
             header, expected_seq=b["seq"], expected_system=b["system"],
             expected_n_atoms=b["n_atoms"]))
+        # atom_diameter задаёт распределение геометрий: в одной цепочке он
+        # должен быть один, иначе в датасете смешаны разные генераторы.
+        if chain_diameter is None:
+            chain_diameter = header.get("atom_diameter")
+        elif header.get("atom_diameter") != chain_diameter:
+            problems.append(f"{b['name']}: atom_diameter {header.get('atom_diameter')} "
+                            f"!= {chain_diameter} (как в первом блоке)")
         if chain_composition is None:
             chain_composition = header.get("composition")
         elif header.get("composition") != chain_composition:

@@ -152,8 +152,16 @@ class Wallet:
 # ---------- база ----------
 def open_db(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    # Мастер и панель пишут в keys.db одновременно: без busy_timeout второй
+    # получает «database is locked», а WAL убирает блокировку читателей.
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except sqlite3.DatabaseError:
+        pass
     conn.executescript(SCHEMA)
     # ключи не должны читаться другими пользователями машины (было 0644)
     try:

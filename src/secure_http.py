@@ -21,6 +21,12 @@ SECURE_REQUIRED_PREFIXES = (
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
 
 
+# Конверт — это JSON небольшого размера. /submit-result может нести
+# устаревший base64-состояния, для него лимит выше.
+CONVERT_MAX_BYTES = 8 * 1024 * 1024
+CONVERT_MAX_BYTES_BIG = 96 * 1024 * 1024
+
+
 class SecureASGIMiddleware:
     def __init__(self, app, seed_provider, require: bool = True):
         self.app = app
@@ -58,8 +64,13 @@ class SecureASGIMiddleware:
                                                "(X-Secure: 1); см. src/secure.py"})
             return await self.app(scope, receive, send)
 
-        # ---- расшифровка запроса
-        body = await _read_body(receive)
+        # ---- расшифровка запроса (с пределом до чтения всего тела)
+        cap = (CONVERT_MAX_BYTES_BIG if path.rstrip("/").endswith("/submit-result")
+               else CONVERT_MAX_BYTES)
+        declared = headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > cap:
+            return await _reply(send, 413, {"detail": "конверт слишком большой"})
+        body = await _read_body(receive, cap)
         try:
             env = json.loads(body.decode("utf-8"))
         except Exception:
@@ -69,6 +80,8 @@ class SecureASGIMiddleware:
         try:
             from_hex, method, meta_path, query, plain = secure.open_request(
                 priv, own_pub, env, path, self.guard)
+        except ValueError as e:
+            return await _reply(send, 413, {"detail": str(e)})
         except Exception as e:  # noqa: BLE001
             return await _reply(send, 403, {"detail": f"конверт: {e}"})
         if meta_path != path:
@@ -122,13 +135,15 @@ def _q(value: str) -> str:
     return quote(str(value), safe="")
 
 
-async def _read_body(receive) -> bytes:
+async def _read_body(receive, max_bytes: int = 8 * 1024 * 1024) -> bytes:
     body = b""
     while True:
         msg = await receive()
         if msg["type"] != "http.request":
             break
         body += msg.get("body", b"")
+        if len(body) > max_bytes:
+            raise ValueError("тело больше лимита")
         if not msg.get("more_body"):
             break
     return body
