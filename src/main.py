@@ -1135,8 +1135,11 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
               "награда не выплачивается")
         worker_address = None
 
-    utxo = chain_mod.utxo_set(CONFIG["output_dir"])
-    mem_txs, mem_fee = _drain_mempool(utxo, seq, confirmations)
+    # Ленивый вид: сборка блока не материализует UTXO всей цепочки.
+    # Мемпул работает на СВОЁМ слое изменений — индекс он не трогает.
+    utxo = chain_mod.utxo_view(CONFIG["output_dir"])
+    mem_txs, mem_fee = _drain_mempool(
+        utxo.child() if hasattr(utxo, "child") else utxo, seq, confirmations)
 
     subsidy = chain_mod.subsidy_for(n_atoms)      # 50 000 000 за блок
     _master_share, worker_share = chain_mod.coinbase_split(n_atoms)
@@ -1179,7 +1182,7 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
     dft.update(props)
     dft["props_version"] = cp2k_runner.PROPS_VERSION
 
-    utxo_before = chain_mod.utxo_set(CONFIG["output_dir"])
+    utxo_before = utxo            # состояние ДО блока (вид не мутировался)
     path = chain_mod.write_block(
         CONFIG["output_dir"], CONFIG["element"], n_atoms, state_sha, state_rel, txs,
         cp2k_version=CONFIG.get("cp2k_version", "unknown"),
@@ -3498,7 +3501,8 @@ def tx_submit(req: TxSubmit, request: Request = None):
     if shape:
         return {"status": "rejected", "reason": shape}
     conf = int(CONFIG.get("coinbase_confirmations", chain_mod.DEFAULT_CONFIRMATIONS))
-    utxo = chain_mod.utxo_set(CONFIG["output_dir"])
+    # Вид, а не словарь: на /tx/submit нужны выходы только этой транзакции.
+    utxo = chain_mod.utxo_view(CONFIG["output_dir"])
     ok, problems = chain_mod.validate_tx(tx, CONFIG["output_dir"],
                                          confirmations=conf, utxo=utxo)
     if not ok:

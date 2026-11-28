@@ -457,6 +457,11 @@ def read_block_txs(path: str) -> list[dict]:
 BROKEN_BLOCKS: set[str] = set()
 
 
+def utxo_view(element_dir: str, before_seq: int | None = None):
+    """Ленивый UTXO из индекса: единичные обращения без словаря на всю цепочку."""
+    return chain_index.utxo_view(element_dir, before_seq=before_seq)
+
+
 def utxo_set(element_dir: str, before_seq: int | None = None) -> dict:
     """
     Множество непотраченных выходов: (txid, vout) -> {value, address, height, coinbase}.
@@ -464,6 +469,23 @@ def utxo_set(element_dir: str, before_seq: int | None = None) -> dict:
     before_seq — учесть только блоки ВЫШЕ этой высоты меньше: нужно, чтобы
     проверить блок N на его собственном UTXO (иначе входы, потраченные самим
     блоком N, уже вычтены, и блок ложно отвергается).
+
+    Данные — из SQLite-индекса (src/chain_index.py), без чтения zip-файлов.
+    Полный dict нужен кошельку/балансам/тестам; на горячем пути (проверка
+    блока, приём транзакции) используется utxo_view().
+    """
+    view = chain_index.utxo_view(element_dir, before_seq=before_seq)
+    try:
+        return dict(view.items())
+    finally:
+        view.close()
+
+
+def utxo_set_files(element_dir: str, before_seq: int | None = None) -> dict:
+    """Тот же UTXO, но пересчитанный ТОЛЬКО из файлов блоков.
+
+    Нужен независимой проверке и паритет-режиму: индекс производный, и
+    ошибку в нём должен ловить кто-то, кто индексом не пользуется.
     """
     utxo = {}
     for b in list_blocks(element_dir):
@@ -553,7 +575,9 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
         return False, ["транзакция не transfer"]
     height = height if height is not None else next_seq(element_dir)
     if utxo is None:
-        utxo = utxo_set(element_dir)
+        # Вид живёт только на время проверки; закрывается при выходе.
+        with chain_index.utxo_view(element_dir) as view:
+            return validate_tx(tx, element_dir, height, confirmations, utxo=view)
 
     # txid — обязательство на тело: подпись проверяется по нему, поэтому
     # присланное значение обязано совпадать с каноническим хэшем.
@@ -1016,7 +1040,12 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
     # Чужой словарь не портим: вызывающий передаёт свой UTXO-снимок
     # (utxo_before), и он должен остаться неизменным. add_outputs=True —
     # режим построения UTXO (utxo_set), там мутация и нужна.
-    work = utxo if add_outputs else dict(utxo)
+    if add_outputs:
+        work = utxo
+    elif isinstance(utxo, chain_index.UtxoView):
+        work = utxo.child()        # изменения не должны утечь в индекс
+    else:
+        work = dict(utxo)
 
     block_fee = 0
     for tx in txs:
@@ -1186,17 +1215,24 @@ def _verify_block(element_dir: str, block_path: str,
 
     if utxo is None:
         # UTXO на высоте seq-1: без проверяемого блока и всего, что выше
-        utxo = utxo_set(element_dir, before_seq=seq if seq > 0 else 0)
+        utxo = chain_index.utxo_view(element_dir, before_seq=seq if seq > 0 else 0)
+        owns_utxo = True
+    elif isinstance(utxo, chain_index.UtxoView):
+        owns_utxo = False
     else:
         utxo = dict(utxo)
-
-    for key in list(utxo):
-        info = utxo[key]
-        utxo[key] = {"value": info["value"], "address": info["address"],
-                     "height": info["height"], "coinbase": info["coinbase"]}
-    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path),
-                                height=seq, n_atoms=n_atoms)
-    problems.extend(tx_problems)
+        for key in list(utxo):
+            info = utxo[key]
+            utxo[key] = {"value": info["value"], "address": info["address"],
+                         "height": info["height"], "coinbase": info["coinbase"]}
+        owns_utxo = False
+    try:
+        _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path),
+                                    height=seq, n_atoms=n_atoms)
+        problems.extend(tx_problems)
+    finally:
+        if owns_utxo:
+            utxo.close()
 
     return {"ok": not problems, "problems": problems,
             "header": header, "dft": dft, "txs": txs}

@@ -2488,6 +2488,101 @@ def chain_index_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def chain_utxo_index_tests():
+    print("\n--- 46. D4b: UTXO из индекса против файлов (паритет) ---")
+    import chain_index
+
+    tmp = tempfile.mkdtemp(prefix="utxo_idx_")
+    old_dir = main.CONFIG.get("output_dir")
+    main.CONFIG["output_dir"] = tmp
+    try:
+        seed = os.urandom(32)
+        pub = crypto.public_key_from_seed(seed)
+        addr = crypto.address_from_public(pub)
+
+        def wfn(seq):
+            p = os.path.join(tmp, f"s{seq}.wfn")
+            with open(p, "wb") as f:
+                f.write(b"U" + bytes([seq]) * 1500)
+            return chain.store_blob(tmp, p)[0]
+
+        def block(seq, nonce, prev, txs, n_atoms=2):
+            hdr = {"prev_id": prev, "nonce": nonce, "n_atoms": n_atoms,
+                   "dim": chain.consensus.dim_for_height(seq - 1),
+                   "atom_diameter": 2.56, "system": "Cu",
+                   "composition": {"Cu": 1}}
+            sha = wfn(seq)
+            return chain.write_block(
+                tmp, "Cu", n_atoms, sha, "blobs/" + sha + ".wfn", txs,
+                cp2k_version="x", cp2k_build="y",
+                cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                dft={"energy_ev": -1.0,
+                     "forces_ev_ang": [[0.0, 0.0, 0.0]] * n_atoms,
+                     "geometry": chain.expected_geometry(hdr).tolist(),
+                     "species": ["Cu"] * n_atoms},
+                nonce=nonce, atom_diameter=2.56, composition={"Cu": 1})
+
+        cb1 = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
+        p1 = block(1, 21, chain.ZERO_HASH, [cb1])
+        h1 = chain.read_block(p1)[0]["block_id"]
+        tx = chain.make_transfer([{"txid": chain.txid_of(cb1), "vout": 0}],
+                                 [{"value": 1_000, "address": addr}])
+        tid = chain.txid_of(tx)
+        for i in tx["inputs"]:
+            i["public_key"] = pub.hex()
+            i["signature"] = crypto.sign(seed, bytes.fromhex(tid)).hex()
+        tx["txid"] = chain.txid_of(tx)
+        cb2 = chain.make_coinbase(2, addr, chain.COINBASE_VALUE + 100)
+        p2 = block(2, 22, h1, [cb2, tx])
+
+        idx = chain.utxo_set(tmp)
+        files = chain.utxo_set_files(tmp)
+        check("D4b: индекс UTXO совпадает с пересчётом из файлов", idx == files,
+              (len(idx), len(files)))
+        check("D4b: потраченный вход исчез, новые выходы есть",
+              (chain.txid_of(cb1), 0) not in idx
+              and (chain.txid_of(cb2), 0) in idx)
+
+        before = chain.utxo_set(tmp, before_seq=2)
+        before_files = chain.utxo_set_files(tmp, before_seq=2)
+        check("D4b: before_seq даёт состояние до блока",
+              before == before_files and (chain.txid_of(cb1), 0) in before)
+
+        # откат (реорг): блок 2 убран — индекс обязан перестроиться
+        os.remove(p2)
+        idx2 = chain.utxo_set(tmp)
+        check("D4b: после отката индекс совпадает с файлами",
+              idx2 == chain.utxo_set_files(tmp) and (chain.txid_of(cb1), 0) in idx2)
+
+        # вид: ленивое чтение, pop не трогает индекс, child изолирован
+        with chain.utxo_view(tmp) as view:
+            key = (chain.txid_of(cb1), 0)
+            check("D4b: вид отдаёт выход по ключу", key in view and view[key]["value"]
+                  == chain.COINBASE_VALUE)
+            child = view.child()
+            child.pop(key)
+            check("D4b: изменения в child не видны родителю", key in view)
+            view.pop(key)
+            check("D4b: pop в самом виде скрывает выход", key not in view)
+        check("D4b: индекс не пострадал от pop во видах",
+              (chain.txid_of(cb1), 0) in chain.utxo_set(tmp))
+
+        # балансы через SQL-агрегат
+        agg = chain_index.balances_by_address(tmp)
+        manual: dict[str, int] = {}
+        for info in chain.utxo_set_files(tmp).values():
+            manual[info["address"]] = manual.get(info["address"], 0) + int(info["value"])
+        check("D4b: SQL-агрегат балансов совпадает с ручным", agg == manual, agg)
+
+        # после «перезапуска» (свежий index.db) результат тот же
+        chain_index.rebuild(tmp)
+        check("D4b: после перестройки индекса UTXO тот же",
+              chain.utxo_set(tmp) == chain.utxo_set_files(tmp))
+    finally:
+        main.CONFIG["output_dir"] = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -3029,6 +3124,7 @@ def _run_tests():
     audit5_d_tests()
     ready_quota_v2_tests()
     chain_index_tests()
+    chain_utxo_index_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()
