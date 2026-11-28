@@ -46,12 +46,16 @@ async function init() {
         return;
     }
     if (out.created && out.password) {
+        // Пароль НЕ печатаем в лог контейнера (аудит, L4): логи уезжают в
+        // journald/CI и копируются вместе с отчётами. Он пишется только в
+        // файл 0600, а если файл не пишется — просим задать пароль через env.
         const file = path.join(RESULTS_DIR, 'webui_admin_password.txt');
         try {
             fs.writeFileSync(file, out.password + '\n', { mode: 0o600 });
-            console.log(`Панель: создан admin, пароль: ${out.password} (файл ${file})`);
+            console.log(`Панель: создан admin, пароль записан в ${file} (0600)`);
         } catch (e) {
-            console.log(`Панель: создан admin, пароль: ${out.password}`);
+            console.error('Панель: создан admin, но файл с паролем записать не удалось ' +
+                `(${e.message}). Задайте WEBUI_ADMIN_PASSWORD и пересоздайте admin.`);
         }
     } else if (out.created) {
         console.log('Панель: admin создан из WEBUI_ADMIN_PASSWORD');

@@ -2103,6 +2103,80 @@ def audit5_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def transport_ticket_tests():
+    print("\n--- 41. Транспорт: тикет на /submit-state, fail-closed ---")
+    import asyncio
+
+    import secure_http
+
+    check("B: /submit-state не требует конверта (поток нельзя шифровать целиком)",
+          "/submit-state" not in secure_http.SECURE_REQUIRED_PREFIXES)
+    check("B: /submit-state опознан как путь «по тикету»",
+          "/submit-state" in secure_http.TICKET_AUTHORIZED_PATHS)
+    check("B: /state-ticket требует конверт (тикет выдаётся только по шифру)",
+          "/state-ticket" in secure_http.SECURE_REQUIRED_PREFIXES)
+    check("B: docker-шлюз не считается loopback",
+          not main._is_loopback_client(
+              types.SimpleNamespace(client=types.SimpleNamespace(host="172.17.0.1"))))
+
+    # ---------- fail-closed ----------
+    saved = (main._SECURE_TRANSPORT, main.MASTER_BIND)
+    try:
+        def dies() -> bool:
+            try:
+                main._check_secure_transport()
+                return False
+            except SystemExit:
+                return True
+
+        main._SECURE_TRANSPORT = False
+        main.MASTER_BIND = "0.0.0.0"
+        check("B: без шифрования мастер на 0.0.0.0 не стартует", dies())
+        main.MASTER_BIND = "127.0.0.1"
+        check("B: без шифрования на loopback стартует (локальный режим)", not dies())
+        main._SECURE_TRANSPORT = True
+        main.MASTER_BIND = "0.0.0.0"
+        check("B: с шифрованием слушаем сеть", not dies())
+    finally:
+        main._SECURE_TRANSPORT, main.MASTER_BIND = saved
+
+    # ---------- маршрут /submit-state ----------
+    main.registered_workers.clear()
+    reg = main._register_worker("b", None, None)
+    wid, sess = reg["worker_id"], reg["session"]
+
+    def fake_request(host):
+        return types.SimpleNamespace(
+            client=types.SimpleNamespace(host=host), headers={})
+
+    def call(request, **kw):
+        try:
+            asyncio.run(main.submit_state(request, **kw))
+            return 200
+        except main.HTTPException as e:
+            return e.status_code
+
+    check("B: состояние без тикета с чужого IP — 403 даже с верной сессией",
+          call(fake_request("10.1.2.3"), worker_id=wid, session=sess,
+               struct_id="n2_d3_0001") == 403)
+    check("B: с loopback и сессией маршрут доходит до struct_id (400)",
+          call(fake_request("127.0.0.1"), worker_id=wid, session=sess,
+               struct_id="плохой id") == 400)
+
+    ticket = main._issue_state_ticket(wid)
+    check("B: тикет заменяет session с чужого IP (доходит до struct_id)",
+          call(fake_request("10.1.2.3"), worker_id="worker_999",
+               struct_id="плохой id", ticket=ticket) == 400)
+    check("B: тикет одноразовый (повтор — 403)",
+          call(fake_request("10.1.2.3"), worker_id=wid,
+               struct_id="плохой id", ticket=ticket) == 403)
+    check("B: неизвестный тикет — 403",
+          call(fake_request("10.1.2.3"), worker_id=wid,
+               struct_id="n2_d3_0001", ticket="deadbeef") == 403)
+
+    main.registered_workers.clear()
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2632,6 +2706,7 @@ def _run_tests():
     audit3_tests()
     audit4_tests()
     audit5_tests()
+    transport_ticket_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()

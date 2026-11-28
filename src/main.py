@@ -1332,11 +1332,44 @@ def _transport_seed() -> bytes:
     return wallet.private_seed(latest["address"])
 
 
+# Транспорт считается подключённым, только если cryptography есть И
+# middleware реально встал: иначе сеть работала бы открытым текстом, а
+# предупреждение в лог никто не читает (аудит, H1).
+_SECURE_TRANSPORT = False
 try:                       # в оффлайн-тестах заглушка fastapi не умеет add_middleware
     from secure_http import SecureASGIMiddleware
     app.add_middleware(SecureASGIMiddleware, seed_provider=_transport_seed)
+    _SECURE_TRANSPORT = secure is not None
+    if not _SECURE_TRANSPORT:
+        print("[Master] ! middleware транспорта установлен, но secure пуст "
+              "(cryptography не импортируется)")
 except Exception as _e:    # noqa: BLE001
     print(f"[Master] ! шифрованный транспорт не подключён: {_e}")
+
+# На каком адресе слушает API мастера. 0.0.0.0 нужен, чтобы принимать воркеров
+# с других машин (трафик при этом зашифрован). MASTER_BIND=127.0.0.1 —
+# локальный режим, он же единственный допустимый без шифрования.
+MASTER_BIND = (os.environ.get("MASTER_BIND") or "0.0.0.0").strip() or "0.0.0.0"
+
+
+def _check_secure_transport() -> None:
+    """Fail-closed: без шифрования слушаем только loopback.
+
+    Иначе (аудит, H1) при отсутствии cryptography мастер молча работал
+    открытым текстом, и сессии воркеров, админ-токен и содержимое заданий
+    уезжали по LAN в открытом виде.
+    """
+    if _SECURE_TRANSPORT:
+        return
+    if MASTER_BIND not in _LOOPBACK_HOSTS:
+        print(f"[Master] ✗ шифрование транспорта не подключено (нет cryptography "
+              f"или middleware не встал), а мастер слушает {MASTER_BIND}.")
+        print("[Master] ✗ отказ старта: сессии и админ-токен шли бы открытым "
+              "текстом. Поставьте cryptography или запустите с "
+              "MASTER_BIND=127.0.0.1 (только локальные воркеры).")
+        raise SystemExit(2)
+    print(f"[Master] ! шифрование транспорта недоступно: мастер слушает только "
+          f"{MASTER_BIND}, воркеры по сети подключиться не смогут")
 
 
 @app.get("/secure/hello")
@@ -1354,6 +1387,16 @@ def secure_hello():
 STATE_TICKET_TTL = 120
 _STATE_TICKETS: dict[str, tuple[str, float]] = {}
 _TICKET_LOCK = threading.Lock()
+
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
+
+
+def _is_loopback_client(request) -> bool:
+    """Запрос пришёл с этой же машины? (за прокси/портом docker — нет)."""
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) or ""
+    return str(host) in _LOOPBACK_HOSTS
 
 
 def _issue_state_ticket(worker_id: str) -> str:
@@ -2339,14 +2382,28 @@ async def submit_state(request: Request, worker_id: str | None = None,
     Ответ: {"status": "ok", "sha256": ..., "size": ...}. Дальше воркер шлёт
     state_sha256 в /submit-result.
     """
-    # Основной путь: одноразовый тикет, выданный по зашифрованному каналу.
-    # Сессия напрямую (loopback/старый клиент) — тоже принимается.
+    # Основной путь: одноразовый тикет, выданный по зашифрованному каналу
+    # (POST /state-ticket проверяет session и выдаёт тикет на 120 с).
+    # Тикет одноразовый и уже доказывает право говорить за worker_id,
+    # поэтому session здесь не требуется — воркер его и не шлёт.
     if ticket:
         resolved = _consume_state_ticket(ticket)
         if not resolved:
             raise HTTPException(status_code=403, detail="тикет неверен или истёк")
         worker_id = resolved
-    _auth_worker(worker_id, session)
+        rec = registered_workers.get(worker_id)
+        if not rec:
+            raise HTTPException(status_code=400, detail="неизвестный воркер")
+        rec["last_seen"] = time.time()
+    else:
+        # Без тикета — только с этой машины (панель, старый клиент). Иначе
+        # перехваченная по LAN сессия давала бы загрузку состояния.
+        if not _is_loopback_client(request):
+            raise HTTPException(
+                status_code=403,
+                detail="загрузка состояния без тикета разрешена только с loopback; "
+                       "воркер должен брать тикет в POST /state-ticket")
+        _auth_worker(worker_id, session)
     if not isinstance(struct_id, str) or not STRUCT_ID_RE.match(struct_id):
         raise HTTPException(status_code=400, detail="недопустимый struct_id")
 
@@ -3648,7 +3705,7 @@ def admin_balances(token: str | None = None):
 
 
 def run_fastapi_server(port: int):
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    uvicorn.run(app, host=MASTER_BIND, port=port, log_level="warning")
 
 # ---------- main ----------
 def main():
@@ -3692,6 +3749,9 @@ def main():
 
 def _main_impl():
     global pending_tasks
+
+    # До всего остального: без шифрования не открываемся в сеть (аудит, H1).
+    _check_secure_transport()
 
     args = get_args()
     # Порт: --port важнее, иначе из config.json, иначе 8000
