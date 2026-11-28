@@ -59,6 +59,10 @@ DEFAULT_CONFIRMATIONS = consensus.DEFAULT_CONFIRMATIONS
 # тратить только в блоке N + COINBASE_MATURITY. Bitcoin держит 100; здесь 1 —
 # текущая совместимость, поднять = новая версия протокола (см. docs/AUDIT.md).
 COINBASE_MATURITY = consensus.COINBASE_MATURITY
+# Эмиссия: субсидия зависит от размера блока (полезная работа), делится в
+# coinbase между мастером и воркером. Реализация — в consensus.py.
+subsidy_for = consensus.subsidy_for
+coinbase_split = consensus.coinbase_split
 
 
 # ---------- общее ----------
@@ -157,12 +161,18 @@ def tx_fee_safe(tx: dict, utxo: dict) -> int | None:
 
 
 def make_coinbase(height: int, address: str, value: int = COINBASE_VALUE) -> dict:
+    return make_coinbase_outputs(height, [{"value": value, "address": address}])
+
+
+def make_coinbase_outputs(height: int, outputs: list[dict]) -> dict:
+    """Coinbase с произвольным набором выходов (мастер + воркер)."""
     return {
         "version": 1,
         "type": "coinbase",
         "height": int(height),
         "inputs": [{"coinbase": f"block-{int(height):06d}"}],
-        "outputs": [{"value": int(value), "address": address}],
+        "outputs": [{"value": int(o["value"]), "address": o["address"]}
+                    for o in outputs],
     }
 
 
@@ -552,7 +562,7 @@ def write_block(element_dir: str, system: str, n_atoms: int,
                 cp2k_params: dict | None = None,
                 dft: dict | None = None,
                 nonce: int = 0,
-                dim: int = 3,
+                dim: int | None = None,
                 atom_diameter: float = 2.0,
                 geom_version: int | None = None,
                 composition: dict | None = None) -> str:
@@ -584,6 +594,8 @@ def write_block(element_dir: str, system: str, n_atoms: int,
     d = blocks_dir(element_dir)
     os.makedirs(d, exist_ok=True)
     seq = next_seq(element_dir)
+    if dim is None:
+        dim = consensus.dim_for_height(seq - 1)
     prev_id = previous_hash(element_dir, seq)
     path = os.path.join(d, block_name(seq, system, n_atoms))
 
@@ -730,9 +742,13 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
                     problems.append(
                         f"n_atoms {n_atoms} != расписания {want} для высоты {seq}")
 
-    if type(header.get("dim")) is not int or header["dim"] not in consensus.DIM_CYCLE:
-        problems.append(f"dim {header.get('dim')!r} — не из расписания "
-                        f"{consensus.DIM_CYCLE}")
+    dim = header.get("dim")
+    if type(dim) is not int or dim not in consensus.DIM_CYCLE:
+        problems.append(f"dim {dim!r} — не из расписания {consensus.DIM_CYCLE}")
+    elif type(seq) is int and seq >= 1 and dim != consensus.dim_for_height(seq - 1):
+        # v6: размерность задаётся высотой, а не счётчиком заданий мастера
+        problems.append(f"dim {dim} != расписания "
+                        f"{consensus.dim_for_height(seq - 1)} для высоты {seq}")
     if not _is_number(header.get("atom_diameter")) or float(header["atom_diameter"]) <= 0:
         problems.append("atom_diameter — не положительное число")
 
@@ -763,6 +779,11 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
         miss = [k for k in REQUIRED_CP2K_PARAMS if k not in params]
         if miss:
             problems.append(f"cp2k_params: нет ключей {miss}")
+        else:
+            bad = consensus.profile_mismatch(params)
+            if bad:
+                problems.append("cp2k_params не совпадают с профилем сети: "
+                                + "; ".join(bad[:4]))
 
     tx_root = header.get("tx_root")
     if not isinstance(tx_root, str) or not SHA_RE.match(tx_root):
@@ -832,7 +853,8 @@ def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
 
 def _check_txs(txs: list[dict], utxo: dict, label: str,
                add_outputs: bool = False,
-               height: int | None = None) -> tuple[int, list[str]]:
+               height: int | None = None,
+               n_atoms: int | None = None) -> tuple[int, list[str]]:
     problems = []
     coinbases = [t for t in txs if t.get("type") == "coinbase"]
     if len(coinbases) != 1:
@@ -887,9 +909,12 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         # sum_outputs не падает на мусоре: блок всё равно отклонится
         # invalid_outputs, но исключения из проверки быть не должно.
         cb_value = sum_outputs(coinbases[0])
-        if cb_value > COINBASE_VALUE + block_fee:
+        # Эмиссия блока пропорциональна числу атомов: 25 000 000 за атом.
+        cap = (subsidy_for(n_atoms) if n_atoms else COINBASE_VALUE) + block_fee
+        if cb_value > cap:
             problems.append(
-                f"{label}: coinbase {cb_value} > {COINBASE_VALUE} + комиссии {block_fee}")
+                f"{label}: coinbase {cb_value} > субсидии {cap} "
+                f"(n={n_atoms}, комиссии {block_fee})")
 
     if add_outputs:
         for tx in txs:
@@ -1004,7 +1029,8 @@ def _verify_block(element_dir: str, block_path: str,
         info = utxo[key]
         utxo[key] = {"value": info["value"], "address": info["address"],
                      "height": info["height"], "coinbase": info["coinbase"]}
-    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path), height=seq)
+    _, tx_problems = _check_txs(txs, utxo, os.path.basename(block_path),
+                                height=seq, n_atoms=n_atoms)
     problems.extend(tx_problems)
 
     return {"ok": not problems, "problems": problems,

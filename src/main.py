@@ -519,6 +519,10 @@ def task_cfg_payload(cfg) -> dict:
         # энергия изолированного атома считается ТОЛЬКО мастером (при старте)
         # и передаётся воркеру для лога E_binding/atom
         "e_isolated_atom": cfg.get("e_isolated_atom"),
+        # профиль сети: сетка, допуски, решатель, число рангов. Воркер обязан
+        # считать ровно этими числами — иначе присланное состояние не
+        # воспроизведётся у мастера (и блок не пройдёт проверку у пиров).
+        **consensus.CP2K_PROFILE,
     }
 
 
@@ -930,8 +934,6 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
         print("[Master] ! нет ключей мастера — блок не создан")
         _fail("у мастера нет ключей")
         return None
-    master_addresses = wallet.addresses()
-
     # Самая длинная цепочка: сначала догоняем пиров; свой блок — только если никто не выше
     cu = catch_up_chain()
     if not cu["ok"]:
@@ -946,39 +948,29 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
     confirmations = int(CONFIG.get("coinbase_confirmations",
                                    chain_mod.DEFAULT_CONFIRMATIONS))
 
-    reward = None
-    fee = 0          # целое: суммы в консенсусе — только int (и ':d' в логе)
-    # Награда выплачивается только на адрес вида sha256-hex (64 символа).
-    # Иначе монеты уходят в никуда: такой выход нельзя потратить ни одним кошельком.
+    # Награда воркеру — доля эмиссии ЭТОГО блока (второй выход coinbase), а не
+    # перевод из монет мастера. При росте n субсидия растёт вместе с работой, а
+    # баланс мастера — нет: платить ему было бы нечем, и ready-блок на 200
+    # атомов никто не собрал бы. Теперь платит сеть, из новых монет.
+    # Адрес обязан быть sha256-hex (64 символа), иначе монеты уходят в никуда.
     if worker_address and not re.fullmatch(r"[0-9a-f]{64}", str(worker_address)):
         print(f"[Master] ! адрес воркера {worker_address!r} не похож на адрес — "
               "награда не выплачивается")
         worker_address = None
-    utxo = chain_mod.utxo_set(CONFIG["output_dir"])
-    if worker_address:
-        reward = chain_mod.build_transfer(
-            CONFIG["output_dir"], master_addresses, worker_address,
-            latest["address"], value=chain_mod.REWARD_VALUE,
-            confirmations=confirmations, height=seq,
-        )
-        if reward is not None:
-            fee = int(chain_mod.tx_fee(reward, utxo))
-            # подписываем входы Ed25519 ключами мастера (txid от подписей не зависит)
-            chain_mod.sign_transaction(reward, wallet, utxo)
-            # учитываем reward в локальном UTXO, чтобы мемпул не конфликтовал
-            for i in reward["inputs"]:
-                utxo.pop((i["txid"], int(i["vout"])), None)
-            rtid = reward.get("txid") or chain_mod.txid_of(reward)
-            for vout, o in enumerate(reward["outputs"]):
-                utxo[(rtid, vout)] = {"value": int(o["value"]),
-                                      "address": o["address"], "height": seq}
 
+    utxo = chain_mod.utxo_set(CONFIG["output_dir"])
     mem_txs, mem_fee = _drain_mempool(utxo, seq, confirmations)
 
-    # coinbase = субсидия + комиссии блока (как в Bitcoin)
-    coinbase = chain_mod.make_coinbase(seq, latest["address"],
-                                       chain_mod.COINBASE_VALUE + fee + mem_fee)
-    txs = [coinbase] + ([reward] if reward else []) + mem_txs
+    subsidy = chain_mod.subsidy_for(n_atoms)      # 25 000 000 за атом
+    _master_share, worker_share = chain_mod.coinbase_split(n_atoms)
+    total = subsidy + mem_fee                     # комиссии мемпула — мастеру
+    outputs = []
+    if worker_address:
+        outputs.append({"value": worker_share, "address": worker_address})
+    outputs.append({"value": total - (worker_share if worker_address else 0),
+                    "address": latest["address"]})
+    coinbase = chain_mod.make_coinbase_outputs(seq, outputs)
+    txs = [coinbase] + mem_txs
 
     dft = {
         "energy_ev": verdict.get("energy_ev"),
@@ -1037,21 +1029,23 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
         return None
 
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
-          f"coinbase {chain_mod.COINBASE_VALUE + fee + mem_fee:d} → {latest['address'][:12]}…")
+          f"эмиссия {total:d} (мастер "
+          f"{total - (worker_share if worker_address else 0):d}"
+          + (f", воркер {worker_share:d} → {str(worker_address)[:12]}…"
+             if worker_address else "")
+          + ")")
     _announce_to_peers(seq)
     _sync_stage("свой блок")
     if mem_txs:
         print(f"[Master] 📦 в блок включено транзакций из мемпула: {len(mem_txs)} "
               f"(комиссия {mem_fee:g})")
-    if reward:
-        print(f"[Master] 💰 награда {chain_mod.REWARD_VALUE:d} → {worker_address[:12]}…, "
-              f"комиссия {fee:g} (входов: {len(reward['inputs'])})")
-    else:
-        print(f"[Master] ⚠ награда {chain_mod.REWARD_VALUE:d} не выплачена: "
-              f"нет подтверждённых средств (conf={confirmations})")
+    if not worker_address:
+        print("[Master] ⚠ адрес воркера неизвестен — вся эмиссия ушла мастеру")
     if info is not None:
         info["block"] = path
-        info["reward_paid"] = bool(reward)
+        info["reward_paid"] = bool(worker_address)
+        info["emission"] = int(total)
+        info["worker_share"] = int(worker_share) if worker_address else 0
     return path
 
 
@@ -1795,6 +1789,11 @@ def get_task(worker_id: str, session: str | None = None):
         # Геометрию делает МАСТЕР: воркеру уезжают готовые координаты и сорт
         # атомов. Так близость к шаблону/seed проверяема (см. verify_state_payload),
         # а не держится на доверии к воркеру.
+        # Размерность блока задаёт высота (v6): 3D, 2D, 3D, 2D…
+        # Раньше она зависела от локального счётчика заданий, и два мастера
+        # выдавали разные dim на одной высоте — проверить это было нельзя.
+        task["dim"] = consensus.dim_for_height(
+            chain_mod.next_seq(CONFIG["output_dir"]) - 1)
         try:
             issued = _issue_geometry(task)
         except Exception as e:  # noqa: BLE001
@@ -2013,13 +2012,13 @@ def _ready_binding(payload: dict, sid: str):
         return None, None, "nonce вне диапазона uint64"
     try:
         n_atoms = int(payload.get("n_atoms") or 0)
-        dim = int(payload.get("dim") or 3)
     except (TypeError, ValueError):
-        return None, None, "n_atoms/dim не числа"
+        return None, None, "n_atoms не число"
     if not 1 <= n_atoms <= MAX_TASK_ATOMS:
         return None, None, f"n_atoms {n_atoms} вне диапазона 1..{MAX_TASK_ATOMS}"
-    if dim not in (1, 2, 3):
-        return None, None, f"dim {dim} — не 1/2/3"
+    # Размерность — из высоты (консенсус v6), а не из тела запроса: воркер
+    # присылает геометрию, а какую именно ждёт сеть, решает высота.
+    dim = consensus.dim_for_height(chain_mod.next_seq(CONFIG["output_dir"]) - 1)
     geometry = payload.get("geometry")
     if not geometry:
         return None, None, "в ready-результате нет geometry"
@@ -2416,7 +2415,8 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                 return False, [f"DFT-проверка: {res.get('reason')}"]
 
             e_block = float(dft.get("energy_ev"))
-            if abs(res["energy_ev"] - e_block) > PEER_TOL_ENERGY_EV:
+            tol_e = consensus.peer_tol_energy_ev(n_atoms)
+            if abs(res["energy_ev"] - e_block) > tol_e:
                 return False, [f"энергия блока {e_block:.6f} != "
                                f"пересчёт {res['energy_ev']:.6f} eV"]
 

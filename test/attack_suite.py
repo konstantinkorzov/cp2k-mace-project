@@ -52,10 +52,12 @@ def make_state(element_dir, data=b"fake-wfn-state" * 200):
 
 
 def make_dft(element_dir, n_atoms=2, nonce=0, energy=-42.0):
-    """Геометрия должна следовать из (prev_id, nonce) — правило v2."""
-    prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
+    """Геометрия следует из (prev_id, nonce); dim — по высоте (v6)."""
+    seq = chain.next_seq(element_dir)
+    prev = chain.previous_hash(element_dir, seq)
     geom = chain.expected_geometry({
-        "prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": 3,
+        "prev_id": prev, "nonce": nonce, "n_atoms": n_atoms,
+        "dim": chain.consensus.dim_for_height(seq - 1),
         "atom_diameter": 2.0, "element": "Cu",
     })
     return {"energy_ev": energy,

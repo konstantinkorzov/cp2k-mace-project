@@ -565,13 +565,19 @@ def identity_tests():
           identity.make_identity("alpha")["pubkey_hash"] != a["pubkey_hash"])
 
 
-def block_dft(element_dir, n_atoms=2, dim=3, nonce=0, system="Cu",
+def block_dft(element_dir, n_atoms=2, dim=None, nonce=0, system="Cu",
               composition=None):
-    """dft.json, геометрия которого следует из (prev_id, nonce) — правило v3."""
+    """dft.json, геометрия которого следует из (prev_id, nonce) — правило v3.
+
+    dim=None — размерность по высоте (протокол v6), как её строит мастер.
+    """
     import structure_generator
 
     comp = composition or {system: 1}
-    prev = chain.previous_hash(element_dir, chain.next_seq(element_dir))
+    seq = chain.next_seq(element_dir)
+    prev = chain.previous_hash(element_dir, seq)
+    if dim is None:
+        dim = chain.consensus.dim_for_height(seq - 1)
     header = {"prev_id": prev, "nonce": nonce, "n_atoms": n_atoms, "dim": dim,
               "atom_diameter": 2.0, "system": system, "composition": comp}
     geom = chain.expected_geometry(header)
@@ -626,7 +632,7 @@ def chain_tests():
         check("в заголовке только нужные поля", set(h1) == expected, sorted(h1))
         check("отпечаток сборки CP2K попал в заголовок",
               h1.get("cp2k_build") == cp2k_runner.CP2K_BUILD_CPU, h1.get("cp2k_build"))
-        check("version = 5", h1["version"] == 5)
+        check("version = 6", h1["version"] == 6)
         check("created_at — ISO 8601 UTC",
               datetime.strptime(h1["created_at"], "%Y-%m-%dT%H:%M:%SZ") is not None)
         check("CP2K version и params в блоке",
@@ -646,6 +652,25 @@ def chain_tests():
         p_dim = chain.validate_header(dict(h1, dim=1))
         check("dim вне расписания (1) отвергается",
               any("не из расписания" in p for p in p_dim), p_dim[:2])
+
+        # v6: размерность задаётся высотой (seq 2 → 2D)
+        p_h = chain.validate_header(dict(h1, seq=2, dim=3))
+        check("dim не по высоте отвергается",
+              any("для высоты" in p for p in p_h), p_h[:2])
+        check("dim по высоте принимается",
+              not any("dim" in p for p in chain.validate_header(dict(h1, seq=2, dim=2))))
+
+        # v6: профиль вычислений — часть консенсуса
+        check("профиль сети в блоке",
+              not chain.consensus.profile_mismatch(h1["cp2k_params"]))
+        p_prof = chain.validate_header(
+            dict(h1, cp2k_params=dict(h1["cp2k_params"], cutoff=200)))
+        check("чужой профиль (cutoff=200) отвергается",
+              any("не совпадают" in p for p in p_prof), p_prof[:2])
+        p_rank = chain.validate_header(
+            dict(h1, cp2k_params=dict(h1["cp2k_params"], mpi_ranks=8)))
+        check("чужое число рангов отвергается",
+              any("не совпадают" in p for p in p_rank), p_rank[:2])
         check("расписание: высота 10 → n=3, высота 0 → n=2",
               main.stage_for_height(0, {"formula_size": 1})["n_atoms"] == 2
               and main.stage_for_height(10, {"formula_size": 1})["n_atoms"] == 3)
@@ -1448,6 +1473,18 @@ def money_int_tests():
         fee, _ = chain._check_txs([], {}, "t")
         check("_check_txs возвращает int", type(fee) is int, repr(fee))
 
+        # v6: эмиссия пропорциональна числу атомов, делится в coinbase 50/50
+        check("субсидия пропорциональна n",
+              chain.subsidy_for(2) == 50_000_000 and chain.subsidy_for(5) == 125_000_000,
+              (chain.subsidy_for(2), chain.subsidy_for(5)))
+        check("coinbase делится 50/50",
+              chain.coinbase_split(2) == (25_000_000, 25_000_000),
+              chain.coinbase_split(2))
+        check("допуск энергии растёт с n",
+              chain.consensus.peer_tol_energy_ev(2) == 0.02
+              and chain.consensus.peer_tol_energy_ev(2000) > 0.02,
+              chain.consensus.peer_tol_energy_ev(2000))
+
         # build_transfer: ровно хватает на сумму+комиссию, без 1e-9
         conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
         wallet = wallet_store.create_wallet(conn, "m", "root")
@@ -1460,7 +1497,7 @@ def money_int_tests():
 
 
 def reward_format_tests():
-    print("\n--- 32. Блок без средств: награда не платится, формат не падает ---")
+    print("\n--- 32. Блок: эмиссия делится в coinbase (мастер + воркер) ---")
     root = tempfile.mkdtemp(prefix="ready_wb_")
     tmp = os.path.join(root, "Cu")      # система = имя каталога цепочки
     os.makedirs(tmp, exist_ok=True)
@@ -1495,8 +1532,12 @@ def reward_format_tests():
                      "_nonce": 7, "attempts": 0}
         info = {}
         path = main._REAL_WRITE_CHAIN_BLOCK(task_data, payload, verdict, info=info)
-        check("блок без средств пишется без падения формата",
-              bool(path) and info.get("reward_paid") is False, info)
+        # v6: награда больше не зависит от того, есть ли у мастера монеты —
+        # она часть эмиссии этого блока (второй выход coinbase).
+        check("эмиссия блока делится в coinbase (мастер + воркер)",
+              bool(path) and info.get("emission") == chain.subsidy_for(2)
+              and info.get("worker_share") == chain.coinbase_split(2)[1]
+              and info.get("reward_paid") is True, info)
     finally:
         main.registered_workers.pop("worker_x", None)
         main.CONFIG.update(saved)
