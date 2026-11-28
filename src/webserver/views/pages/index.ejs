@@ -1168,7 +1168,12 @@ async function sendCoins() {
   const amount = Number(document.getElementById('wal-amount').value);
   const fee = Number(document.getElementById('wal-fee').value || 0);
   if (!name) { msg.innerHTML = '<span class="err">сначала выберите кошелёк</span>'; return; }
-  if (!to || !(amount > 0)) { msg.innerHTML = '<span class="err">нужны адрес и сумма</span>'; return; }
+  if (!to || !Number.isSafeInteger(amount) || amount <= 0) {
+    msg.innerHTML = '<span class="err">нужны адрес и целая сумма (дробей нет)</span>'; return;
+  }
+  if (!Number.isSafeInteger(fee) || fee < 0) {
+    msg.innerHTML = '<span class="err">комиссия — целое число</span>'; return;
+  }
   msg.textContent = 'отправляю…';
   const r = await api('/api/wallet/send', {
     name, password, to, amount, fee,

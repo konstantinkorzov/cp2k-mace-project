@@ -1381,6 +1381,55 @@ def ready_binding_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def money_int_tests():
+    print("\n--- 33. Деньги: только целые, без эпсилонов ---")
+    tmp = tempfile.mkdtemp(prefix="money_")
+    try:
+        owner = "b" * 64
+        # UTXO с огромной суммой: во float 10**30 и 10**30+1 — одно и то же число
+        huge = 10 ** 30
+        utxo = {("a" * 64, 0): {"value": huge, "address": owner,
+                                "height": 1, "coinbase": False}}
+
+        def make(to_value):
+            tx = {"version": 1, "type": "transfer",
+                  "inputs": [{"txid": "a" * 64, "vout": 0}],
+                  "outputs": [{"value": to_value, "address": "c" * 64}]}
+            tx["txid"] = chain.txid_of(tx)
+            return tx
+
+        ok, problems = chain.validate_tx(make(huge + 1), tmp, height=10,
+                                         confirmations=0, utxo=dict(utxo))
+        check("вход 10^30 < выход 10^30+1 отклонён (без эпсилона)",
+              not ok and any("сумма входов" in p for p in problems), problems)
+
+        ok, problems = chain.validate_tx(make(huge), tmp, height=10,
+                                         confirmations=0, utxo=dict(utxo))
+        check("равные огромные суммы не ловятся как расхождение",
+              not any("сумма входов" in p for p in problems), problems)
+
+        ok, problems = chain.validate_tx(make(1.5), tmp, height=10,
+                                         confirmations=0, utxo=dict(utxo))
+        check("дробная сумма в выходе отклонена",
+              not ok and any("не целое" in p for p in problems), problems)
+
+        fee_cb = chain.tx_fee(chain.make_coinbase(1, owner), {})
+        check("tx_fee(coinbase) — int 0", type(fee_cb) is int and fee_cb == 0, repr(fee_cb))
+
+        fee, _ = chain._check_txs([], {}, "t")
+        check("_check_txs возвращает int", type(fee) is int, repr(fee))
+
+        # build_transfer: ровно хватает на сумму+комиссию, без 1e-9
+        conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
+        wallet = wallet_store.create_wallet(conn, "m", "root")
+        addr = wallet.latest_key()["address"]
+        check("баланс пустого кошелька — int",
+              all(type(v) is int for r in chain.balances(tmp, {addr}).values()
+                  for v in r.values()))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def reward_format_tests():
     print("\n--- 32. Блок без средств: награда не платится, формат не падает ---")
     root = tempfile.mkdtemp(prefix="ready_wb_")
@@ -1827,6 +1876,7 @@ def _run_tests():
     lease_tests()
     master_geometry_tests()
     ready_binding_tests()
+    money_int_tests()
     reward_format_tests()
     build_tests()
     rfc8032_tests()

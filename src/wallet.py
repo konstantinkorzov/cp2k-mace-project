@@ -150,7 +150,7 @@ def _output_value(element_dir: str, txid: str, vout: int) -> int:
             except Exception:  # noqa: BLE001
                 continue
         _value_loaded.add(dir_key)
-    return _value_cache.get(key, 0.0)
+    return int(_value_cache.get(key, 0))
 
 
 def _prompt(label: str) -> str:

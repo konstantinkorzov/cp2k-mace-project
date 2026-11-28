@@ -405,15 +405,24 @@ async function onWalletSend(req, res) {
     try {
         const body = req.body || {};
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
+        // Деньги — только целые: JS Number дробный, поэтому проверяем явно,
+        // иначе "1.5" уедет в --amount и превратится в чужую сумму.
         const amount = Number(body.amount);
-        if (!body.to || !(amount > 0)) return bad(res, 400, 'нужны адрес и сумма');
+        if (!Number.isSafeInteger(amount) || amount <= 0) {
+            return bad(res, 400, 'сумма — целое число монет (дробей нет)');
+        }
+        let fee = 0;
+        if (body.fee !== undefined && body.fee !== null && body.fee !== '') {
+            fee = Number(body.fee);
+            if (!Number.isSafeInteger(fee) || fee < 0) {
+                return bad(res, 400, 'комиссия — целое число (дробей нет)');
+            }
+        }
 
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'send', '--results-root', root,
             '--to', String(body.to), '--amount', String(amount)];
-        if (body.fee !== undefined && body.fee !== null && body.fee !== '') {
-            args.push('--fee', String(body.fee));
-        }
+        if (fee) args.push('--fee', String(fee));
         if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const masters = (body.masters || []).map((m) => String(m).trim()).filter(Boolean);

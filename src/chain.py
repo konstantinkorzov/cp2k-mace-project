@@ -129,10 +129,15 @@ def sign_transaction(tx: dict, signer, utxo: dict) -> dict:
     return tx
 
 
-def tx_fee(tx: dict, utxo: dict) -> float:
-    """Комиссия = сумма входов − сумма выходов (для не-coinbase)."""
+def tx_fee(tx: dict, utxo: dict) -> int:
+    """Комиссия = сумма входов − сумма выходов (для не-coinbase).
+
+    Только целые: дробей в деньгах нет. float не представляет суммы выше 2^53
+    точно, поэтому комиссия, посчитанная во float, у одних узлов больше нуля,
+    у других — равна нулю (тот же вход, разные округления).
+    """
     if tx.get("type") == "coinbase":
-        return 0.0
+        return 0
     total_in = sum(int(utxo[(i["txid"], int(i["vout"]))]["value"])
                    for i in tx.get("inputs", []))
     total_out = sum_outputs(tx)
@@ -389,11 +394,11 @@ def build_transfer(element_dir: str, from_addresses: set[str], to_address: str,
     if not available:
         return None
 
-    chosen, total = [], 0.0
+    chosen, total = [], 0
     for u in sorted(available, key=lambda x: -x["value"]):
         chosen.append(u)
-        total += u["value"]
-        if total + 1e-9 >= value + fee:
+        total += int(u["value"])
+        if total >= int(value) + int(fee):
             break
     if total < value + fee:
         return None
@@ -427,7 +432,7 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
     if not inputs:
         problems.append("нет входов")
 
-    total_in = 0.0
+    total_in = 0
     seen = set()
     for i in inputs:
         key = (i.get("txid"), int(i.get("vout", -1)))
@@ -465,7 +470,9 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
     total_out = sum_outputs(tx)
     if total_out <= 0:
         problems.append("нулевая сумма выходов")
-    if total_in + 1e-8 < total_out:
+    # Строго, без эпсилона: суммы целые, допуска на округление быть не может.
+    # Раньше здесь стояло 1e-8 — и мемпул принимал вход 10^30 при выходе 10^30+1.
+    if total_in < total_out:
         problems.append(f"сумма входов {total_in} < суммы выходов {total_out}")
     return (not problems), problems
 
@@ -810,7 +817,7 @@ def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
 
 def _check_txs(txs: list[dict], utxo: dict, label: str,
                add_outputs: bool = False,
-               height: int | None = None) -> tuple[float, list[str]]:
+               height: int | None = None) -> tuple[int, list[str]]:
     problems = []
     coinbases = [t for t in txs if t.get("type") == "coinbase"]
     if len(coinbases) != 1:
@@ -819,7 +826,7 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
     if len(transfers) > MAX_TXS_PER_BLOCK:
         problems.append(f"{label}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
-    block_fee = 0.0
+    block_fee = 0
     for tx in txs:
         tid = tx.get("txid") or txid_of(tx)
         if tid != txid_of(tx):
@@ -828,7 +835,7 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         if tx.get("type") == "coinbase":
             continue
 
-        total_in = 0.0
+        total_in = 0
         for i in tx.get("inputs", []):
             key = (i.get("txid"), int(i.get("vout", -1)))
             if key not in utxo:
@@ -859,7 +866,7 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         total_out = sum_outputs(tx)
         if total_in < total_out:
             problems.append(f"{label}: сумма входов {total_in} < суммы выходов {total_out}")
-        block_fee += max(0.0, total_in - total_out)
+        block_fee += max(0, total_in - total_out)
 
     if coinbases:
         # sum_outputs не падает на мусоре: блок всё равно отклонится
@@ -1140,7 +1147,7 @@ def balances(element_dir: str, addresses: set[str] | None = None,
         addr = info["address"]
         if addresses is not None and addr not in addresses:
             continue
-        rec = result.setdefault(addr, {"available": 0.0, "pending": 0.0, "total": 0.0})
+        rec = result.setdefault(addr, {"available": 0, "pending": 0, "total": 0})
         rec["total"] += int(info["value"])
         if info["height"] + max(0, confirmations) <= height:
             rec["available"] += int(info["value"])
