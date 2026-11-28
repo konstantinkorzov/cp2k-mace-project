@@ -244,8 +244,9 @@ fi
 docker run $DOCKER_FLAGS $EXTRA_FLAGS \
     --add-host=host.docker.internal:host-gateway \
     -e MASTER_HOST="$MASTER_HOST" \
+    -e WEBUI_TLS_SAN="${WEBUI_TLS_SAN:-}" \
     -e MASTER_PORT="8000" \
-    -p "127.0.0.1:${HOST_PORT_8443}:8443" \
+    -p "${PANEL_BIND:-0.0.0.0}:${HOST_PORT_8443}:8443" \
     -p "${HOST_PORT_8000}:8000" \
     -v "$SCRIPT_DIR":/workspace \
     -w /workspace \
