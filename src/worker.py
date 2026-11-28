@@ -667,6 +667,7 @@ def main():
 
     try:
         while True:
+            submit_payload = None      # что пересдать, если мастер перезапустился
             try:
                 if time.time() - last_peer_refresh > PEER_REFRESH_SEC:
                     last_peer_refresh = time.time()
@@ -731,6 +732,7 @@ def main():
                     "data": send_data,
                 }
 
+                submit_payload = payload
                 sub_resp = _http().post(submit_url, json=payload, timeout=60)
                 sub_resp.raise_for_status()
                 sub_data = sub_resp.json()
@@ -770,6 +772,22 @@ def main():
                     holder["worker_id"] = worker_id
                     holder["session"] = session
                     logger.info(f"Новый worker_id: {worker_id}")
+                    # Посчитанный результат не выбрасываем: он мог быть
+                    # отклонён только потому, что мастер перезапустился и
+                    # забыл сессию. Пересдаём один раз с новой.
+                    if submit_payload is not None:
+                        try:
+                            again = dict(submit_payload, worker_id=worker_id,
+                                         session=session)
+                            retry = _http().post(submit_url, json=again, timeout=60)
+                            if retry.status_code == 200:
+                                logger.info("Результат пересдан после перерегистрации: "
+                                            f"{(retry.json() or {}).get('status')}")
+                            else:
+                                logger.warning(f"Пересдача не удалась: HTTP "
+                                               f"{retry.status_code}")
+                        except Exception as e2:  # noqa: BLE001
+                            logger.warning(f"Пересдача не удалась: {e2}")
                 else:
                     logger.warning(f"HTTP-ошибка связи с сервером: {http_err}. "
                                    f"Повтор через {args.retry_delay} сек...")
