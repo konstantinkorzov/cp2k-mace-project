@@ -43,7 +43,7 @@
   },
   "coinbase_confirmations": {
     "value": 1,
-    "help": "Сколько блоков должно пройти, чтобы выход стал доступен для траты (coinbase maturity). Настройка кошелька: python3 src/wallet.py --set-confirmations N (применится к следующему запуску мастера)."
+    "help": "Сколько блоков должно пройти, чтобы выход coinbase стал доступен для ОБЫЧНЫХ переводов (по умолчанию 1). Это настройка кошелька: python3 src/wallet.py --set-confirmations N. ВАЖНО: зрелость coinbase внутри блока — консенсус (COINBASE_MATURITY = 1 в src/consensus.py), этот ключ её НЕ меняет."
   },
   "print_level": {
     "value": "LOW",

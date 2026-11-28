@@ -10,6 +10,21 @@ const auth = require('./auth');
 
 const app = express();
 
+// Заголовки безопасности (аудит-5, I4). Панель умеет запускать процессы,
+// открывать кошелёк и править config.json, поэтому clickjacking и подмену
+// MIME закрываем по умолчанию. CSP разрешает inline-скрипты/стили: страницы
+// (index.ejs) собраны с одним встроенным <script>, внешних CDN нет.
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Content-Security-Policy',
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'");
+    next();
+});
+
 // --- Абсолютные пути проекта ---
 // __dirname    = .../src/webserver
 // PROJECT_ROOT = .../cp2k-mace-project
