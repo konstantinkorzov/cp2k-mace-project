@@ -35,6 +35,7 @@ from datetime import datetime
 
 import numpy as np
 
+import chain_index
 import consensus
 import crypto
 
@@ -409,21 +410,15 @@ def _block_id_of_file(path: str) -> str:
 
 
 def list_blocks(element_dir: str) -> list[dict]:
-    d = blocks_dir(element_dir)
-    if not os.path.isdir(d):
-        return []
-    out = []
-    for name in os.listdir(d):
-        m = BLOCK_NAME_RE.match(name)
-        if not m or not SYSTEM_RE.match(m.group(2)):
-            continue
-        path = os.path.join(d, name)
-        out.append({"seq": int(m.group(1)), "system": m.group(2),
-                    "n_atoms": int(m.group(3)), "path": path, "name": name,
-                    "sha256": sha256_file(path),
-                    "block_id": _block_id_of_file(path)})
-    out.sort(key=lambda b: b["seq"])
-    return out
+    """Блоки цепочки по возрастанию seq.
+
+    Данные — из SQLite-индекса (src/chain_index.py): раньше здесь на каждый
+    вызов читался каждый zip и считался sha256 каждого файла, то есть
+    O(размер цепочки × размер блока) на любой запрос UTXO. Индекс производный:
+    рассинхрон с файлами ловится по размеру/mtime, при ошибке SQLite список
+    собирается напрямую из файлов.
+    """
+    return chain_index.list_blocks(element_dir)
 
 
 def next_seq(element_dir: str) -> int:

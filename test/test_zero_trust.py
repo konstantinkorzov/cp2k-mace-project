@@ -98,7 +98,7 @@ def prepare_env():
               "config_loader.py", "archive_maker.py", "identity.py", "chain.py",
               "consensus.py", "crypto.py", "wallet_store.py", "wallet.py",
               "webwallet.py", "money.py", "secure.py", "secure_http.py",
-              "secure_client.py"):
+              "secure_client.py", "chain_index.py"):
         shutil.copy(os.path.join(SRC, f), os.path.join(ENV, f))
 
     # реальный config.json проекта (формат {"value":..., "help":...})
@@ -2408,6 +2408,86 @@ def ready_quota_v2_tests():
         main._reset_ready_quota()
 
 
+def chain_index_tests():
+    print("\n--- 45. D4a: индекс блоков (SQLite) ---")
+    import chain_index
+
+    tmp = tempfile.mkdtemp(prefix="index_")
+    old_dir = main.CONFIG.get("output_dir")
+    main.CONFIG["output_dir"] = tmp
+    try:
+        def add_block(seq, nonce, n_atoms=2, nxt=None):
+            hdr = {"prev_id": nxt or chain.ZERO_HASH, "nonce": nonce,
+                   "n_atoms": n_atoms,
+                   "dim": chain.consensus.dim_for_height(seq - 1),
+                   "atom_diameter": 2.56, "system": "Cu",
+                   "composition": {"Cu": 1}}
+            sha = chain.store_blob(tmp, _write_tmp_wfn(tmp, seq))[0]
+            return chain.write_block(
+                tmp, "Cu", n_atoms, sha, "blobs/" + sha + ".wfn",
+                [chain.make_coinbase(seq, "a" * 64)],
+                cp2k_version="x", cp2k_build="y",
+                cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                dft={"energy_ev": -1.0,
+                     "forces_ev_ang": [[0.0, 0.0, 0.0]] * n_atoms,
+                     "geometry": chain.expected_geometry(hdr).tolist(),
+                     "species": ["Cu"] * n_atoms},
+                nonce=nonce, atom_diameter=2.56, composition={"Cu": 1})
+
+        def _write_tmp_wfn(d, seq):
+            path = os.path.join(d, f"state_{seq}.wfn")
+            with open(path, "wb") as f:
+                f.write(b"IDX" + bytes([seq]) * 2000)
+            return path
+
+        check("D4a: пустая цепочка — пустой список",
+              chain.list_blocks(tmp) == [])
+
+        p1 = add_block(1, 11)
+        b1 = chain.read_block(p1)[0]
+        p2 = add_block(2, 12, nxt=b1["block_id"])
+        b2 = chain.read_block(p2)[0]
+
+        idx = chain.list_blocks(tmp)
+        files = chain_index._from_files(tmp)
+        check("D4a: индекс видит блоки", [b["seq"] for b in idx] == [1, 2],
+              [b["seq"] for b in idx])
+        check("D4a: индекс совпадает с чтением файлов",
+              [(b["seq"], b["block_id"], b["sha256"], b["n_atoms"]) for b in idx]
+              == [(b["seq"], b["block_id"], b["sha256"], b["n_atoms"]) for b in files])
+        check("D4a: index.db создан в каталоге системы",
+              os.path.exists(chain_index.db_path(tmp)))
+
+        # удалили блок — индекс это увидел
+        os.remove(p2)
+        check("D4a: удалённый блок уходит из индекса",
+              [b["seq"] for b in chain.list_blocks(tmp)] == [1])
+
+        # блок с тем же именем, но другим содержимым — переиндексация
+        p2b = add_block(2, 13, nxt=b1["block_id"])
+        b2b = chain.read_block(p2b)[0]
+        check("D4a: перезаписанный блок переиндексирован",
+              chain.list_blocks(tmp)[-1]["block_id"] == b2b["block_id"], b2b["block_id"])
+
+        # битый индекс — резервный путь и восстановление
+        with open(chain_index.db_path(tmp), "wb") as f:
+            f.write(b"garbage" * 100)
+        got = chain.list_blocks(tmp)
+        check("D4a: битый индекс не ломает чтение (резервный путь)",
+              [b["seq"] for b in got] == [1, 2], [b["seq"] for b in got])
+        check("D4a: rebuild строит индекс заново",
+              chain_index.rebuild(tmp) == {"blocks": 2}
+              and [b["seq"] for b in chain.list_blocks(tmp)] == [1, 2])
+
+        # next_seq/previous_hash работают через индекс
+        check("D4a: next_seq через индекс", chain.next_seq(tmp) == 3)
+        check("D4a: previous_hash через индекс",
+              chain.previous_hash(tmp, 3) == b2b["block_id"])
+    finally:
+        main.CONFIG["output_dir"] = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2948,6 +3028,7 @@ def _run_tests():
     worker_profile_tests()
     audit5_d_tests()
     ready_quota_v2_tests()
+    chain_index_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()
