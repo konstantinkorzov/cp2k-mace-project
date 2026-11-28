@@ -20,6 +20,7 @@ S_master перестала бы соответствовать матрицам
 """
 
 import os
+import math
 import re
 import sys
 import json
@@ -185,10 +186,55 @@ TOL_GRAD = 1e-4                        # только для метаданны�
 CP2K_TIMEOUT = 3600                    # таймаут одного прогона CP2K, секунды
 
 
+# Значения профиля (cutoff, eps, ot_minimizer…) приходят из задания и
+# подставляются в .inp через TEMPLATE.format. Пока они шли строками как есть,
+# значение вида "400\n&END MGRID\n &MGRID …" добавляло в файл произвольные
+# секции CP2K — то есть мастер получал выполнение своих директив на машине
+# воркера (аудит 5, M2). Теперь значение обязано быть числом (или ключевым
+# словом из [A-Za-z0-9_]) и рендерится в текст уже самим воркером.
+_NUMBER_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+_KEYWORD_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+_SYMBOL_RE = re.compile(r"^[A-Z][a-z]?$")
+
+
+def _as_number(key, value):
+    """Число из задания. Любой нечисловой текст — ошибка задачи."""
+    if isinstance(value, bool):
+        raise ValueError(f"{key}: ожидалось число, получено {value!r}")
+    if isinstance(value, (int, float)):
+        number = value
+    elif isinstance(value, str) and _NUMBER_RE.match(value.strip()):
+        text = value.strip()
+        number = float(text)
+        if number.is_integer() and "." not in text and "e" not in text.lower():
+            number = int(text)
+    else:
+        raise ValueError(f"{key}: ожидалось число, получено {value!r}")
+    if isinstance(number, float) and not math.isfinite(number):
+        raise ValueError(f"{key}: не конечное число")
+    return number
+
+
 def _num(cfg, key):
-    """Значение параметра CP2K: из cfg, иначе константа из CP2K_PARAMS."""
+    """Числовой параметр CP2K: из cfg, иначе константа из CP2K_PARAMS."""
     value = cfg.get(key)
-    return CP2K_PARAMS[key] if value is None else value
+    return _as_number(key, CP2K_PARAMS[key] if value is None else value)
+
+
+def _keyword(cfg, key):
+    """Ключевое слово CP2K (DIIS, FULL_SINGLE_INVERSE, LOW…).
+
+    Только буквы/цифры/подчёркивание: перевод строки и пробел невозможны,
+    поэтому «напечатать лишнюю секцию» через ot_minimizer не получится.
+    """
+    value = cfg.get(key)
+    if value is None:
+        value = CP2K_PARAMS[key]
+    text = str(value).strip()
+    if text and not _KEYWORD_RE.match(text):
+        raise ValueError(f"{key}: недопустимое значение {value!r} "
+                         f"(ожидалось ключевое слово CP2K)")
+    return text
 
 
 def force_print_block(project: str) -> str:
@@ -284,10 +330,23 @@ def resolve_cell_size(coords, cfg: dict) -> float:
 
 
 def _species_list(n_atoms, cfg) -> list[str]:
-    """Список символов по атомам: cfg['species'] или один элемент на всех."""
+    """Список символов по атомам: cfg['species'] или один элемент на всех.
+
+    Символы попадают в &KIND и &COORD как текст, поэтому проверяются по
+    справочнику потенциалов: неизвестный вид — ошибка задания, а не повод
+    посчитать «что-нибудь». Молчаливая подстановка элемента вместо
+    присланного состава давала бы другой расчёт, который мастер всё равно
+    отклонит.
+    """
     species = cfg.get("species")
     if species and len(species) == n_atoms:
-        return list(species)
+        checked = []
+        for sym in species:
+            if not isinstance(sym, str) or not _SYMBOL_RE.match(sym) \
+                    or sym not in PSEUDOPOTENTIALS:
+                raise ValueError(f"вид атома {sym!r} не из справочника потенциалов")
+            checked.append(sym)
+        return checked
     return [cfg["element"]] * n_atoms
 
 
@@ -365,7 +424,7 @@ def render_cp2k_input(
     gap = float(_num(cfg, "ot_energy_gap") or 0.0)
     if gap > 0:
         ot_extra += f"        ENERGY_GAP {gap:g}\n"
-    linesearch = str(_num(cfg, "ot_linesearch") or "").strip()
+    linesearch = _keyword(cfg, "ot_linesearch")
     if linesearch:
         ot_extra += f"        LINESEARCH {linesearch}\n"
 
@@ -374,13 +433,13 @@ def render_cp2k_input(
     return TEMPLATE.format(
         project=project,
         run_type=run_type,
-        print_level=_num(cfg, "print_level"),
+        print_level=_keyword(cfg, "print_level"),
         cutoff=_num(cfg, "cutoff"),
         rel_cutoff=_num(cfg, "rel_cutoff"),
         eps_default=_sci(_num(cfg, "eps_default")),
         eps_scf=_sci(_num(cfg, "eps_scf")),
-        ot_minimizer=_num(cfg, "ot_minimizer"),
-        ot_preconditioner=_num(cfg, "ot_preconditioner"),
+        ot_minimizer=_keyword(cfg, "ot_minimizer"),
+        ot_preconditioner=_keyword(cfg, "ot_preconditioner"),
         ot_extra=ot_extra,
         max_scf=max_scf,
         ignore_convergence=ignore_kw,

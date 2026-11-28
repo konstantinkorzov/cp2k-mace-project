@@ -53,14 +53,23 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _config_defaults() -> dict:
-    """Значения из src/config.json (формат {"value": ..., "help": ...})."""
-    try:
-        with open(os.path.join(PROJECT_ROOT, "src", "config.json"), encoding="utf-8") as f:
-            raw = json.load(f)
-    except Exception:  # noqa: BLE001
-        return {}
-    return {k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
-            for k, v in raw.items()}
+    """Значения из config.json (формат {"value": ..., "help": ...}).
+
+    Ищем два места: `<проект>/src/config.json` (обычная раскладка) и
+    `config.json` рядом с модулем — так воркер работает и из песочницы
+    тестов, и из каталога, куда скопировали только src/*.py.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(PROJECT_ROOT, "src", "config.json"),
+                 os.path.join(here, "config.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:  # noqa: BLE001
+            continue
+        return {k: (v.get("value") if isinstance(v, dict) and "value" in v else v)
+                for k, v in raw.items()}
+    return {}
 
 
 def setup_logger(worker_id: str, log_dir: str):
@@ -136,6 +145,15 @@ def _local_cfg(task_cfg: dict, project_root: str, results_root: str,
     out_dir = os.path.join(results_root, element)
     cfg["cp2k_cmd"] = LOCAL_CP2K_CMD
     cfg["cp2k_timeout_sec"] = LOCAL_CP2K_TIMEOUT
+
+    # Исполнение, а не физика: print_level задаёт детальность лога, который
+    # разбирает сам воркер, omp_threads — сколько ядер ему брать. В консенсус
+    # (consensus.CP2K_PROFILE) они не входят, поэтому берутся из config.json
+    # ВЛАДЕЛЬЦА воркера, даже если мастер прислал что-то другое.
+    local = _config_defaults()
+    for key in ("print_level", "omp_threads"):
+        if key in local:
+            cfg[key] = local[key]
     cfg["output_dir"] = out_dir
     cfg["failed_ids_file"] = os.path.join(out_dir, f"{element}_failed_ids.txt")
     if verbose is not None:
@@ -282,8 +300,16 @@ def run_task(task: dict, cfg: dict, logger, verbose: bool | None = None):
     dim = int(task.get("dim", 3))
     used_seed = task.get("seed")
 
-    species = [str(s) for s in (task.get("species") or [])]
-    if len(species) != n_atoms:
+    raw_species = task.get("species")
+    species = [str(s) for s in (raw_species or [])]
+    if raw_species and len(species) != n_atoms:
+        # Молча считать «один элемент на всех» нельзя: это уже другая система,
+        # и мастер всё равно отклонит результат. Пусть лучше сразу будет
+        # понятная причина — задача вернётся в очередь.
+        return False, {"error": True,
+                       "message": f"видов атомов {len(species)}, а атомов {n_atoms}"}
+    if not species:
+        # Совсем без species — старая совместимость: одноэлементная система.
         species = [cfg["element"]] * n_atoms
 
     cfg = dict(cfg)

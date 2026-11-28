@@ -2177,6 +2177,67 @@ def transport_ticket_tests():
     main.registered_workers.clear()
 
 
+def worker_profile_tests():
+    print("\n--- 42. Воркер: числа профиля, print_level локально, species ---")
+    base = dict(cp2k_runner.CP2K_PARAMS, element="Cu",
+                potential=cp2k_runner.get_potential("Cu"),
+                charge=0, multiplicity=1, species=["Cu", "Cu"],
+                verbose_cp2k=False)
+    coords = [[0.0, 0.0, 0.0], [0.0, 0.0, 2.56]]
+
+    def render(**over):
+        return cp2k_runner.render_cp2k_input("p", coords, dict(base, **over))
+
+    def raises(**over):
+        try:
+            render(**over)
+            return False
+        except ValueError:
+            return True
+
+    text = render()
+    check("C: обычный профиль рендерится",
+          "CUTOFF 400" in text and "MINIMIZER DIIS" in text)
+
+    check("C: cutoff с переводом строки не попадает в .inp",
+          raises(cutoff="400\n&END MGRID\n &MGRID\n  CUTOFF 50"))
+    check("C: cutoff строкой-числом принимается",
+          "CUTOFF 400" in render(cutoff="400"))
+    check("C: eps_scf=bool отвергается", raises(eps_scf=True))
+    check("C: ot_minimizer с секцией отвергается",
+          raises(ot_minimizer="DIIS\n&END SCF"))
+    check("C: print_level с секцией отвергается",
+          raises(print_level="LOW\n&END SCF"))
+    check("C: неизвестный вид атома отвергается", raises(species=["Cu", "Au2"]))
+    check("C: известные виды проходят",
+          cp2k_runner._species_list(2, {"species": ["Cu", "Al"], "element": "Cu"})
+          == ["Cu", "Al"])
+
+    # print_level/omp_threads — локальные: задание их не переопределяет
+    task_cfg = dict(base, print_level="DEBUG", omp_threads=8)
+    cfg = worker._local_cfg(task_cfg, "/workspace", "/tmp/res_c")
+    local = worker._config_defaults()
+    check("C: print_level из локального config.json, а не из задания",
+          cfg.get("print_level") == local.get("print_level", "LOW")
+          and cfg.get("print_level") != "DEBUG", cfg.get("print_level"))
+    check("C: omp_threads тоже локальный",
+          cfg.get("omp_threads") == local.get("omp_threads", 0),
+          cfg.get("omp_threads"))
+    check("C: физика профиля остаётся из задания",
+          cfg.get("cutoff") == cp2k_runner.CP2K_PARAMS["cutoff"]
+          and cfg.get("eps_scf") == cp2k_runner.CP2K_PARAMS["eps_scf"],
+          (cfg.get("cutoff"), cfg.get("eps_scf")))
+
+    # species: несовпадение длины — явная ошибка до CP2K
+    ok, data = worker.run_task(
+        {"struct_id": "n2_d3_0000", "n_atoms": 2, "dim": 3,
+         "geometry": coords, "species": ["Cu"]}, cfg,
+        logging.getLogger("worker_profile_test"))
+    check("C: несовпадение числа видов — задача падает с причиной",
+          (not ok) and "видов" in str(data.get("message")),
+          str(data.get("message"))[:90])
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2707,6 +2768,7 @@ def _run_tests():
     audit4_tests()
     audit5_tests()
     transport_ticket_tests()
+    worker_profile_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()
