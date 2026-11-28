@@ -1956,8 +1956,15 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
 
 
 @app.get("/register-challenge")
+@app.post("/register-challenge")
 def register_challenge():
-    """Одноразовый nonce: воркер подписывает его и доказывает владение ключом."""
+    """Одноразовый nonce для регистрации.
+
+    Два метода: незашифрованный клиент (loopback) спрашивает GET-ом, а
+    зашифрованный шлёт конверт POST-ом — внутри конверта метод тоже POST, и
+    раньше маршрут отвечал 405, то есть регистрация с шифрованием не
+    проходила вообще.
+    """
     return {"nonce": _issue_registration_nonce(), "ttl": REG_NONCE_TTL,
             "sign_prefix": REG_SIGN_PREFIX.decode("ascii")}
 
