@@ -39,8 +39,8 @@ usage() {
     echo "  --no-pull           Skip 'docker pull' before starting container"
     echo ""
     echo "Bind (env):"
-    echo "  PANEL_BIND          host interface for the HTTPS panel (default: 127.0.0.1)"
-    echo "                      set PANEL_BIND=0.0.0.0 to publish it to the LAN"
+    echo "  PANEL_BIND          host interface for the HTTPS panel (default: 0.0.0.0)"
+    echo "                      set PANEL_BIND=127.0.0.1 to keep it local-only"
     echo "  MASTER_API_BIND     host interface for master API :8000 (default: 0.0.0.0)"
     echo "  MASTER_BIND         bind address INSIDE the container (default: 0.0.0.0);"
     echo "                      127.0.0.1 makes the master loopback-only (no encryption needed)"
@@ -213,11 +213,9 @@ fi
 # 5. Запуск контейнера
 # ==========================================
 echo ">>> Starting container '$CONTAINER_NAME' in $MODE mode ($RUN_MODE)..."
-echo ">>> Ports: ${PANEL_BIND:-127.0.0.1}:$HOST_PORT_8443 -> container:8443, ${MASTER_API_BIND:-0.0.0.0}:$HOST_PORT_8000 -> container:8000"
-if [[ "${PANEL_BIND:-127.0.0.1}" != "127.0.0.1" ]]; then
-    echo ">>> Panel is published on ${PANEL_BIND} — anyone on that network can reach it."
-    echo ">>> Admin password: results/webui_admin_password.txt (0600), not printed to the log."
-fi
+echo ">>> Ports: ${PANEL_BIND:-0.0.0.0}:$HOST_PORT_8443 -> container:8443, ${MASTER_API_BIND:-0.0.0.0}:$HOST_PORT_8000 -> container:8000"
+echo ">>> Panel: ${PANEL_BIND:-0.0.0.0} — доступна по сети (PANEL_BIND=127.0.0.1 оставит только локально)."
+echo ">>> Admin password: results/webui_admin_password.txt (0600), в лог не пишется."
 
 DOCKER_FLAGS="-i"
 if [[ "$RUN_MODE" == "interactive" ]]; then
@@ -258,7 +256,7 @@ docker run $DOCKER_FLAGS $EXTRA_FLAGS \
     -e WEBUI_TLS_SAN="${WEBUI_TLS_SAN:-}" \
     -e MASTER_PORT="8000" \
     -e MASTER_BIND="${MASTER_BIND:-0.0.0.0}" \
-    -p "${PANEL_BIND:-127.0.0.1}:${HOST_PORT_8443}:8443" \
+    -p "${PANEL_BIND:-0.0.0.0}:${HOST_PORT_8443}:8443" \
     -p "${MASTER_API_BIND:-0.0.0.0}:${HOST_PORT_8000}:8000" \
     -v "$SCRIPT_DIR":/workspace \
     -w /workspace \
