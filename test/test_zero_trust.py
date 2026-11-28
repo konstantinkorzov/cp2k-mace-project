@@ -1907,6 +1907,202 @@ def audit4_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def audit5_tests():
+    print("\n--- 40. Аудит 5: NaN в блоке, диаметр на приёме, coinbase.height ---")
+    import structure_generator
+
+    tmp = tempfile.mkdtemp(prefix="audit5_")
+    saved = {k: main.CONFIG.get(k) for k in
+             ("output_dir", "element", "composition", "formula_size", "atom_diameter")}
+    old_verify = cp2k_runner.verify_state_from_wfn
+    try:
+        edir = os.path.join(tmp, "Cu")
+        os.makedirs(edir, exist_ok=True)
+        main.CONFIG.update({"output_dir": edir, "element": "Cu",
+                            "composition": {"Cu": 1}, "formula_size": 1,
+                            "atom_diameter": 2.56})
+        conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
+        wallet = wallet_store.create_wallet(conn, "m", "root")
+        master = wallet.latest_key()["address"]
+
+        wfn = os.path.join(tmp, "s.wfn")
+        with open(wfn, "wb") as f:
+            f.write(b"CP2K-WFN" + b"\x00" * 20000)
+        sha, rel = chain.store_blob(edir, wfn)
+
+        # ---------- H5: сами проверки чисел ----------
+        nan = float("nan")
+        check("H5: NaN в энергии ловится",
+              chain.dft_number_problems({"energy_ev": nan}) ==
+              ["dft.json: energy_ev — не конечное число"],
+              chain.dft_number_problems({"energy_ev": nan}))
+        check("H5: NaN в силах ловится",
+              any("силы" in p for p in chain.dft_number_problems(
+                  {"energy_ev": -1.0,
+                   "forces_ev_ang": [[0.0, 0.0, 0.0], [nan, 0.0, 0.0]]})))
+        check("H5: NaN/Inf в gap и магнитном моменте ловятся",
+              len(chain.dft_number_problems(
+                  {"energy_ev": -1.0, "homo_lumo_gap_ev": nan,
+                   "magnetic_moment": float("inf")})) == 2)
+        check("H5: конечные числа проходят",
+              chain.dft_number_problems(
+                  {"energy_ev": -1.5, "homo_lumo_gap_ev": 0.5,
+                   "forces_ev_ang": [[0.0, 0.0, 0.5], [0.1, 0.0, 0.0]]}) == [])
+
+        issued = main._issue_geometry({"n_atoms": 2, "nonce": 3,
+                                       "dim": chain.consensus.dim_for_height(0)})
+        dft1 = {"energy_ev": -1.5,
+                "forces_ev_ang": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]],
+                "geometry": issued["coords"], "species": issued["species"]}
+        p1 = chain.write_block(edir, "Cu", 2, sha, rel,
+                               [chain.make_coinbase(1, master)],
+                               cp2k_version="x", cp2k_build="y",
+                               cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                               dft=dft1, nonce=3, atom_diameter=2.56,
+                               composition={"Cu": 1})
+        head1 = chain.read_block(p1)[0]["block_id"]
+        check("H5: диаметр цепочки виден приёмке",
+              chain.chain_diameter(edir) == "2.560", chain.chain_diameter(edir))
+
+        def block2(diameter, override, nonce):
+            """Блок высоты 2 под заданный диаметр; возвращает его байты."""
+            hdr = {"prev_id": head1, "nonce": nonce, "n_atoms": 2,
+                   "dim": chain.consensus.dim_for_height(1),
+                   "atom_diameter": diameter, "system": "Cu",
+                   "composition": {"Cu": 1}}
+            body = {"energy_ev": -1.5,
+                    "forces_ev_ang": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]],
+                    "geometry": chain.expected_geometry(hdr).tolist(),
+                    "species": [str(s) for s in structure_generator.assign_species(
+                        2, {"composition": {"Cu": 1}},
+                        seed=chain.geometry_seed(hdr["prev_id"], nonce))]}
+            body.update(override)
+            path = chain.write_block(edir, "Cu", 2, sha, rel,
+                                     [chain.make_coinbase(2, master)],
+                                     cp2k_version="x", cp2k_build="y",
+                                     cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                                     dft=body, nonce=nonce,
+                                     atom_diameter=diameter,
+                                     composition={"Cu": 1})
+            data = open(path, "rb").read()
+            os.remove(path)
+            return data
+
+        def nan_energy(coords, wfn_path, cfg, project=None):
+            return {"ok": True, "energy_ev": nan, "gap": None, "mag": None,
+                    "props": {}, "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2}
+
+        def nan_forces(coords, wfn_path, cfg, project=None):
+            return {"ok": True, "energy_ev": -1.5, "gap": None, "mag": None,
+                    "props": {}, "forces_ev_ang": [[0.0, 0.0, 0.0], [nan, 0.0, 0.0]]}
+
+        main._BAD_PEERS.clear()
+        cp2k_runner.verify_state_from_wfn = nan_energy
+        ok, why = main._accept_peer_block("http://nan1:8000", 2, head1,
+                                          block2(2.56, {"energy_ev": nan}, 11))
+        check("H5: блок пира с NaN-энергией не принят",
+              (not ok) and any("energy_ev" in w for w in why), why[:2])
+        check("H5: пир с NaN-энергией в карантине",
+              "http://nan1:8000" in main._BAD_PEERS, list(main._BAD_PEERS))
+
+        main._BAD_PEERS.clear()
+        cp2k_runner.verify_state_from_wfn = nan_forces
+        ok, why = main._accept_peer_block(
+            "http://nan2:8000", 2, head1,
+            block2(2.56, {"forces_ev_ang": [[0.0, 0.0, 0.0], [nan, 0.0, 0.0]]}, 12))
+        check("H5: блок пира с NaN в силах не принят",
+              (not ok) and any("силы" in w for w in why), why[:2])
+
+        main._BAD_PEERS.clear()
+        ok, why = main._accept_peer_block(
+            "http://nan3:8000", 2, head1,
+            block2(2.56, {"homo_lumo_gap_ev": nan}, 13))
+        check("H5: блок пира с NaN в gap не принят",
+              (not ok) and any("homo_lumo_gap_ev" in w for w in why), why[:2])
+
+        # ---------- M1: чужой диаметр — отказ при приёме, а не в verify_chain ----------
+        main._BAD_PEERS.clear()
+        cp2k_runner.verify_state_from_wfn = nan_energy   # сюда не должно дойти
+        ok, why = main._accept_peer_block("http://diam:8000", 2, head1,
+                                          block2(2.9, {}, 14))
+        check("M1: блок пира с чужим atom_diameter не принят",
+              (not ok) and any("atom_diameter" in w for w in why), why[:2])
+        check("M1: чужой диаметр отвергнут ДО DFT (пир не в карантине)",
+              "http://diam:8000" not in main._BAD_PEERS, list(main._BAD_PEERS))
+
+        # ---------- L1: coinbase.height != seq ----------
+        hdr15 = {"prev_id": head1, "nonce": 15, "n_atoms": 2,
+                 "dim": chain.consensus.dim_for_height(1),
+                 "atom_diameter": 2.56, "system": "Cu", "composition": {"Cu": 1}}
+        dft15 = {"energy_ev": -1.5,
+                 "forces_ev_ang": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5]],
+                 "geometry": chain.expected_geometry(hdr15).tolist(),
+                 "species": ["Cu", "Cu"]}
+        p_cb = chain.write_block(edir, "Cu", 2, sha, rel,
+                                 [chain.make_coinbase(99, master)],
+                                 cp2k_version="x", cp2k_build="y",
+                                 cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                                 dft=dft15, nonce=15, atom_diameter=2.56,
+                                 composition={"Cu": 1})
+        v = chain.verify_block(edir, p_cb)
+        check("L1: verify_block ловит coinbase.height != seq",
+              (not v["ok"]) and any("coinbase.height" in p for p in v["problems"]),
+              v["problems"][:2])
+        os.remove(p_cb)
+
+        dft16 = dict(dft15, geometry=chain.expected_geometry(
+            dict(hdr15, nonce=16)).tolist())
+        p_reuse = chain.write_block(edir, "Cu", 2, sha, rel,
+                                    [chain.make_coinbase(1, master)],
+                                    cp2k_version="x", cp2k_build="y",
+                                    cp2k_params=dict(cp2k_runner.CP2K_PARAMS),
+                                    dft=dft16, nonce=16, atom_diameter=2.56,
+                                    composition={"Cu": 1})
+        probs = chain.verify_chain(edir, "Cu")["problems"]
+        check("L1: verify_chain ловит переиспользованный coinbase (тот же txid)",
+              any("coinbase.height" in p for p in probs), probs[:2])
+        os.remove(p_reuse)
+
+        # ---------- L3: worker_id из тела запроса ----------
+        main.pending_tasks.clear()
+        main.active_tasks.clear()
+        main.completed_tasks.clear()
+        main.failed_tasks.clear()
+        main.registered_workers.clear()
+        reg = main._register_worker("audit5", None, None)
+        wid, sess = reg["worker_id"], reg["session"]
+        main.pending_tasks.append({"struct_id": "n2_d3_9001", "n_atoms": 2,
+                                   "attempts": 0})
+        issued_t = main.get_task(wid, session=sess)["task"]
+        captured = {}
+        real_vsp = main.verify_state_payload
+
+        def spy(cfg_, task_, payload_, issued_=None, **kw):
+            captured.update(payload_)
+            return {"valid": False, "reason": "тест: дальше не идём"}
+
+        main.verify_state_payload = spy
+        try:
+            main.submit_result(main.TaskResult(
+                worker_id=wid, session=sess, struct_id=issued_t["struct_id"],
+                success=True,
+                data={"worker_id": "worker_999",
+                      "geometry": issued_t["geometry"],
+                      "species": issued_t["species"]}))
+        finally:
+            main.verify_state_payload = real_vsp
+        check("L3: worker_id из тела запроса не подменяет автора работы",
+              captured.get("worker_id") == wid, captured.get("worker_id"))
+    finally:
+        cp2k_runner.verify_state_from_wfn = old_verify
+        main._BAD_PEERS.clear()
+        main.registered_workers.clear()
+        main.pending_tasks.clear()
+        main.active_tasks.clear()
+        main.CONFIG.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2435,6 +2631,7 @@ def _run_tests():
     dft_units_tests()
     audit3_tests()
     audit4_tests()
+    audit5_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()

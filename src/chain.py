@@ -291,6 +291,50 @@ def sum_outputs(tx: dict) -> int:
     return total
 
 
+# Числовые поля dft.json, которые обязаны быть КОНЕЧНЫМИ. NaN/Inf проходят
+# любое сравнение (abs(nan - x) > tol → False), поэтому подкрашенный блок с
+# NaN «сходится» с любым пересчётом, попадает в цепочку и портит датасет
+# MACE (NaN-loss). money-путь от такого закрыт целыми числами, а физика — нет.
+DFT_FINITE_FIELDS = (
+    "energy_ev", "homo_lumo_gap_ev", "magnetic_moment",
+    "dipole_total_debye", "e_binding_per_atom_ev", "e_isolated_atom_ev",
+)
+
+
+def _is_finite_number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)))
+
+
+def dft_number_problems(dft: dict) -> list[str]:
+    """Нечисловые/не-конечные величины в dft.json: энергия, наблюдаемые, силы."""
+    if not isinstance(dft, dict):
+        return ["dft.json: не объект"]
+    problems = []
+    for key in DFT_FINITE_FIELDS:
+        value = dft.get(key)
+        if value is None:
+            continue                     # необязательное поле
+        if not _is_finite_number(value):
+            problems.append(f"dft.json: {key} — не конечное число")
+    dipole = dft.get("dipole_debye")
+    if dipole is not None:
+        if not isinstance(dipole, list) or len(dipole) != 3 \
+                or not all(_is_finite_number(x) for x in dipole):
+            problems.append("dft.json: dipole_debye — не 3 конечных числа")
+    forces = dft.get("forces_ev_ang")
+    if forces is not None:
+        if not isinstance(forces, list):
+            problems.append("dft.json: forces_ev_ang — не список")
+        else:
+            for idx, row in enumerate(forces):
+                if not isinstance(row, list) or len(row) != 3 \
+                        or not all(_is_finite_number(x) for x in row):
+                    problems.append(f"dft.json: силы атома {idx} — не 3 конечных числа")
+                    break
+    return problems
+
+
 def merkle_root(leaves: list[bytes]) -> str:
     """Merkle-корень с доменным разделением листьев и узлов."""
     if not leaves:
@@ -999,6 +1043,16 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
             problems.append(f"{label}: сумма входов {total_in} < суммы выходов {total_out}")
         block_fee += max(0, total_in - total_out)
 
+    if coinbases and height is not None:
+        # coinbase.height обязан совпадать с высотой блока: иначе два блока
+        # дают ОДИН txid (его считают из body, а height в него не входит) и
+        # делят один UTXO-ключ — история и атрибуция монет теряются.
+        cb_height = coinbases[0].get("height")
+        if type(cb_height) is not int or cb_height != int(height):
+            problems.append(
+                f"{label}: coinbase.height {cb_height!r} != высоты блока {height} "
+                f"(txid coinbase перестал бы быть уникальным)")
+
     if coinbases:
         # sum_outputs не падает на мусоре: блок всё равно отклонится
         # invalid_outputs, но исключения из проверки быть не должно.
@@ -1091,6 +1145,7 @@ def _verify_block(element_dir: str, block_path: str,
             problems.append("dft.json: forces не соответствуют n_atoms")
         if dft.get("energy_ev") is None:
             problems.append("dft.json: нет energy_ev")
+        problems.extend(dft_number_problems(dft))
         if dft_sha256(dft) != header.get("dft_sha256"):
             problems.append("dft_sha256 не совпадает с dft.json")
         try:
@@ -1213,6 +1268,7 @@ def verify_chain(element_dir: str, system: str | None = None) -> dict:
         if not dft or dft.get("energy_ev") is None:
             problems.append(f"{b['name']}: нет dft.json/energy_ev")
         else:
+            problems.extend(f"{b['name']}: {p}" for p in dft_number_problems(dft))
             if dft_sha256(dft) != header.get("dft_sha256"):
                 problems.append(f"{b['name']}: dft_sha256 не совпадает с dft.json")
             geom = dft.get("geometry")
@@ -1296,7 +1352,15 @@ def verify_chain(element_dir: str, system: str | None = None) -> dict:
             block_fee += max(0, total_in - total_out)
 
         if coinbases:
-            cb_value = sum(int(o["value"]) for o in coinbases[0].get("outputs", []))
+            # coinbase.height обязан совпадать с высотой блока: иначе txid
+            # coinbase (height в него не входит) повторяется у двух блоков и
+            # UTXO-ключ переиспользуется — история монет становится двусмысленной.
+            cb_height = coinbases[0].get("height")
+            if type(cb_height) is not int or cb_height != b["seq"]:
+                problems.append(
+                    f"{b['name']}: coinbase.height {cb_height!r} != высоты блока "
+                    f"{b['seq']}")
+            cb_value = sum_outputs(coinbases[0])
             if cb_value > COINBASE_VALUE + block_fee:
                 problems.append(f"{b['name']}: coinbase {cb_value} > "
                                 f"{COINBASE_VALUE} + комиссии {block_fee}")

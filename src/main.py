@@ -21,6 +21,7 @@ TOL_ENERGY_EV = 0.02       # только для печати телеметри
 import os
 import sys
 import json
+import math
 import time
 import base64
 import signal
@@ -2445,7 +2446,9 @@ def submit_result(result: TaskResult):
             return {"status": "busy", "reason": "master is syncing"}
 
         payload = dict(result.data or {})
-        payload.setdefault("worker_id", w_id)
+        # worker_id — только из проверенной сессии: иначе тело запроса
+        # переназначает награду и атрибуцию кадра на другого воркера.
+        payload["worker_id"] = str(w_id)
         if sid in completed_tasks:
             return {"status": "accepted", "kept": "already", "energy_ev": None}
 
@@ -2562,7 +2565,8 @@ def submit_result(result: TaskResult):
 
         # --- Приёмка: только по файлу состояния (-RESTART.wfn) ---
         payload = dict(result.data or {})
-        payload.setdefault("worker_id", w_id)
+        # См. above: тело запроса не может сменить автора работы.
+        payload["worker_id"] = str(w_id)
 
         # Эталон — та геометрия, которую мастер выдал (info), а не присланная.
         # Сверка дешёвая; только после неё запускаются последние шаги DFT.
@@ -2801,6 +2805,22 @@ def _accept_peer_block(peer: str, seq: int, head: str,
         local_comp = CONFIG.get("composition") or {str(CONFIG.get("element")): 1}
         if header.get("composition") != local_comp:
             return False, [f"состав блока {header.get('composition')} != {local_comp}"]
+        # Диаметр — свойство цепочки (src/chain.py::verify_chain). Раньше он
+        # проверялся ТОЛЬКО там: пир присылал блок с другим диаметром (своя,
+        # легальная по seed геометрия), блок принимался, а потом проверка
+        # истории валила всю цепочку без возможности починить.
+        pinned_diameter = chain_mod.chain_diameter(element_dir)
+        if pinned_diameter is not None and header.get("atom_diameter") != pinned_diameter:
+            return False, [f"atom_diameter {header.get('atom_diameter')} != "
+                           f"{pinned_diameter} (как в цепочке)"]
+
+        # Нечисловые/не-конечные величины — до скачивания blob и до DFT:
+        # abs(nan - x) > tol даёт False, то есть NaN «совпадал» с любым
+        # пересчётом. Такое не считает ни один честный CP2K → карантин.
+        bad_numbers = chain_mod.dft_number_problems(dft)
+        if bad_numbers:
+            _bad_peer(peer, bad_numbers[0])
+            return False, bad_numbers[:3]
         if any(b["seq"] == seq for b in chain_mod.list_blocks(element_dir)):
             return False, [f"блок с seq {seq} уже есть"]
 
@@ -2834,9 +2854,15 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                 _bad_peer(peer, f"DFT-проверка: {res.get('reason')}")
                 return False, [f"DFT-проверка: {res.get('reason')}"]
 
-            e_block = float(dft.get("energy_ev"))
+            e_block = dft.get("energy_ev")
+            mine_e = res.get("energy_ev")
+            if not (isinstance(e_block, (int, float)) and isinstance(mine_e, (int, float))):
+                return False, ["энергия блока/пересчёта — не число"]
+            e_block, mine_e = float(e_block), float(mine_e)
+            if not (math.isfinite(e_block) and math.isfinite(mine_e)):
+                return False, ["энергия блока/пересчёта — не конечное число"]
             tol_e = consensus.peer_tol_energy_ev(expected_n)
-            if abs(res["energy_ev"] - e_block) > tol_e:
+            if not (abs(mine_e - e_block) <= tol_e):
                 _bad_peer(peer, f"энергия: блок {e_block:.4f} != "
                                 f"пересчёт {res['energy_ev']:.4f}")
                 return False, [f"энергия блока {e_block:.6f} != "
@@ -2855,7 +2881,13 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                 claimed = dft.get(key)
                 if claimed is None or mine is None:
                     continue  # старые блоки без этих полей — не повод отбраковывать
-                if abs(float(claimed) - float(mine)) > tol:
+                try:
+                    claimed_v, mine_v = float(claimed), float(mine)
+                except (TypeError, ValueError):
+                    return False, [f"{key}: не число (блок {claimed!r})"]
+                if not (math.isfinite(claimed_v) and math.isfinite(mine_v)):
+                    return False, [f"{key}: не конечное число (блок {claimed!r})"]
+                if not (abs(claimed_v - mine_v) <= tol):
                     _bad_peer(peer, f"{key}: блок {float(claimed):.4f} != "
                                     f"пересчёт {float(mine):.4f}")
                     return False, [f"{key}: в блоке {float(claimed):.6f}, "
@@ -2877,9 +2909,13 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                     except (TypeError, ValueError):
                         _bad_peer(peer, "forces: не числа")
                         return False, [f"forces: атом {idx} — не числа"]
+                    if not math.isfinite(delta):
+                        # NaN в силах раньше проходил: nan > tol — False
+                        _bad_peer(peer, f"forces: атом {idx} — не конечное число")
+                        return False, [f"forces: атом {idx} — не конечное число"]
                     if delta > worst:
                         worst, where = delta, idx
-                if worst > PEER_TOL_FORCE_EV_ANG:
+                if not (worst <= PEER_TOL_FORCE_EV_ANG):
                     _bad_peer(peer, f"forces: расхождение {worst:.4f} эВ/Å")
                     return False, [f"forces: расхождение до {worst:.4f} эВ/Å "
                                    f"(атом {where}, допуск {PEER_TOL_FORCE_EV_ANG})"]
