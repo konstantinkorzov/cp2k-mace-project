@@ -6,6 +6,7 @@ const http = require('http');
 const { execFile } = require('child_process');
 
 const presets = require('./presets');
+const Money = require('./static_pages/money.js');
 const procs = require('./procs');
 
 // ==================== helpers ====================
@@ -412,24 +413,28 @@ async function onWalletSend(req, res) {
     try {
         const body = req.body || {};
         if (!body.password) return bad(res, 400, 'нужен пароль кошелька');
-        // Деньги — только целые: JS Number дробный, поэтому проверяем явно,
-        // иначе "1.5" уедет в --amount и превратится в чужую сумму.
-        const amount = Number(body.amount);
-        if (!Number.isSafeInteger(amount) || amount <= 0) {
-            return bad(res, 400, 'сумма — целое число монет (дробей нет)');
+        // Суммы вводятся в DFT ("12.5"), разбираются строго: без float,
+        // не больше 6 знаков. В webwallet уходит та же строка — он разберёт
+        // её в целые базовые единицы (консенсус целочисленный).
+        const amountText = String(body.amount === undefined || body.amount === null
+            ? '' : body.amount).trim();
+        const amountUnits = Money.parse(amountText);
+        if (amountUnits === null || amountUnits <= 0) {
+            return bad(res, 400, `сумма в ${Money.TICKER}, например 12.5`);
         }
-        let fee = 0;
+        let feeText = '';
         if (body.fee !== undefined && body.fee !== null && body.fee !== '') {
-            fee = Number(body.fee);
-            if (!Number.isSafeInteger(fee) || fee < 0) {
-                return bad(res, 400, 'комиссия — целое число (дробей нет)');
+            feeText = String(body.fee).trim();
+            const feeUnits = Money.parse(feeText);
+            if (feeUnits === null || feeUnits < 0) {
+                return bad(res, 400, `комиссия в ${Money.TICKER}, например 0.1`);
             }
         }
 
         const root = walletRoot(body);
         const args = ['src/webwallet.py', 'send', '--results-root', root,
-            '--to', String(body.to), '--amount', String(amount)];
-        if (fee) args.push('--fee', String(fee));
+            '--to', String(body.to), '--amount', amountText];
+        if (feeText) args.push('--fee', feeText);
         if (body.name) args.push('--name', String(body.name));
         if (body.element) args.push('--element', String(body.element));
         const masters = (body.masters || []).map((m) => String(m).trim()).filter(Boolean);

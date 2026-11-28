@@ -27,6 +27,7 @@ import sys
 import requests
 
 import chain
+import money
 import crypto
 import wallet_store
 
@@ -239,15 +240,17 @@ def show_info(wallet, element: str, element_dir: str, confirmations: int) -> int
     print(f"  цепочка : {element} (results/{element})")
     print(f"  высота  : {max(0, chain.next_seq(element_dir) - 1)}")
     print(f"  адресов : {len(wallet.keys())}")
-    print(f"  доступно: {totals['available']}  pending: {totals['pending']}  "
-          f"всего: {totals['total']}")
+    print(f"  доступно: {money.fmt(totals['available'])} {money.TICKER}"
+          f"  pending: {money.fmt(totals['pending'])}"
+          f"  всего: {money.fmt(totals['total'])}")
     return 0
 
 
 def show_balance(wallet, element_dir: str, confirmations: int) -> int:
     totals = _totals(element_dir, wallet.addresses(), confirmations)
-    print(f"available={totals['available']} pending={totals['pending']} "
-          f"total={totals['total']}")
+    print(f"available={money.fmt(totals['available'])} "
+          f"pending={money.fmt(totals['pending'])} "
+          f"total={money.fmt(totals['total'])} {money.TICKER}")
     return 0
 
 
@@ -260,7 +263,7 @@ def show_unspent(wallet, element_dir: str, confirmations: int) -> int:
             continue
         need = chain.COINBASE_MATURITY if info.get("coinbase") else max(0, confirmations)
         ready = info["height"] + need <= next_height
-        rows.append(f"  {txid[:16]}…:{vout:<3} {int(info['value']):>12}  "
+        rows.append(f"  {txid[:16]}…:{vout:<3} {money.fmt(info['value']):>14}  "
                     f"подтв. {max(0, next_height - 1 - info['height']):>3}  "
                     f"{info['address'][:16]}…  "
                     + ("доступен" if ready else "ждёт подтверждений")
@@ -270,6 +273,45 @@ def show_unspent(wallet, element_dir: str, confirmations: int) -> int:
     for r in rows:
         print(r)
     return 0
+
+
+def send_coins(wallet, element_dir: str, to: str, amount: int, fee: int,
+               masters: list[str], confirmations: int) -> int:
+    """
+    Перевод из CLI: собрать, подписать и отправить на мастеров.
+
+    Раньше эта функция вызывалась, но не была написана — `--send-to` из CLI
+    падал с NameError. Суммы приходят уже в базовых единицах (их разобрал
+    `money.parse` в main()).
+    """
+    tx = chain.build_wallet_transfer(
+        wallet, element_dir, to, amount, fee=fee,
+        confirmations=confirmations)
+    if tx is None:
+        print("✗ недостаточно подтверждённых средств", file=sys.stderr)
+        return 1
+
+    accepted, errors = 0, []
+    for url in masters:
+        url = str(url).rstrip("/")
+        try:
+            r = requests.post(url + "/tx/submit", json={"tx": tx}, timeout=30)
+            body = r.json()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{url}: {e}")
+            continue
+        if body.get("status") == "accepted":
+            accepted += 1
+        else:
+            errors.append(f"{url}: {body.get('reason') or body.get('status')}")
+
+    print(f"Перевод {money.fmt(amount, ticker=True)} на {to[:16]}…, "
+          f"комиссия {money.fmt(fee)} {money.TICKER}")
+    print(f"  txid: {tx.get('txid')}")
+    print(f"  принят мастерами: {accepted}/{len(masters)}")
+    for e in errors:
+        print(f"  ✗ {e}")
+    return 0 if accepted else 1
 
 
 def show_tx(element_dir: str, wallet, txid: str) -> int:
@@ -296,14 +338,14 @@ def show_tx(element_dir: str, wallet, txid: str) -> int:
                 owner = owners.get((i["txid"], int(i["vout"])))
                 total_in += value
                 mark = " (наш)" if owner in addrs else ""
-                print(f"  ← {int(value):>12}  {str(owner)[:16]}…{mark}")
+                print(f"  ← {money.fmt(value):>14}  {str(owner)[:16]}…{mark}")
             total_out = 0
             for n, o in enumerate(tx.get("outputs", [])):
                 total_out += int(o["value"])
                 mark = " (наш)" if o["address"] in addrs else ""
-                print(f"  → #{n:<2} {int(o['value']):>9}  {o['address'][:16]}…{mark}")
+                print(f"  → #{n:<2} {money.fmt(o['value']):>12}  {o['address'][:16]}…{mark}")
             if tx.get("type") != "coinbase" and total_in:
-                print(f"  комиссия: {total_in - total_out}")
+                print(f"  комиссия: {money.fmt(total_in - total_out)} {money.TICKER}")
             return 0
     print(f"✗ транзакция {txid} не найдена в блоках цепочки "
           f"{os.path.basename(os.path.normpath(element_dir))}")
@@ -320,8 +362,9 @@ def show_address(wallet, element_dir: str, address: str, confirmations: int) -> 
         print("  наш: нет (чужой адрес — только баланс по цепочке)")
     bal = chain.balances(element_dir, {address}, confirmations).get(address)
     if bal:
-        print(f"  доступно {int(bal['available'])}, pending {int(bal['pending'])}, "
-              f"всего {int(bal['total'])}")
+        print(f"  доступно {money.fmt(bal['available'])}, "
+              f"pending {money.fmt(bal['pending'])}, "
+              f"всего {money.fmt(bal['total'])} {money.TICKER}")
     else:
         print("  баланс: пусто")
     return 0
@@ -349,8 +392,11 @@ def main():
                     help="сохранить число подтверждений в config.json "
                          "(для мастеров применится при следующем запуске)")
     ap.add_argument("--send-to", default=None, help="адрес получателя")
-    ap.add_argument("--amount", type=int, default=None, help="сумма перевода (целые монеты)")
-    ap.add_argument("--fee", type=int, default=chain.DEFAULT_FEE, help="комиссия (целые монеты)")
+    ap.add_argument("--amount", default=None,
+                    help=f"сумма перевода в {money.TICKER} (например 12.5)")
+    ap.add_argument("--fee", default=None,
+                    help=f"комиссия в {money.TICKER} (по умолчанию "
+                         f"{money.fmt(chain.DEFAULT_FEE)})")
     ap.add_argument("--master", action="append", default=None,
                     help="URL мастера для отправки tx (можно несколько)")
     ap.add_argument("--new-address", action="store_true",
@@ -498,8 +544,19 @@ def main():
         sys.exit(show_address(wallet, element_dir, args.address, confirmations))
 
     if args.send_to:
-        if args.amount is None or args.amount <= 0:
-            print("✗ Нужна положительная сумма: --amount", file=sys.stderr)
+        try:
+            amount_units = money.parse(args.amount, "--amount")
+            fee_units = (money.parse(args.fee, "--fee") if args.fee is not None
+                         else chain.DEFAULT_FEE)
+        except ValueError as e:
+            print(f"✗ {e}", file=sys.stderr)
+            sys.exit(2)
+        if amount_units <= 0:
+            print(f"✗ Нужна положительная сумма: --amount (в {money.TICKER})",
+                  file=sys.stderr)
+            sys.exit(2)
+        if fee_units < 0:
+            print("✗ Комиссия не может быть отрицательной", file=sys.stderr)
             sys.exit(2)
         if not chain.ADDRESS_RE.match(str(args.send_to)):
             print("✗ Адрес получателя должен быть 64 hex (sha256 ключа)",
@@ -507,8 +564,8 @@ def main():
             sys.exit(2)
         masters = [m.rstrip("/") for m in (args.master or
                    [os.environ.get("MASTER_URL", "http://127.0.0.1:8000")]) if m]
-        sys.exit(send_coins(wallet, element_dir, args.send_to, args.amount,
-                            args.fee, masters, confirmations))
+        sys.exit(send_coins(wallet, element_dir, args.send_to, amount_units,
+                            fee_units, masters, confirmations))
 
     sys.exit(show(wallet, element_dir, confirmations, element))
 

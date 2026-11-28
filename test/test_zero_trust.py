@@ -97,7 +97,8 @@ def prepare_env():
     for f in ("main.py", "cp2k_runner.py", "structure_generator.py", "worker.py",
               "config_loader.py", "archive_maker.py", "identity.py", "chain.py",
               "consensus.py", "crypto.py", "wallet_store.py", "wallet.py",
-              "webwallet.py", "secure.py", "secure_http.py", "secure_client.py"):
+              "webwallet.py", "money.py", "secure.py", "secure_http.py",
+              "secure_client.py"):
         shutil.copy(os.path.join(SRC, f), os.path.join(ENV, f))
 
     # реальный config.json проекта (формат {"value":..., "help":...})
@@ -1673,6 +1674,32 @@ def audit3_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def dft_units_tests():
+    print("\n--- 38. Деньги: показ в DFT (1 DFT = 10^6 базовых) ---")
+    check("1 DFT = 1 000 000 базовых", money.BASE == 1_000_000)
+    check("fmt: 25 монет", money.fmt(25_000_000) == "25", money.fmt(25_000_000))
+    check("fmt: 0.1", money.fmt(100_000) == "0.1", money.fmt(100_000))
+    check("fmt: одна базовая единица", money.fmt(1) == "0.000001", money.fmt(1))
+    check("fmt: хвостовые нули убираются", money.fmt(12_340_000) == "12.34",
+          money.fmt(12_340_000))
+    check("fmt: знак", money.fmt(-100_000, signed=True) == "-0.1",
+          money.fmt(-100_000, signed=True))
+    check("fmt: тикер", money.fmt(50_000_000, ticker=True) == "50 DFT")
+    check("parse: 12.5", money.parse("12.5") == 12_500_000)
+    check("parse: целое", money.parse("25") == 25_000_000)
+    check("parse: 6 знаков", money.parse("0.000001") == 1)
+    check("parse: запятая", money.parse("12,5") == 12_500_000)
+    check("round-trip", all(money.parse(money.fmt(v)) == v
+                            for v in (0, 1, 999_999, 1_000_000, 12_345_678)))
+    for bad in ("1.2345678", "abc", "", "1.2.3", "-1", "5 DFT"):
+        try:
+            money.parse(bad)
+            ok = False
+        except ValueError:
+            ok = True
+        check(f"parse отвергает {bad!r}", ok)
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2142,7 +2169,7 @@ def run():
     sys.path.insert(0, ENV)
 
     global main, cp2k_runner, worker, structure_generator, identity, chain
-    global crypto, wallet_store, wallet
+    global crypto, wallet_store, wallet, money
     import cp2k_runner
     import structure_generator
     import main
@@ -2152,6 +2179,7 @@ def run():
     import crypto
     import wallet_store
     import wallet
+    import money
 
     # Цепочка блоков проверяется отдельно (chain_tests); в приёмочных тестах
     # блоки не пишем, чтобы не трогать боевые results/. Настоящую реализацию
@@ -2197,6 +2225,7 @@ def _run_tests():
     master_geometry_tests()
     ready_binding_tests()
     money_int_tests()
+    dft_units_tests()
     audit3_tests()
     elements_catalog_tests()
     state_storage_tests()

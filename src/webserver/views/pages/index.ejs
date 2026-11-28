@@ -369,6 +369,7 @@
 
 </main>
 
+<script src="/money.js"></script>
 <script>
 /* ==================== общее ==================== */
 
@@ -873,8 +874,10 @@ function buildWalletTab() {
           <h2>Перевести монеты</h2>
           <div class="row">
             <div><label>Адрес получателя</label><input type="text" id="wal-to" /></div>
-            <div><label>Сумма</label><input type="number" id="wal-amount" step="1" min="1" placeholder="целые монеты" /></div>
-            <div><label>Комиссия</label><input type="number" id="wal-fee" step="1" value="100000" /></div>
+            <div><label>Сумма (DFT)</label><input type="text" id="wal-amount"
+                 inputmode="decimal" placeholder="например 12.5" /></div>
+            <div><label>Комиссия (DFT)</label><input type="text" id="wal-fee"
+                 inputmode="decimal" value="0.1" /></div>
           </div>
           <div style="margin-top:10px">
             <label>Мастера (транзакция уйдёт всем известным)</label>
@@ -1021,16 +1024,16 @@ function renderWallet(data) {
     .map((t) => {
       const pending = Boolean(t.mempool);
       const net = (t.received || 0) - (t.sent || 0);
-      const amount = (net >= 0 ? '+' : '−') + Math.abs(net);
+      const amount = Money.fmt(net, { signed: true });
       const cls = net > 0 ? 'ok' : (net < 0 ? 'err' : '');
       const hint = (t.received && t.sent)
-        ? `приход ${t.received}, расход ${t.sent} — нажмите для деталей`
+        ? `приход ${Money.fmt(t.received)}, расход ${Money.fmt(t.sent)} — нажмите для деталей`
         : 'нажмите, чтобы посмотреть входы и выходы';
       return `<tr class="tx-row" data-txid="${esc(t.txid)}" title="${esc(hint)}">
         <td class="num">${pending ? '<span class="pill warn">мемпул</span>' : t.block}</td>
         <td>${esc(t.type)}</td>
         <td class="num ${cls}">${amount}</td>
-        <td class="num">${t.fee || '—'}</td>
+        <td class="num">${t.fee ? Money.fmt(t.fee) : '—'}</td>
         <td class="num">${pending ? 0 : t.confirmations}</td>
         <td class="mono" title="${esc(t.txid)}">${esc(t.txid.slice(0, 12))}…</td>
       </tr>`;
@@ -1044,9 +1047,9 @@ function renderWallet(data) {
         <span class="muted">адресов: ${w.addresses.length}</span>
         <button class="btn secondary" style="margin-left:auto;padding:4px 10px;font-size:12px"
                 data-newkey="1">＋ адрес</button>
-        <span class="pill ok">доступно ${w.totals.available.toFixed(2)}</span>
-        <span class="pill warn">pending ${w.totals.pending.toFixed(2)}</span>
-        <span class="pill off">всего ${w.totals.total.toFixed(2)}</span>
+        <span class="pill ok">доступно ${Money.fmt(w.totals.available, { ticker: true })}</span>
+        <span class="pill warn">pending ${Money.fmt(w.totals.pending)}</span>
+        <span class="pill off">всего ${Money.fmt(w.totals.total)}</span>
       </div>
       <h3>Адреса</h3>
       ${addrs || '<span class="muted">нет</span>'}
@@ -1083,13 +1086,13 @@ async function showTxDetails(txid) {
 
   const ins = (data.inputs || []).map((i) => i.coinbase
     ? '<div class="mono">− coinbase: новых монет (без источника)</div>'
-    : `<div class="mono">− ${i.value == null ? '?' : i.value.toFixed(6)}
+    : `<div class="mono">− ${i.value == null ? '?' : Money.fmt(i.value)}
         с ${esc(shortAddr(i.address))}
         ${i.txid ? `<span class="muted">(${esc(String(i.txid).slice(0, 10))}…#${i.vout})</span>` : ''}</div>`)
     .join('');
 
   const outs = (data.outputs || []).map((o) =>
-    `<div class="mono">+ ${o.value} на ${esc(shortAddr(o.address))}</div>`).join('');
+    `<div class="mono">+ ${Money.fmt(o.value)} на ${esc(shortAddr(o.address))}</div>`).join('');
 
   box.innerHTML = `
     <div class="kv">
@@ -1097,12 +1100,12 @@ async function showTxDetails(txid) {
         : '<span class="pill warn">в мемпуле</span>'}
       <span>подтверждений <code>${data.confirmations}</code></span>
       <span>тип <code>${esc(data.type)}</code></span>
-      ${data.fee != null ? `<span>комиссия <code>${data.fee}</code></span>` : ''}
+      ${data.fee != null ? `<span>комиссия <code>${Money.fmt(data.fee)} ${Money.TICKER}</code></span>` : ''}
     </div>
     <div class="mono muted" style="font-size:11px;margin:6px 0">${esc(data.txid)}</div>
-    <h3>Откуда — входы (${data.total_in})</h3>
+    <h3>Откуда — входы (${Money.fmt(data.total_in)})</h3>
     ${ins || '<span class="muted">нет входов</span>'}
-    <h3>Куда — выходы (${data.total_out})</h3>
+    <h3>Куда — выходы (${Money.fmt(data.total_out)})</h3>
     ${outs || '<span class="muted">нет выходов</span>'}
     <div class="actions">
       <button class="btn secondary" id="wal-raw-btn">Полная транзакция из блока</button>
@@ -1185,18 +1188,20 @@ async function sendCoins() {
   const password = document.getElementById('wal-password').value;
   const msg = document.getElementById('wal-send-msg');
   const to = document.getElementById('wal-to').value.trim();
-  const amount = Number(document.getElementById('wal-amount').value);
-  const fee = Number(document.getElementById('wal-fee').value || 0);
+  const amountText = document.getElementById('wal-amount').value.trim();
+  const feeText = document.getElementById('wal-fee').value.trim();
+  const amountUnits = Money.parse(amountText);
+  const feeUnits = feeText ? Money.parse(feeText) : 0;
   if (!name) { msg.innerHTML = '<span class="err">сначала выберите кошелёк</span>'; return; }
-  if (!to || !Number.isSafeInteger(amount) || amount <= 0) {
-    msg.innerHTML = '<span class="err">нужны адрес и целая сумма (дробей нет)</span>'; return;
+  if (!to || amountUnits === null || amountUnits <= 0) {
+    msg.innerHTML = `<span class="err">нужны адрес и положительная сумма в ${Money.TICKER} (до 6 знаков)</span>`; return;
   }
-  if (!Number.isSafeInteger(fee) || fee < 0) {
-    msg.innerHTML = '<span class="err">комиссия — целое число</span>'; return;
+  if (feeUnits === null || feeUnits < 0) {
+    msg.innerHTML = `<span class="err">комиссия в ${Money.TICKER}: например 0.1</span>`; return;
   }
   msg.textContent = 'отправляю…';
   const r = await api('/api/wallet/send', {
-    name, password, to, amount, fee,
+    name, password, to, amount: amountText, fee: feeText,
     resultsRoot: document.getElementById('wal-root').value || null,
     element: document.getElementById('wal-chain').value || null,
     masters: walletMasters(),

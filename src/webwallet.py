@@ -22,6 +22,7 @@ import sys
 import requests
 
 import chain
+import money
 import wallet_store
 from wallet import _element, _transactions
 
@@ -503,8 +504,11 @@ def main() -> int:
                          "(по умолчанию system.name из config.json)")
     ap.add_argument("--confirmations", type=int, default=None)
     ap.add_argument("--to", default=None)
-    ap.add_argument("--amount", type=int, default=0)
-    ap.add_argument("--fee", type=int, default=chain.DEFAULT_FEE)
+    ap.add_argument("--amount", default="0",
+                    help=f"сумма в {money.TICKER} (например 12.5)")
+    ap.add_argument("--fee", default=None,
+                    help=f"комиссия в {money.TICKER} (по умолчанию "
+                         f"{money.fmt(chain.DEFAULT_FEE)})")
     ap.add_argument("--change-to", default=None)
     ap.add_argument("--txid", default=None)
     ap.add_argument("--master", action="append", default=None)
@@ -546,14 +550,27 @@ def main() -> int:
     elif args.action == "newkey":
         result = new_address(args.results_root, args.name, password)
     elif args.action == "send":
-        if not args.to or args.amount <= 0:
-            print(json.dumps({"ok": False, "error": "нужны --to и --amount > 0"},
+        try:
+            amount_units = money.parse(args.amount, "--amount")
+            fee_units = (money.parse(args.fee, "--fee") if args.fee is not None
+                         else chain.DEFAULT_FEE)
+        except ValueError as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            return 2
+        if not args.to or amount_units <= 0:
+            print(json.dumps({"ok": False,
+                              "error": f"нужны --to и --amount > 0 (в {money.TICKER})"},
+                             ensure_ascii=False))
+            return 2
+        if fee_units < 0:
+            print(json.dumps({"ok": False, "error": "комиссия не может быть "
+                                                    "отрицательной"},
                              ensure_ascii=False))
             return 2
         masters = [m for m in (args.master or [os.environ.get(
             "MASTER_URL", "http://127.0.0.1:8000")]) if m]
-        result = send(args.results_root, args.name, password, args.to, args.amount,
-                      args.fee, masters, confirmations, element=args.element)
+        result = send(args.results_root, args.name, password, args.to, amount_units,
+                      fee_units, masters, confirmations, element=args.element)
     else:
         if not args.change_to:
             print(json.dumps({"ok": False, "error": "нужен --change-to"},
