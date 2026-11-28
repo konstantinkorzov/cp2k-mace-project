@@ -310,12 +310,16 @@ def _masters_list(base_url: str, extra: list[str] | None) -> list[str]:
 def deliver_result(masters: list[str], primary: str, element: str, name: str,
                    pubkey_hash: str, struct_id: str, data: dict, logger,
                    attempts: int = 30, delay: int = 10,
-                   wallet=None, public_key: str | None = None):
+                   wallet=None, public_key: str | None = None,
+                   task: dict | None = None):
     """
     Ищет мастера, который возьмёт готовый результат (ready):
     GET /work/height (поддерживает ли элемент) → POST /register-worker с
     подписью nonce (worker_id + session) → POST /submit-result ready.
 
+    В ready-запросе уходят prev_id и nonce из задания: работа привязана к
+    голове цепочки, и только мастер с этой же головой может проверить кадр
+    (geometry == Generate(seed(prev_id, nonce))) и положить его в блок.
     Регистрация у каждого мастера своя: worker_id другого мастера ничего не
     доказывает, а без подписи ключа готовый результат не примет никто.
     """
@@ -336,12 +340,20 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
                 if not reg:
                     logger.warning(f"{url}: регистрация с подписью не удалась")
                     continue
+                ready_data = dict(data or {})
+                if task:
+                    # Привязка к голове: (prev_id, nonce) — это та самая работа,
+                    # которую выдал первый мастер. Без неё новый мастер не может
+                    # ни проверить кадр, ни положить его в блок.
+                    for field in ("prev_id", "nonce"):
+                        if task.get(field) is not None:
+                            ready_data[field] = task[field]
                 sub = requests.post(url + "/submit-result", json={
                     "worker_id": reg["worker_id"],
                     "session": reg["session"],
                     "struct_id": struct_id,
                     "success": True,
-                    "data": data,
+                    "data": ready_data,
                     "ready": True,
                 }, timeout=180)
                 if sub.status_code != 200:
@@ -554,7 +566,7 @@ def main():
                         target, res = deliver_result(
                             masters, base_url, cfg["element"], worker_name,
                             pubkey_hash, struct_id, data, logger,
-                            wallet=wallet, public_key=public_key)
+                            wallet=wallet, public_key=public_key, task=task)
                         if target:
                             logger.info(f"Готовый результат {struct_id} принят мастером "
                                         f"{target} ({res.get('kept')})")

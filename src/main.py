@@ -91,6 +91,11 @@ MAX_REGISTERED_WORKERS = 200  # потолок памяти мастера
 REG_LIMIT_PER_IP = 60         # challenge+register с одного IP в минуту (~30 регистраций)
 REG_WINDOW_SEC = 60.0
 
+# --- ready-приёмка (результат принесён мастеру, который задание не выдавал) ---
+# Каждая приёмка — прогон CP2K за счёт мастера, поэтому квота на воркера и
+# запрет повторной проверки той же пары (prev_id, nonce).
+READY_QUOTA_PER_HOUR = 12
+
 
 def _task_timeout() -> int:
     """Жёсткий предел удержания задачи: config.json → task_timeout_sec.
@@ -902,16 +907,28 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
     return included, int(fee_total)
 
 
-def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | None:
-    """Кладёт проверенный результат в блокчейн-блок: blob + подписанные UTXO-транзакции."""
+def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
+                       info: dict | None = None) -> str | None:
+    """
+    Кладёт проверенный результат в блокчейн-блок: blob + подписанные UTXO-транзакции.
+
+    info (необязательно) заполняется итогом: block — путь к блоку,
+    reward_paid — ушла ли награда воркеру, reason — почему блока нет.
+    """
+    def _fail(reason: str) -> None:
+        if info is not None:
+            info["reason"] = reason
+
     raw = payload.get("wfn_b64")
     if not raw:
         print("[Master] ! в payload нет wfn — блок не создан")
+        _fail("в payload нет wfn")
         return None
     try:
         wfn_bytes = base64.b64decode(raw)
     except Exception as e:  # noqa: BLE001
         print(f"[Master] ! wfn_b64 не декодируется: {e}")
+        _fail(f"wfn_b64 не декодируется: {e}")
         return None
 
     struct_id = task_data["struct_id"]
@@ -927,10 +944,12 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     wallet = CONFIG.get("wallet")
     if wallet is None:
         print("[Master] ! кошелёк мастера не разблокирован — блок не создан")
+        _fail("кошелёк мастера не разблокирован")
         return None
     latest = wallet.latest_key()
     if latest is None:
         print("[Master] ! нет ключей мастера — блок не создан")
+        _fail("у мастера нет ключей")
         return None
     master_addresses = wallet.addresses()
 
@@ -938,6 +957,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     cu = catch_up_chain()
     if not cu["ok"]:
         print("[Master] ✗ не удалось догнать самую длинную цепочку — свой блок не создаю")
+        _fail("не удалось догнать цепочку")
         return None
     if cu["accepted"]:
         print(f"[Master] догнал сеть: высота {cu['height']} (принято {cu['accepted']} блоков)")
@@ -948,7 +968,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
                                    chain_mod.DEFAULT_CONFIRMATIONS))
 
     reward = None
-    fee = 0.0
+    fee = 0          # целое: суммы в консенсусе — только int (и ':d' в логе)
     # Награда выплачивается только на адрес вида sha256-hex (64 символа).
     # Иначе монеты уходят в никуда: такой выход нельзя потратить ни одним кошельком.
     if worker_address and not re.fullmatch(r"[0-9a-f]{64}", str(worker_address)):
@@ -963,7 +983,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
             confirmations=confirmations, height=seq,
         )
         if reward is not None:
-            fee = chain_mod.tx_fee(reward, utxo)
+            fee = int(chain_mod.tx_fee(reward, utxo))
             # подписываем входы Ed25519 ключами мастера (txid от подписей не зависит)
             chain_mod.sign_transaction(reward, wallet, utxo)
             # учитываем reward в локальном UTXO, чтобы мемпул не конфликтовал
@@ -1034,6 +1054,7 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
             pass
         print("[Master] ✗ собранный блок не прошёл проверку и не опубликован: "
               + "; ".join(v["problems"][:3]))
+        _fail("блок не прошёл проверку: " + "; ".join(v["problems"][:2]))
         return None
 
     print(f"[Master] ⛓ блок {os.path.basename(path)}: blob {state_sha[:12]}…, "
@@ -1049,10 +1070,14 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict) -> str | N
     else:
         print(f"[Master] ⚠ награда {chain_mod.REWARD_VALUE:d} не выплачена: "
               f"нет подтверждённых средств (conf={confirmations})")
+    if info is not None:
+        info["block"] = path
+        info["reward_paid"] = bool(reward)
     return path
 
 
-def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> str:
+def _persist_verified_state(task_data: dict, payload: dict, verdict: dict,
+                            block_info: dict | None = None) -> str:
     """
     Записывает кадр в набор для MACE: E/F/gap/mag — из прогона мастера.
     Дубликаты геометрии не плодятся: для одной геометрии хранится только
@@ -1161,7 +1186,7 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict) -> st
 
     print(f"[Master] ✓ {struct_id}: кадр принят для MACE (E={energy_ev:.6f} eV, "
           f"кадров всего {n_frames})")
-    _write_chain_block(task_data, payload, verdict)
+    _write_chain_block(task_data, payload, verdict, info=block_info)
     return "accepted"
 
 
@@ -1934,6 +1959,121 @@ def _verify_registration(nonce, public_key, pubkey_hash, signature) -> str | Non
     return None
 
 
+# ---------- ready-приёмка: квота, дедуп, привязка к голове ----------
+_READY_LOCK = threading.Lock()
+_READY_HITS: dict[str, list[float]] = {}
+_READY_SEEN: dict[str, float] = {}
+_READY_SEEN_MAX = 20000
+
+
+def _reset_ready_quota():
+    """Сбросить квоты и дедуп ready-приёмок (тесты, диагностика)."""
+    with _READY_LOCK:
+        _READY_HITS.clear()
+        _READY_SEEN.clear()
+
+
+def _ready_quota_ok(worker_id: str) -> bool:
+    """Скользящее окно: не больше READY_QUOTA_PER_HOUR приёмок на воркера."""
+    now = time.time()
+    with _READY_LOCK:
+        hits = [t for t in _READY_HITS.get(str(worker_id), []) if now - t < 3600]
+        if len(hits) >= READY_QUOTA_PER_HOUR:
+            _READY_HITS[str(worker_id)] = hits
+            return False
+        hits.append(now)
+        _READY_HITS[str(worker_id)] = hits
+    return True
+
+
+def _ready_key(prev_id: str, nonce: int) -> str:
+    return f"{prev_id}:{int(nonce)}"
+
+
+def _ready_seen(key: str) -> bool:
+    now = time.time()
+    with _READY_LOCK:
+        if len(_READY_SEEN) > _READY_SEEN_MAX:
+            for k, t in list(_READY_SEEN.items()):
+                if now - t > 7200:
+                    _READY_SEEN.pop(k, None)
+        return key in _READY_SEEN
+
+
+def _ready_mark(key: str) -> None:
+    with _READY_LOCK:
+        _READY_SEEN[key] = time.time()
+
+
+def _ready_unmark(key: str) -> None:
+    """Неудачная приёмка не должна выглядеть принятой при повторе."""
+    with _READY_LOCK:
+        _READY_SEEN.pop(key, None)
+
+
+def _ready_binding(payload: dict, sid: str):
+    """
+    Привязка ready-результата к голове цепочки.
+
+    Работа в этой сети — пара (prev_id, nonce): она однозначно задаёт
+    геометрию через seed(prev_id, nonce). Поэтому готовый кадр проверяем
+    теми же правилами, что и свой блок: prev_id == голова мастера,
+    n_atoms по расписанию, geometry == Generate(seed(prev_id, nonce)).
+
+    Возвращает (issued, task_data, причина). issued — эталон для
+    verify_state_payload: дальше проверка идёт тем же кодом, что у обычного пути.
+    """
+    prev_id = str(payload.get("prev_id") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", prev_id):
+        return None, None, "нет prev_id (64 hex) в ready-результате"
+    try:
+        nonce = int(payload.get("nonce"))
+    except (TypeError, ValueError):
+        return None, None, "нет nonce в ready-результате"
+    if not 0 <= nonce < (1 << 64):
+        return None, None, "nonce вне диапазона uint64"
+    try:
+        n_atoms = int(payload.get("n_atoms") or 0)
+        dim = int(payload.get("dim") or 3)
+    except (TypeError, ValueError):
+        return None, None, "n_atoms/dim не числа"
+    if not 1 <= n_atoms <= MAX_TASK_ATOMS:
+        return None, None, f"n_atoms {n_atoms} вне диапазона 1..{MAX_TASK_ATOMS}"
+    if dim not in (1, 2, 3):
+        return None, None, f"dim {dim} — не 1/2/3"
+    geometry = payload.get("geometry")
+    if not geometry:
+        return None, None, "в ready-результате нет geometry"
+    if len(geometry) != n_atoms:
+        return None, None, "geometry не соответствует n_atoms"
+    stale = _stale_reason(n_atoms)
+    if stale:
+        return None, None, stale
+
+    tip = chain_mod.previous_hash(CONFIG["output_dir"],
+                                  chain_mod.next_seq(CONFIG["output_dir"]))
+    if prev_id != tip:
+        return None, None, ("prev_id не совпадает с головой мастера: работа для "
+                            "старой головы — ищите мастера с этой головой")
+
+    try:
+        issued = _issue_geometry({"n_atoms": n_atoms, "dim": dim, "nonce": nonce})
+    except Exception as e:  # noqa: BLE001
+        return None, None, f"геометрия для (prev_id, nonce) не строится: {e}"
+
+    try:
+        coords = np.asarray(geometry, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None, None, "geometry не приводится к числам"
+    same, why = _same_geometry(coords, payload.get("species"), issued)
+    if not same:
+        return None, None, f"готовый кадр не из seed(prev_id, nonce): {why}"
+
+    task_data = {"struct_id": sid, "task_index": -1, "n_atoms": n_atoms,
+                 "dim": dim, "attempts": 0, "_nonce": nonce}
+    return issued, task_data, None
+
+
 class TaskResult(BaseModel):
     worker_id: str
     session: str | None = None   # выдаётся при регистрации с подписью ключа
@@ -1966,38 +2106,77 @@ def submit_result(result: TaskResult):
     if result.ready:
         if w_id not in registered_workers:
             raise HTTPException(status_code=400,
-                                detail="неизвестный воркер — сначала /work/height")
+                                detail="неизвестный воркер — сначала /register-worker")
         if BUSY.is_set():
             return {"status": "busy", "reason": "master is syncing"}
 
         payload = dict(result.data or {})
         payload.setdefault("worker_id", w_id)
-        n_atoms = int(payload.get("n_atoms") or 0)
-        if n_atoms <= 0 or not payload.get("geometry"):
-            return {"status": "rejected",
-                    "reason": "в ready-результате нет geometry/n_atoms"}
         if sid in completed_tasks:
             return {"status": "accepted", "kept": "already", "energy_ev": None}
 
-        task_data = {"struct_id": sid, "task_index": -1, "n_atoms": n_atoms,
-                     "dim": int(payload.get("dim", 3)), "attempts": 0}
+        # Кадр обязан быть работой для ГОЛОВЫ этого мастера: пара (prev_id, nonce)
+        # задаёт геометрию, и без этой привязки ready — любой кадр за счёт мастера,
+        # который ещё и нельзя положить в блок.
+        issued, task_data, why = _ready_binding(payload, sid)
+        if why:
+            print(f"[Master] ✗ ready-результат {sid} от {w_id}: {why}")
+            return {"status": "rejected", "reason": why}
+
+        key = _ready_key(issued["prev_id"], issued["nonce"])
+        if _ready_seen(key):
+            return {"status": "accepted", "kept": "already", "energy_ev": None}
+        if not _ready_quota_ok(w_id):
+            return {"status": "rejected",
+                    "reason": f"квота ready-приёмок: {READY_QUOTA_PER_HOUR} в час"}
+        _ready_mark(key)   # до прогона CP2K: неудачная попытка тоже тратит квоту
+
+        payload["seed"] = issued["seed"]
+        payload.setdefault("species", issued["species"])
+        block_info: dict = {}
         verifying_tasks.add(sid)
         try:
-            verdict = verify_state_payload(CONFIG, task_data, payload)
+            verdict = verify_state_payload(CONFIG, task_data, payload, issued=issued)
             verifying_tasks.discard(sid)
             if not verdict["valid"]:
+                _ready_unmark(key)
                 print(f"[Master] ✗ ready-результат {sid} от {w_id} отклонён: "
                       f"{verdict['reason']}")
                 return {"status": "rejected", "reason": verdict["reason"]}
-            kept = _persist_verified_state(task_data, payload, verdict)
-            completed_tasks.add(sid)
-            print(f"[Master] ✓ ready-результат {sid} от {w_id} принят ({kept})")
-            return {"status": "accepted", "kept": kept,
+
+            # Блок пишем под тем же lock, что и обычный путь: голова не должна
+            # уйти, пока шла проверка (прогон CP2K — минуты), и два потока не
+            # должны собрать два блока на одной высоте.
+            with task_queue_lock:
+                tip = chain_mod.previous_hash(CONFIG["output_dir"],
+                                              chain_mod.next_seq(CONFIG["output_dir"]))
+                if tip != issued["prev_id"]:
+                    _ready_unmark(key)
+                    print(f"[Master] ✗ ready-результат {sid}: голова ушла, "
+                          f"блок не собран")
+                    return {"status": "stale",
+                            "reason": "голова мастера изменилась во время проверки"}
+                kept = _persist_verified_state(task_data, payload, verdict,
+                                               block_info=block_info)
+                active_tasks.pop(sid, None)
+                completed_tasks.add(sid)
+
+            print(f"[Master] ✓ ready-результат {sid} от {w_id} принят ({kept}), "
+                  f"блок {block_info.get('block')}")
+            resp = {"status": "accepted", "kept": kept,
                     "energy_ev": verdict.get("energy_ev"),
-                    "scf": (verdict.get("state") or {}).get("scf")}
+                    "scf": (verdict.get("state") or {}).get("scf"),
+                    "block": (os.path.basename(block_info["block"])
+                              if block_info.get("block") else None),
+                    "reward_paid": bool(block_info.get("reward_paid"))}
+            if not resp["block"]:
+                resp["reason"] = block_info.get("reason") or "блок не собран"
+            return resp
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             verifying_tasks.discard(sid)
+            if not block_info.get("block"):
+                _ready_unmark(key)     # блока нет — пусть воркер повторит
             return {"status": "error", "reason": str(e)}
 
     # ---------- обычный путь: задача выдана этим мастером ----------

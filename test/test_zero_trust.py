@@ -1038,25 +1038,34 @@ def busy_tests():
         check("по таймауту задача вернулась в очередь",
               any(t["struct_id"] == sid for t in main.pending_tasks))
 
-        main.verify_state_payload = lambda cfg, task, payload: {
+        main.verify_state_payload = lambda cfg, task, payload, issued=None: {
             "valid": True, "energy_ev": -1.0, "gap": 0.0, "mag": 0.0,
             "state": {"scf": {"steps": 1}}}
-        main._persist_verified_state = lambda t, p, v: "accepted"
+        main._persist_verified_state = lambda t, p, v, block_info=None: "accepted"
+        main._reset_ready_quota()
 
+        # ready-результат — работа для головы мастера: (prev_id, nonce)
+        issued_r = main._issue_geometry({"n_atoms": 2, "dim": 3, "nonce": 31337})
+        ready_payload = {"geometry": issued_r["coords"],
+                         "species": issued_r["species"],
+                         "n_atoms": 2, "dim": 3,
+                         "prev_id": issued_r["prev_id"], "nonce": 31337,
+                         "wfn_b64": "AA=="}
         main.BUSY.clear()
         ready = main.submit_result(main.TaskResult(
             worker_id=wid, session=sess, struct_id="b_ready", success=True,
-            data=payload, ready=True))
+            data=ready_payload, ready=True))
         check("ready-результат принимается без задачи",
               ready.get("status") == "accepted", ready)
 
         main.BUSY.set()
         ready_busy = main.submit_result(main.TaskResult(
             worker_id=wid, session=sess, struct_id="b_ready2", success=True,
-            data=payload, ready=True))
+            data=ready_payload, ready=True))
         check("ready на занятом мастере → busy",
               ready_busy.get("status") == "busy", ready_busy)
         main.BUSY.clear()
+        main._reset_ready_quota()
 
         try:
             main.work_height(element="Fe")
@@ -1110,6 +1119,7 @@ def busy_tests():
               target == "http://p2" and res.get("status") == "accepted", target)
     finally:
         main.verify_state_payload, main._persist_verified_state = old_verify, old_persist
+        main._reset_ready_quota()
         worker.requests.get, worker.requests.post = old_get, old_post
         main.BUSY.clear()
         main.active_tasks.clear()
@@ -1264,6 +1274,155 @@ def master_geometry_tests():
         main.worker_by_pubkey.clear()
         main.CONFIG.update(saved)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def ready_binding_tests():
+    print("\n--- 31. ready: привязка к (prev_id, nonce), блок и квота ---")
+    tmp = tempfile.mkdtemp(prefix="ready_")
+    saved = {k: main.CONFIG.get(k) for k in
+             ("output_dir", "element", "frames_dir", "verified_ids_file")}
+    old_write, old_verify = main._write_chain_block, main.verify_state_payload
+    old_quota = main.READY_QUOTA_PER_HOUR
+    blocks = []
+    try:
+        main.CONFIG.update({"output_dir": tmp, "element": "Cu",
+                            "frames_dir": os.path.join(tmp, "frames"),
+                            "verified_ids_file": os.path.join(tmp, "verified.txt")})
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+        main.completed_tasks.clear()
+        main.active_tasks.clear()
+        main.pending_tasks.clear()
+        main.BUSY.clear()
+        main._reset_ready_quota()
+        reg = main._register_worker("ready_t", "hash_ready", None)
+        wid, sess = reg["worker_id"], reg["session"]
+
+        issued = main._issue_geometry({"n_atoms": 2, "dim": 3, "nonce": 424242})
+        good = {"geometry": issued["coords"], "species": issued["species"],
+                "n_atoms": 2, "dim": 3, "prev_id": issued["prev_id"],
+                "nonce": 424242, "wfn_b64": "AA=="}
+
+        def submit(sid, data):
+            return main.submit_result(main.TaskResult(
+                worker_id=wid, session=sess, struct_id=sid, success=True,
+                data=data, ready=True))
+
+        r = submit("r1", {"geometry": issued["coords"], "n_atoms": 2})
+        check("ready без prev_id/nonce отклонён", r.get("status") == "rejected", r)
+
+        r = submit("r2", dict(good, prev_id="11" * 32))
+        check("ready для чужой головы отклонён",
+              r.get("status") == "rejected" and "голов" in str(r.get("reason")), r)
+
+        r = submit("r3", dict(good, geometry=[[0.0, 0.0, 0.0], [0.0, 0.0, 9.0]]))
+        check("ready с геометрией не из seed отклонён",
+              r.get("status") == "rejected" and "seed" in str(r.get("reason")), r)
+
+        r = submit("r4", dict(good, n_atoms=55))
+        check("ready с n_atoms не по расписанию отклонён",
+              r.get("status") == "rejected", r)
+
+        # правильный кадр: прогон CP2K заглушён, запись блока — под запись
+        main.verify_state_payload = lambda cfg, task, payload, issued=None: {
+            "valid": True, "energy_ev": -1.0, "gap": 0.0, "mag": 0.0,
+            "state": {"scf": {"steps": 1}}}
+
+        def fake_write(task_data, payload, verdict, info=None):
+            blocks.append((task_data.get("_nonce"), task_data.get("dim"),
+                           payload.get("seed")))
+            if info is not None:
+                info["block"] = os.path.join(tmp, "000001_Cu_2.zip")
+                info["reward_paid"] = True
+            return info["block"] if info is not None else None
+
+        main._write_chain_block = fake_write
+        main.READY_QUOTA_PER_HOUR = 5
+
+        r = submit("r5", good)
+        check("ready с привязкой к голове принят",
+              r.get("status") == "accepted", r)
+        check("в блок ушёл nonce из ready-результата",
+              bool(blocks) and blocks[-1][0] == 424242, str(blocks[-1:]))
+        check("эталон геометрии — из seed(prev_id, nonce)",
+              bool(blocks) and blocks[-1][2] == issued["seed"])
+        check("ответ сообщает о блоке и награде",
+              bool(r.get("block")) and r.get("reward_paid") is True, r)
+
+        n_blocks = len(blocks)
+        r = submit("r6", good)
+        check("повтор (prev_id, nonce) не тратит прогон",
+              r.get("status") == "accepted" and len(blocks) == n_blocks, r)
+
+        main.READY_QUOTA_PER_HOUR = 2
+        main._reset_ready_quota()
+        main.completed_tasks.clear()
+        last = None
+        for i, nonce in enumerate((5, 6, 7), start=1):
+            iss = main._issue_geometry({"n_atoms": 2, "dim": 3, "nonce": nonce})
+            last = submit(f"q{i}", {"geometry": iss["coords"],
+                                    "species": iss["species"], "n_atoms": 2,
+                                    "dim": 3, "prev_id": iss["prev_id"],
+                                    "nonce": nonce, "wfn_b64": "AA=="})
+        check("квота ready-приёмок соблюдается",
+              last.get("status") == "rejected" and "квота" in str(last.get("reason")),
+              last)
+    finally:
+        main._write_chain_block = old_write
+        main.verify_state_payload = old_verify
+        main.READY_QUOTA_PER_HOUR = old_quota
+        main._reset_ready_quota()
+        main.completed_tasks.clear()
+        main.active_tasks.clear()
+        main.pending_tasks.clear()
+        main.registered_workers.clear()
+        main.worker_by_pubkey.clear()
+        main.CONFIG.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def reward_format_tests():
+    print("\n--- 32. Блок без средств: награда не платится, формат не падает ---")
+    root = tempfile.mkdtemp(prefix="ready_wb_")
+    tmp = os.path.join(root, "Cu")      # система = имя каталога цепочки
+    os.makedirs(tmp, exist_ok=True)
+    saved = {k: main.CONFIG.get(k) for k in ("output_dir", "element", "wallet")}
+    try:
+        main.CONFIG.update({"output_dir": tmp, "element": "Cu"})
+        wfn = os.path.join(root, "state.wfn")
+        make_wfn(wfn)
+        with open(wfn, "rb") as f:
+            wfn_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        issued = main._issue_geometry({"n_atoms": 2, "dim": 3, "nonce": 7})
+        addr = "c" * 64
+        main.registered_workers["worker_x"] = {"pubkey_hash": addr, "name": "x",
+                                               "sessions": []}
+
+        class W:
+            def latest_key(self):
+                return {"address": addr}
+
+            def addresses(self):
+                return [addr]
+
+        main.CONFIG["wallet"] = W()
+        payload = {"wfn_b64": wfn_b64, "geometry": issued["coords"],
+                   "species": issued["species"], "worker_id": "worker_x",
+                   "seed": issued["seed"]}
+        verdict = {"energy_ev": -1.0,
+                   "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
+                   "gap": 0.1, "mag": 0.0}
+        task_data = {"struct_id": "wb1", "n_atoms": 2, "dim": 3,
+                     "_nonce": 7, "attempts": 0}
+        info = {}
+        path = main._REAL_WRITE_CHAIN_BLOCK(task_data, payload, verdict, info=info)
+        check("блок без средств пишется без падения формата",
+              bool(path) and info.get("reward_paid") is False, info)
+    finally:
+        main.registered_workers.pop("worker_x", None)
+        main.CONFIG.update(saved)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def build_tests():
@@ -1626,7 +1785,9 @@ def run():
     import wallet
 
     # Цепочка блоков проверяется отдельно (chain_tests); в приёмочных тестах
-    # блоки не пишем, чтобы не трогать боевые results/.
+    # блоки не пишем, чтобы не трогать боевые results/. Настоящую реализацию
+    # сохраняем: её проверяет тест формата награды.
+    main._REAL_WRITE_CHAIN_BLOCK = main._write_chain_block
     main._write_chain_block = lambda *a, **k: None
     # Rate limit (5 с на выдачу/сдачу) — политика HTTP-слоя; в юнит-тестах
     # он мешает, поэтому выключаем и проверяем отдельно.
@@ -1665,6 +1826,8 @@ def _run_tests():
     busy_tests()
     lease_tests()
     master_geometry_tests()
+    ready_binding_tests()
+    reward_format_tests()
     build_tests()
     rfc8032_tests()
     mempool_policy_tests()
