@@ -2350,6 +2350,64 @@ def audit5_d_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def ready_quota_v2_tests():
+    print("\n--- 44. D2: квота приёмок — воркер / IP / узел ---")
+    saved = (main.READY_QUOTA_PER_HOUR, main.READY_QUOTA_TOTAL_PER_HOUR,
+             main.READY_QUOTA_PER_IP_PER_HOUR)
+    saved_workers = dict(main.registered_workers)
+    try:
+        def reg(name, ip):
+            return main._register_worker(name, None, None, ip=ip)["worker_id"]
+
+        # --- бюджет узла ---
+        main.READY_QUOTA_PER_HOUR = 100
+        main.READY_QUOTA_PER_IP_PER_HOUR = 100
+        main.READY_QUOTA_TOTAL_PER_HOUR = 2
+        main._reset_ready_quota()
+        w1 = reg("q1", "10.0.0.1")
+        w2 = reg("q2", "10.0.0.2")
+        w3 = reg("q3", "10.0.0.3")
+        check("D2: IP воркера запомнен при регистрации",
+              main.registered_workers[w1]["ip"] == "10.0.0.1")
+        check("D2: первые приёмки в пределах бюджета узла",
+              main._ready_quota_ok(w1) and main._ready_quota_ok(w2))
+        check("D2: бюджет узла исчерпан — третий воркер с другого IP отказ",
+              not main._ready_quota_ok(w3))
+        check("D2: отказ не тратит бюджет (повтор тоже отказ)",
+              not main._ready_quota_ok(w3))
+
+        # --- квота на IP ---
+        main.READY_QUOTA_TOTAL_PER_HOUR = 100
+        main.READY_QUOTA_PER_IP_PER_HOUR = 2
+        main._reset_ready_quota()
+        a = reg("q4", "10.1.0.1")
+        b = reg("q5", "10.1.0.1")          # другой ключ, тот же IP
+        c = reg("q6", "10.1.0.2")
+        check("D2: два воркера с одного IP в пределах квоты IP",
+              main._ready_quota_ok(a) and main._ready_quota_ok(b))
+        check("D2: третий с того же IP — отказ (пересоздание ключа не помогает)",
+              not main._ready_quota_ok(a))
+        check("D2: другой IP не задет", main._ready_quota_ok(c))
+
+        # --- пер-воркерная квота осталась ---
+        main.READY_QUOTA_TOTAL_PER_HOUR = 100
+        main.READY_QUOTA_PER_IP_PER_HOUR = 100
+        main.READY_QUOTA_PER_HOUR = 1
+        main._reset_ready_quota()
+        main.MEMPOOL.clear() if hasattr(main, "MEMPOOL") else None
+        check("D2: пер-воркерная квота работает",
+              main._ready_quota_ok(a) and not main._ready_quota_ok(a))
+        check("D2: текст причины называет все три лимита",
+              "на узел" in main._ready_quota_reason()
+              and "на IP" in main._ready_quota_reason())
+    finally:
+        main.READY_QUOTA_PER_HOUR, main.READY_QUOTA_TOTAL_PER_HOUR, \
+            main.READY_QUOTA_PER_IP_PER_HOUR = saved
+        main.registered_workers.clear()
+        main.registered_workers.update(saved_workers)
+        main._reset_ready_quota()
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2842,6 +2900,10 @@ def run():
     # Rate limit (5 с на выдачу/сдачу) — политика HTTP-слоя; в юнит-тестах
     # он мешает, поэтому выключаем и проверяем отдельно.
     main.RATE_LIMIT_SEC = 0
+    # Квоты приёмок проверяются отдельно (раздел 44); в остальных тестах
+    # они не должны упираться в потолок узла.
+    main.READY_QUOTA_TOTAL_PER_HOUR = 10 ** 6
+    main.READY_QUOTA_PER_IP_PER_HOUR = 10 ** 6
 
     # Все файловые артефакты тестов — во временном каталоге, боевые results/ не трогаем
     scratch = tempfile.mkdtemp(prefix="test_results_")
@@ -2885,6 +2947,7 @@ def _run_tests():
     transport_ticket_tests()
     worker_profile_tests()
     audit5_d_tests()
+    ready_quota_v2_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()

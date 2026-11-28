@@ -108,7 +108,12 @@ REG_WINDOW_SEC = 60.0
 # --- ready-приёмка (результат принесён мастеру, который задание не выдавал) ---
 # Каждая приёмка — прогон CP2K за счёт мастера, поэтому квота на воркера и
 # запрет повторной проверки той же пары (prev_id, nonce).
-READY_QUOTA_PER_HOUR = 12
+# Квота ready-приёмок. Пер-воркерной мало: worker_id бесплатен (регистрация
+# по своему ключу), поэтому 200 воркеров × 12 давали ~2400 полных прогонов
+# CP2K в час за счёт мастера. Глобальный бюджет — это и есть цена узла.
+READY_QUOTA_PER_HOUR = 12          # на одного воркера
+READY_QUOTA_TOTAL_PER_HOUR = 60    # на узел целиком (все воркеры, все IP)
+READY_QUOTA_PER_IP_PER_HOUR = 24   # на один адрес (окно /24 считается как есть)
 
 
 JSON_BODY_MAX_BYTES = 8 * 1024 * 1024   # обычные JSON-запросы (конфиг, tx)
@@ -1980,7 +1985,7 @@ def _evict_workers_locked(now: float) -> int:
 
 def _register_worker(name: str | None, pubkey_hash: str | None,
                      public_key: str | None, verified: bool = False,
-                     requeue: bool = True) -> dict:
+                     requeue: bool = True, ip: str | None = None) -> dict:
     """
     Регистрация воркера. Возвращает worker_id и session.
 
@@ -1997,6 +2002,8 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
             rec.update({"last_seen": now,
                         "name": name or rec.get("name"),
                         "public_key": public_key or rec.get("public_key")})
+            if ip:
+                rec["ip"] = str(ip)
             session = _session_add_locked(worker_id)
             print(f"[Master] Воркер {worker_id} переподключился (pubkey {pubkey_hash[:12]}…)")
             # Воркер перезапустился: задачу, которую он держал, он уже не посчитает
@@ -2023,6 +2030,9 @@ def _register_worker(name: str | None, pubkey_hash: str | None,
             "registered_at": now,
             "last_seen": now,
             "sessions": [],
+            # IP нужен квоте приёмок: пересоздание ключа (новый worker_id)
+            # не должно обходить лимит с одной машины.
+            "ip": str(ip or ""),
         }
         if verified and pubkey_hash:
             worker_by_pubkey[pubkey_hash] = worker_id
@@ -2049,7 +2059,7 @@ def register_challenge():
 
 
 @app.post("/register-worker")
-def register_worker(reg: WorkerRegistration):
+def register_worker(reg: WorkerRegistration, request: Request = None):
     """
     Регистрация только с доказательством ключа: nonce с /register-challenge,
     подписанный приватным ключом адреса pubkey_hash.
@@ -2068,7 +2078,8 @@ def register_worker(reg: WorkerRegistration):
         raise HTTPException(status_code=403,
                             detail=f"регистрация не подтверждена: {reason}")
     return _register_worker(reg.name, reg.pubkey_hash, reg.public_key,
-                            verified=True)
+                            verified=True,
+                            ip=_client_ip(request) if request is not None else None)
 
 
 @app.get("/register-worker")
@@ -2341,28 +2352,65 @@ def _verify_registration(nonce, public_key, pubkey_hash, signature) -> str | Non
 # ---------- ready-приёмка: квота, дедуп, привязка к голове ----------
 _READY_LOCK = threading.Lock()
 _READY_HITS: dict[str, list[float]] = {}
+_READY_HITS_IP: dict[str, list[float]] = {}
+_READY_HITS_ALL: list[float] = []
 _READY_SEEN: dict[str, float] = {}
 _READY_SEEN_MAX = 20000
+QUOTA_WINDOW_SEC = 3600
 
 
 def _reset_ready_quota():
     """Сбросить квоты и дедуп ready-приёмок (тесты, диагностика)."""
     with _READY_LOCK:
         _READY_HITS.clear()
+        _READY_HITS_IP.clear()
+        _READY_HITS_ALL[:] = []
         _READY_SEEN.clear()
 
 
+def _quota_window(hits: list[float], now: float) -> list[float]:
+    return [t for t in hits if now - t < QUOTA_WINDOW_SEC]
+
+
 def _ready_quota_ok(worker_id: str) -> bool:
-    """Скользящее окно: не больше READY_QUOTA_PER_HOUR приёмок на воркера."""
+    """Три окна по часу: воркер, IP и узел целиком.
+
+    Проверяются все три, и хит записывается только если прошли все: иначе
+    один воркер с одного IP съедал бы бюджет узла, а пересоздание ключей
+    (новый worker_id) обходило бы пер-воркерную квоту.
+    """
     now = time.time()
+    wid = str(worker_id)
+    ip = str((registered_workers.get(wid) or {}).get("ip") or "")
     with _READY_LOCK:
-        hits = [t for t in _READY_HITS.get(str(worker_id), []) if now - t < 3600]
-        if len(hits) >= READY_QUOTA_PER_HOUR:
-            _READY_HITS[str(worker_id)] = hits
+        hits = _quota_window(_READY_HITS.get(wid, []), now)
+        total = _quota_window(_READY_HITS_ALL, now)
+        ip_hits = _quota_window(_READY_HITS_IP.get(ip, []), now) if ip else []
+        over = (len(hits) >= READY_QUOTA_PER_HOUR
+                or len(total) >= READY_QUOTA_TOTAL_PER_HOUR
+                or (bool(ip) and len(ip_hits) >= READY_QUOTA_PER_IP_PER_HOUR))
+        if over:
+            # чистим окна, но НЕ записываем попытку
+            _READY_HITS[wid] = hits
+            _READY_HITS_ALL[:] = total
+            if ip:
+                _READY_HITS_IP[ip] = ip_hits
             return False
         hits.append(now)
-        _READY_HITS[str(worker_id)] = hits
+        total.append(now)
+        _READY_HITS[wid] = hits
+        _READY_HITS_ALL[:] = total
+        if ip:
+            ip_hits.append(now)
+            _READY_HITS_IP[ip] = ip_hits
     return True
+
+
+def _ready_quota_reason() -> str:
+    return (f"квота готовых приёмок исчерпана "
+            f"({READY_QUOTA_PER_HOUR}/час на воркера, "
+            f"{READY_QUOTA_TOTAL_PER_HOUR}/час на узел, "
+            f"{READY_QUOTA_PER_IP_PER_HOUR}/час на IP)")
 
 
 def _ready_key(prev_id: str, nonce: int) -> str:
@@ -2607,8 +2655,7 @@ def submit_result(result: TaskResult):
         if _ready_seen(key):
             return {"status": "accepted", "kept": "already", "energy_ev": None}
         if not _ready_quota_ok(w_id):
-            return {"status": "rejected",
-                    "reason": f"квота ready-приёмок: {READY_QUOTA_PER_HOUR} в час"}
+            return {"status": "rejected", "reason": _ready_quota_reason()}
         _ready_mark(key)   # до прогона CP2K: неудачная попытка тоже тратит квоту
 
         payload["seed"] = issued["seed"]
