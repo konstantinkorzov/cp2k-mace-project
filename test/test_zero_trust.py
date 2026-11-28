@@ -646,7 +646,7 @@ def chain_tests():
         check("в заголовке только нужные поля", set(h1) == expected, sorted(h1))
         check("отпечаток сборки CP2K попал в заголовок",
               h1.get("cp2k_build") == cp2k_runner.CP2K_BUILD_CPU, h1.get("cp2k_build"))
-        check("version = 6", h1["version"] == 6)
+        check("version = 7", h1["version"] == 7)
         check("created_at — ISO 8601 UTC",
               datetime.strptime(h1["created_at"], "%Y-%m-%dT%H:%M:%SZ") is not None)
         check("CP2K version и params в блоке",
@@ -1830,15 +1830,35 @@ def audit4_tests():
 
         # ---------- канонизация: один и тот же блок — один block_id ----------
         header1, _d1, _t1, _n1 = chain.read_block(p1)
-        check("канонизация: диаметр блока — float",
-              type(header1.get("atom_diameter")) is float,
-              type(header1.get("atom_diameter")).__name__)
+        check("канонизация: диаметр блока — строка с 3 знаками",
+              header1.get("atom_diameter") == "2.560",
+              repr(header1.get("atom_diameter")))
         probs = chain.validate_header(dict(header1, atom_diameter=2))
-        check("канонизация: atom_diameter 2 (int) отвергается",
-              any("не float" in x for x in probs), probs[:2])
-        probs = chain.validate_header(dict(header1, atom_diameter=2.5600001))
-        check("канонизация: лишние знаки диаметра отвергаются",
-              any("знаков" in x for x in probs), probs[:2])
+        check("канонизация: atom_diameter 2 (число) отвергается",
+              any("не строка" in x for x in probs), probs[:2])
+        probs = chain.validate_header(dict(header1, atom_diameter=2.56))
+        check("канонизация: atom_diameter 2.56 (без третьего знака) отвергается",
+              any("не строка" in x for x in probs), probs[:2])
+        probs = chain.validate_header(dict(header1, atom_diameter="2.56"))
+        check("канонизация: строка \"2.56\" отвергается (нет третьего знака)",
+              any("каноническая" in x for x in probs), probs[:2])
+        probs = chain.validate_header(dict(header1, atom_diameter="2.5600"))
+        check("канонизация: строка \"2.5600\" отвергается (четыре знака)",
+              any("каноническая" in x for x in probs), probs[:2])
+        # Минимум диаметра — консенсус: 0.5 Å (min_dist = diameter).
+        probs = chain.validate_header(dict(header1, atom_diameter="0.400"))
+        check("консенсус: диаметр 0.400 Å отвергается (минимум 0.5 Å)",
+              any("минимум" in x for x in probs), probs[:2])
+        try:
+            chain.consensus.canonical_diameter_text(0.4)
+            raised = False
+        except ValueError:
+            raised = True
+        check("консенсус: запись блока с диаметром 0.4 Å падает с ошибкой", raised)
+        check("консенсус: минимум диаметра = 0.5 Å",
+              chain.consensus.MIN_DIAMETER_ANG == 0.5
+              and chain.consensus.canonical_diameter_text(0.5) == "0.500",
+              chain.consensus.MIN_DIAMETER_ANG)
         # Точность диаметра — 3 знака и именно УСЕЧЕНИЕМ: 2.5689 -> 2.568,
         # а не 2.569. Округление молча меняло бы распределение геометрий.
         check("канонизация: диаметр — ровно 3 знака",
@@ -1849,9 +1869,16 @@ def audit4_tests():
               and chain.consensus.canonical_diameter(2.5699999) == 2.569,
               (chain.consensus.canonical_diameter(2.5689),
                chain.consensus.canonical_diameter(2.5699999)))
-        check("канонизация: диаметр 2.5689 в заголовке отвергается",
-              any("знаков" in x for x in
+        check("канонизация: диаметр 2.5689 (число) в заголовке отвергается",
+              any("не строка" in x for x in
                   chain.validate_header(dict(header1, atom_diameter=2.5689))))
+        check("канонизация: запись 2.5689 даёт \"2.568\" (усечение)",
+              chain.consensus.canonical_diameter_text(2.5689) == "2.568",
+              chain.consensus.canonical_diameter_text(2.5689))
+        check("канонизация: запись 2.56 даёт \"2.560\" (три знака)",
+              chain.consensus.canonical_diameter_text(2.56) == "2.560"
+              and chain.consensus.canonical_diameter_text("2.56") == "2.560",
+              chain.consensus.canonical_diameter_text(2.56))
         # Разбор по десятичной записи: float-арифметика на границе 2.9999
         # даёт то 2999, то 3000 в зависимости от двоичного представления.
         check("канонизация: границы тысячных не зависят от float-шума",

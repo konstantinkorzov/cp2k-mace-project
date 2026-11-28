@@ -1089,7 +1089,8 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
     # сменили в конфиге на середине — блок не соберём, иначе пиры его
     # отвергнут по несогласованности датасета.
     pinned = chain_mod.chain_diameter(CONFIG["output_dir"])
-    if pinned is not None and float(pinned) != float(CONFIG.get("atom_diameter") or 2.0):
+    if pinned is not None and str(pinned) != consensus.canonical_diameter_text(
+            CONFIG.get("atom_diameter") or 2.0):
         print(f"[Master] ✗ atom_diameter в конфиге "
               f"{CONFIG.get('atom_diameter')} != {pinned} (как в цепочке)")
         _fail(f"atom_diameter {CONFIG.get('atom_diameter')} != {pinned}")

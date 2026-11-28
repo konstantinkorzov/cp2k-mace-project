@@ -45,9 +45,11 @@ def atom_diameter(cfg: dict) -> float:
         raw = 2.0
     try:
         import consensus
-        return consensus.canonical_diameter(raw)
-    except (ImportError, ValueError, ArithmeticError):
+    except ImportError:                      # запуск без src в sys.path
         return float(raw)
+    # ValueError (мусор, диаметр < минимума) намеренно не глотается:
+    # молча посчитать кластер с другим диаметром — это другой датасет.
+    return consensus.canonical_diameter(raw)
 
 
 def composition(cfg: dict) -> dict:

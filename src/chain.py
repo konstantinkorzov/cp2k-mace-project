@@ -686,7 +686,7 @@ def write_block(element_dir: str, system: str, n_atoms: int,
         "composition": composition,
         "n_atoms": int(n_atoms),
         "dim": int(dim),
-        "atom_diameter": consensus.canonical_diameter(atom_diameter),
+        "atom_diameter": consensus.canonical_diameter_text(atom_diameter),
         "prev_id": prev_id,
         "created_at": now_iso(),
         "state_sha256": state_sha256,
@@ -829,18 +829,22 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
         # v6: размерность задаётся высотой, а не счётчиком заданий мастера
         problems.append(f"dim {dim} != расписания "
                         f"{consensus.dim_for_height(seq - 1)} для высоты {seq}")
-    # Строго float и ровно DIAMETER_DECIMALS знаков (лишние отбрасываются при
-    # записи): иначе «2» и «2.0» дают разные block_id у одного и того же
-    # блока, и два мастера могут разойтись на ровном месте.
+    # Диаметр — СТРОКА с ровно DIAMETER_DECIMALS знаками: "2.560". Число в
+    # JSON не позволяет записать хвостовой ноль, поэтому 2.56 / 2.560 / 2
+    # давали бы разные block_id у одного и того же блока.
     diam = header.get("atom_diameter")
-    if type(diam) is not float:
-        problems.append(f"atom_diameter {diam!r} — не float "
-                        f"(2 и 2.0 дают разный block_id)")
-    elif not math.isfinite(diam) or diam <= 0:
-        problems.append("atom_diameter — не положительное конечное число")
-    elif not consensus.diameter_ok(diam):
-        problems.append(f"atom_diameter: больше {consensus.DIAMETER_DECIMALS} "
-                        f"знаков после точки (лишние при записи отбрасываются)")
+    if not isinstance(diam, str):
+        problems.append(f"atom_diameter {diam!r} — не строка "
+                        f"(нужно \"2.560\": число в JSON не хранит хвостовой ноль)")
+    elif not consensus.DIAMETER_RE.match(diam):
+        problems.append(f"atom_diameter {diam!r} — нужна каноническая запись "
+                        f"\"<целое>.{consensus.DIAMETER_DECIMALS} знака\", "
+                        f"например \"2.560\" (лишние знаки при записи отбрасываются)")
+    else:
+        value = float(diam)
+        if value < consensus.MIN_DIAMETER_ANG:
+            problems.append(f"atom_diameter {diam} Å меньше физического минимума "
+                            f"{consensus.MIN_DIAMETER_ANG} Å")
 
     prev = header.get("prev_id")
     if not isinstance(prev, str) or not SHA_RE.match(prev):
