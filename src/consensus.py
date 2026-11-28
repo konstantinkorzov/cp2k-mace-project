@@ -26,8 +26,49 @@ COINBASE_MATURITY = 1
 
 # atom_diameter попадает в заголовок и в block_id. JSON «2» и «2.0» —
 # разные байты при одном и том же числе, то есть разные block_id у
-# эквивалентных блоков. Поэтому диаметр — всегда float и не больше 6 знаков.
-DIAMETER_DECIMALS = 6
+# эквивалентных блоков. Поэтому диаметр — всегда float и ровно 3 знака
+# после точки (0.001 Å).
+#
+# Почему 3: диаметр — металлическая длина связи, величина порядка единиц Å.
+# Точность тоньше тысячной ангстрема физически бессмысленна (на этих
+# масштабах главную роль играет соотношение неопределённостей), а хранить её
+# в block_id — значит плодить «разные» блоки для одного и того же кластера.
+#
+# Лишние знаки ОТБРАСЫВАЮТСЯ, а не округляются: 2.5689 -> 2.568. Округление
+# (2.569) молча меняло бы распределение геометрий, то есть master и worker
+# считали бы разные кластеры при формально одном «диаметре».
+DIAMETER_DECIMALS = 3
+DIAMETER_UNITS = 10 ** DIAMETER_DECIMALS        # 1 Å = 1000 тысячных
+
+
+def diameter_milliunits(value) -> int:
+    """Диаметр в тысячных долях Å, усечением (без округления).
+
+    Разбор идёт по десятичной записи числа, а не по float-арифметике:
+    int(2.5689 * 1000) на двоичных дробях даёт то 2568, то 2569.
+    """
+    from decimal import Decimal
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise ValueError("atom_diameter не задан")
+    d = value if isinstance(value, Decimal) else Decimal(str(value).strip())
+    if not d.is_finite():
+        raise ValueError(f"atom_diameter {value!r} - не конечное число")
+    # int() от Decimal усекает к нулю: 2.5689 -> 2568, без округления.
+    return int(d * DIAMETER_UNITS)
+
+
+def canonical_diameter(value) -> float:
+    """Канонический диаметр для заголовка: 3 знака, усечение."""
+    return diameter_milliunits(value) / DIAMETER_UNITS
+
+
+def diameter_ok(diam) -> bool:
+    """Заголовочное значение уже канонично (усечение до 3 знаков его не меняет)."""
+    try:
+        return canonical_diameter(diam) == diam
+    except (ValueError, ArithmeticError, TypeError):
+        return False
 
 # ---------- расписание размеров ----------
 ATOM_SCHEDULE = {

@@ -273,8 +273,13 @@ def load_config(path: str, results_root: str | None = None) -> Config:
     _require(cfg, ["system"])
 
     system = cfg.get("system") or {}
-    cfg["atom_diameter"] = float(
-        system.get("atom_diameter") or cfg.get("atom_diameter") or 2.0)
+    # 3 знака, усечение — см. consensus.DIAMETER_DECIMALS. Значение сразу
+    # канонично: оно уходит и в генератор, и в заголовок, и в config воркера.
+    try:
+        cfg["atom_diameter"] = consensus.canonical_diameter(
+            system.get("atom_diameter") or cfg.get("atom_diameter") or 2.0)
+    except (ValueError, ArithmeticError) as e:
+        raise SystemExit(f"system.atom_diameter: {e}")
     name = str(system.get("name") or cfg.get("element") or "Cu")
     if not chain_mod.SYSTEM_RE.match(name):
         raise SystemExit(
@@ -3462,6 +3467,14 @@ def admin_config_set(update: ConfigUpdate, token: str | None = None):
             value = ADMIN_SETTINGS[key](update.value)
     except (TypeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=f"Неверное значение: {e}")
+
+    if key == "atom_diameter":
+        # Та же канонизация, что при записи блока (3 знака, усечение),
+        # иначе следующий блок молча разошёлся бы с цепочкой.
+        try:
+            value = consensus.canonical_diameter(value)
+        except (ValueError, ArithmeticError) as e:
+            raise HTTPException(status_code=400, detail=f"atom_diameter: {e}")
 
     CONFIG[key] = value
     _persist_config_value(key, value)

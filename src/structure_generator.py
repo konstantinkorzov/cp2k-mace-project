@@ -37,7 +37,17 @@ MAX_DIST_FACTOR = 2.0
 
 
 def atom_diameter(cfg: dict) -> float:
-    return float(cfg.get("atom_diameter") or 2.0)
+    """Диаметр из cfg. Канонизируется так же, как в заголовке блока
+    (consensus: 3 знака, усечение), иначе локальный прогон с диаметром
+    «2.5689» дал бы другую геометрию, чем приёмка с «2.568»."""
+    raw = cfg.get("atom_diameter")
+    if raw is None or raw == "":
+        raw = 2.0
+    try:
+        import consensus
+        return consensus.canonical_diameter(raw)
+    except (ImportError, ValueError, ArithmeticError):
+        return float(raw)
 
 
 def composition(cfg: dict) -> dict:

@@ -1839,6 +1839,26 @@ def audit4_tests():
         probs = chain.validate_header(dict(header1, atom_diameter=2.5600001))
         check("канонизация: лишние знаки диаметра отвергаются",
               any("знаков" in x for x in probs), probs[:2])
+        # Точность диаметра — 3 знака и именно УСЕЧЕНИЕМ: 2.5689 -> 2.568,
+        # а не 2.569. Округление молча меняло бы распределение геометрий.
+        check("канонизация: диаметр — ровно 3 знака",
+              chain.consensus.DIAMETER_DECIMALS == 3,
+              chain.consensus.DIAMETER_DECIMALS)
+        check("канонизация: лишние знаки отбрасываются, а не округляются",
+              chain.consensus.canonical_diameter(2.5689) == 2.568
+              and chain.consensus.canonical_diameter(2.5699999) == 2.569,
+              (chain.consensus.canonical_diameter(2.5689),
+               chain.consensus.canonical_diameter(2.5699999)))
+        check("канонизация: диаметр 2.5689 в заголовке отвергается",
+              any("знаков" in x for x in
+                  chain.validate_header(dict(header1, atom_diameter=2.5689))))
+        # Разбор по десятичной записи: float-арифметика на границе 2.9999
+        # даёт то 2999, то 3000 в зависимости от двоичного представления.
+        check("канонизация: границы тысячных не зависят от float-шума",
+              chain.consensus.canonical_diameter(2.9999) == 2.999
+              and chain.consensus.canonical_diameter("2.9999") == 2.999,
+              (chain.consensus.canonical_diameter(2.9999),
+               chain.consensus.canonical_diameter("2.9999")))
         check("канонизация: 2 и 2.0 дают разные block_id (и второй теперь невалиден)",
               chain.block_id_of(dict(header1, atom_diameter=2))
               != chain.block_id_of(dict(header1, atom_diameter=2.0)))

@@ -686,7 +686,7 @@ def write_block(element_dir: str, system: str, n_atoms: int,
         "composition": composition,
         "n_atoms": int(n_atoms),
         "dim": int(dim),
-        "atom_diameter": round(float(atom_diameter), consensus.DIAMETER_DECIMALS),
+        "atom_diameter": consensus.canonical_diameter(atom_diameter),
         "prev_id": prev_id,
         "created_at": now_iso(),
         "state_sha256": state_sha256,
@@ -829,18 +829,18 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
         # v6: размерность задаётся высотой, а не счётчиком заданий мастера
         problems.append(f"dim {dim} != расписания "
                         f"{consensus.dim_for_height(seq - 1)} для высоты {seq}")
-    # Строго float и не больше DIAMETER_DECIMALS знаков: иначе «2» и «2.0»
-    # дают разные block_id у одного и того же блока, и два мастера могут
-    # разойтись на ровном месте.
+    # Строго float и ровно DIAMETER_DECIMALS знаков (лишние отбрасываются при
+    # записи): иначе «2» и «2.0» дают разные block_id у одного и того же
+    # блока, и два мастера могут разойтись на ровном месте.
     diam = header.get("atom_diameter")
     if type(diam) is not float:
         problems.append(f"atom_diameter {diam!r} — не float "
                         f"(2 и 2.0 дают разный block_id)")
     elif not math.isfinite(diam) or diam <= 0:
         problems.append("atom_diameter — не положительное конечное число")
-    elif round(diam, consensus.DIAMETER_DECIMALS) != diam:
+    elif not consensus.diameter_ok(diam):
         problems.append(f"atom_diameter: больше {consensus.DIAMETER_DECIMALS} "
-                        f"знаков после точки")
+                        f"знаков после точки (лишние при записи отбрасываются)")
 
     prev = header.get("prev_id")
     if not isinstance(prev, str) or not SHA_RE.match(prev):
