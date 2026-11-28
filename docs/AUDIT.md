@@ -441,7 +441,11 @@ AES-256-GCM, конверт на каждый запрос, AAD с привяз�
 JSON, зашифрованный `POST /submit-result` → бизнес-отказ. Тесты:
 `test/test_secure.py` 13/13, `test_zero_trust.py` 297/297.
 
-Остаток: клиент мастера для синхронизации с пирами (`/chain/height`,
-`/chain/announce`) готов (`SecureClient`), но вызовы в `main.py` пока идут
-открытым `requests` — это следующий шаг.
+Мастер↔мастер тоже на этом транспорте: `_peer_get`/`_peer_post` в `main.py`
+идут через `SecureClient` (высоты, анонсы; опрос `/peers` при gossip — тоже).
+Проверено вживую: `_peer_get(.../chain/height)` → 200 с настоящим JSON,
+`_peer_post(.../chain/announce)` → 200 `sync_started: true`.
+
+Блоки и `.wfn` остаются открытыми осознанно: они не секретны, а целостность
+проверяется `block_id`/`state_sha256`; шифровать гигабайты ради этого незачем.
 

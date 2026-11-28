@@ -2564,6 +2564,45 @@ def _normalize_peer(url: str) -> str:
     return str(url).strip().rstrip("/")
 
 
+# ---------- обращения к пирам: тот же шифрованный транспорт, что у воркеров ----------
+_PEER_CLIENT = None
+_PEER_CLIENT_LOCK = threading.Lock()
+
+
+def _peer_client():
+    """Клиент к пирам (X25519 из seed кошелька мастера). None — нет кошелька."""
+    global _PEER_CLIENT
+    with _PEER_CLIENT_LOCK:
+        if _PEER_CLIENT is None:
+            try:
+                from secure_client import SecureClient
+                wallet = CONFIG.get("wallet")
+                latest = wallet.latest_key() if wallet is not None else None
+                if latest is None:
+                    return None
+                trust = os.path.join(RESULTS_ROOT, "master_trust.json")
+                _PEER_CLIENT = SecureClient(
+                    wallet.private_seed(latest["address"]), trust)
+            except Exception as e:  # noqa: BLE001
+                print(f"[Master] ! шифрованный клиент пиров недоступен: {e}")
+                return None
+        return _PEER_CLIENT
+
+
+def _peer_get(url: str, params=None, timeout: float = PEER_TIMEOUT):
+    client = _peer_client()
+    if client is None:
+        return requests.get(url, params=params, timeout=timeout)
+    return client.get(url, params=params, timeout=timeout)
+
+
+def _peer_post(url: str, json_body=None, timeout: float = PEER_TIMEOUT):
+    client = _peer_client()
+    if client is None:
+        return requests.post(url, json=json_body, timeout=timeout)
+    return client.post(url, json=json_body, timeout=timeout)
+
+
 def _collect_peers(args) -> list[str]:
     raw = list(CONFIG.get("peers") or [])
     raw += list(getattr(args, "peer", None) or [])
@@ -2866,7 +2905,7 @@ def _is_fork_conflict(text: str) -> bool:
 def sync_from_peer(peer: str) -> dict:
     peer = _normalize_peer(peer)
     try:
-        r = requests.get(f"{peer}/chain/height", timeout=PEER_TIMEOUT)
+        r = _peer_get(f"{peer}/chain/height")
         r.raise_for_status()
         info = r.json()
     except Exception as e:  # noqa: BLE001
@@ -2976,7 +3015,7 @@ def _peer_heights() -> list[tuple[str, int]]:
         if _BAD_PEERS.get(peer, 0) > now:
             continue
         try:
-            r = requests.get(f"{peer}/chain/height", timeout=PEER_TIMEOUT)
+            r = _peer_get(f"{peer}/chain/height")
             r.raise_for_status()
             info = r.json()
         except Exception:  # noqa: BLE001
@@ -3027,9 +3066,9 @@ def catch_up_chain(max_rounds: int = MAX_CATCHUP_ROUNDS) -> dict:
 def _announce_to_peers(height: int):
     for peer in list(CONFIG.get("peers") or []):
         try:
-            requests.post(f"{_normalize_peer(peer)}/chain/announce",
-                          json={"height": height, "element": CONFIG["element"]},
-                          timeout=5)
+            _peer_post(f"{_normalize_peer(peer)}/chain/announce",
+                       json_body={"height": height, "element": CONFIG["element"]},
+                       timeout=5)
         except Exception:  # noqa: BLE001
             pass
 
