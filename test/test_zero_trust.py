@@ -238,11 +238,15 @@ def queue_tests():
     payload_cfg = main.task_cfg_payload(main.CONFIG)
     check("воркеру передаётся диаметр атома", "atom_diameter" in payload_cfg)
     check("воркеру передаётся состав", "composition" in payload_cfg)
-    check("в payload нет ручек CP2K/генерации/режима проверки",
-          not any(k in payload_cfg for k in ("verify_mode", "cutoff", "eps_scf",
-                                             "box_size_margin", "max_scf",
-                                             "min_dist", "max_dist", "random_seed",
-                                             "max_attempts_per_atom")))
+    # v6: профиль сети уходит воркеру целиком и ровно с нашими значениями —
+    # это не «ручка выбора», а требование считать теми же числами.
+    check("воркеру передаётся профиль сети (не выбор физики)",
+          all(payload_cfg.get(k) == v
+              for k, v in main.consensus.CP2K_PROFILE.items())
+          and not any(k in payload_cfg for k in (
+              "verify_mode", "box_size_margin", "min_dist", "max_dist",
+              "random_seed", "max_attempts_per_atom")),
+          {k: payload_cfg.get(k) for k in ("cutoff", "eps_scf", "mpi_ranks")})
 
 
 # ---------- макет файла состояния (-RESTART.wfn) по РЕАЛЬНОМУ формату ----------
