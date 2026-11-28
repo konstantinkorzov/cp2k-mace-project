@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Устанавливаем MACE, ASE, FastAPI и Uvicorn (тяжелый слой, кэшируется)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install mace-torch ase fastapi uvicorn numpy requests
+    pip3 install mace-torch ase fastapi uvicorn numpy requests cryptography
 	
 # Устанавливаем Node.js (LTS 20.x) через официальный скрипт
 RUN apt-get update && apt-get install -y curl ca-certificates gnupg \

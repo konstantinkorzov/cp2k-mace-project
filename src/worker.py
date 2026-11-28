@@ -36,7 +36,15 @@ import identity
 import wallet_store
 
 
-RETRY_DELAY = 5          # секунд между попытками подключения к серверу
+RETRY_DELAY = 5  # секунд между попытками подключения к серверу
+
+# Шифрованный клиент мастера. None — обычный requests (оффлайн-тесты).
+CLIENT = None
+
+
+def _http():
+    """Клиент для запросов к мастеру: зашифрованный, если он настроен."""
+    return CLIENT if CLIENT is not None else requests
 PEER_REFRESH_SEC = 60    # как часто спрашивать у мастеров адреса других мастеров
 MAX_MASTERS = 32         # сколько адресов мастеров воркер готов держать
 HEARTBEAT_SEC = 30       # как часто сообщать мастеру «я жив» (в т.ч. во время расчёта)
@@ -157,13 +165,21 @@ def _upload_state(base_url: str, session: str, worker_id: str,
         return None
     try:
         with open(path, "rb") as f:
-            r = requests.post(
-                base_url + "/submit-state",
-                params={"worker_id": worker_id, "session": session,
-                        "struct_id": struct_id},
-                data=f,
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=timeout)
+            if CLIENT is not None:
+                # сессия/тикет идут зашифрованным запросом, файл — открытым
+                r = CLIENT.upload_state(
+                    base_url + "/submit-state",
+                    {"worker_id": worker_id, "session": session,
+                     "struct_id": struct_id},
+                    f, timeout=timeout)
+            else:
+                r = requests.post(
+                    base_url + "/submit-state",
+                    params={"worker_id": worker_id, "session": session,
+                            "struct_id": struct_id},
+                    data=f,
+                    headers={"Content-Type": "application/octet-stream"},
+                    timeout=timeout)
         if r.status_code != 200:
             logger.warning(f"мастер не принял состояние: HTTP {r.status_code} "
                            f"{r.text[:200]}")
@@ -186,9 +202,12 @@ def _register_once(reg_url: str, name: str, pubkey_hash: str, public_key: str,
     Возвращает {"worker_id", "session", ...} или None.
     """
     payload = {"name": name, "pubkey_hash": pubkey_hash, "public_key": public_key}
+    http = _http()
     if wallet is not None:
-        ch = requests.get(
-            reg_url.replace("/register-worker", "/register-challenge"), timeout=10)
+        # одноразовый nonce тоже через шифрованный канал (он и есть доказательство)
+        challenge_url = reg_url.replace("/register-worker", "/register-challenge")
+        ch = http.post(challenge_url, timeout=10) if CLIENT is not None \
+            else http.get(challenge_url, timeout=10)
         ch.raise_for_status()
         nonce = str((ch.json() or {}).get("nonce") or "")
         if not nonce:
@@ -196,7 +215,7 @@ def _register_once(reg_url: str, name: str, pubkey_hash: str, public_key: str,
         payload["nonce"] = nonce
         payload["signature"] = wallet.sign(
             pubkey_hash, b"cp2k-mace-register:" + bytes.fromhex(nonce)).hex()
-    reg_resp = requests.post(reg_url, json=payload, timeout=10)
+    reg_resp = http.post(reg_url, json=payload, timeout=10)
     reg_resp.raise_for_status()
     reg_data = reg_resp.json() or {}
     if reg_data.get("worker_id") and reg_data.get("session"):
@@ -430,8 +449,8 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
     for attempt in range(1, attempts + 1):
         for url in order:
             try:
-                r = requests.get(url + "/work/height",
-                                 params={"element": element}, timeout=10)
+                r = _http().get(url + "/work/height",
+                                params={"element": element}, timeout=10)
                 if r.status_code != 200:
                     continue
                 info = r.json()
@@ -460,7 +479,7 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
                     for field in ("prev_id", "nonce"):
                         if task.get(field) is not None:
                             ready_data[field] = task[field]
-                sub = requests.post(url + "/submit-result", json={
+                sub = _http().post(url + "/submit-result", json={
                     "worker_id": reg["worker_id"],
                     "session": reg["session"],
                     "struct_id": struct_id,
@@ -496,10 +515,10 @@ def start_heartbeat(base_url: str, holder: dict, logger,
             wid = holder.get("worker_id")
             if wid:
                 try:
-                    r = requests.get(base_url + "/heartbeat",
-                                     params={"worker_id": wid,
-                                             "session": holder.get("session")},
-                                     timeout=5)
+                    r = _http().get(base_url + "/heartbeat",
+                                    params={"worker_id": wid,
+                                            "session": holder.get("session")},
+                                    timeout=5)
                     if r.status_code == 200 and r.json().get("status") == "unknown":
                         # Перерегистрацию делает основной цикл (400 от /get-task) —
                         # heartbeat не должен гонки ради сам создавать воркера
@@ -582,6 +601,17 @@ def main():
     pubkey_hash = key["address"]
     public_key = key["public_key"]
 
+    # Транспортное шифрование: X25519-ключ выводится из seed кошелька.
+    # Ключ мастера запоминается при первом обращении (results/worker_trust.json).
+    global CLIENT
+    try:
+        from secure_client import SecureClient
+        trust_path = os.path.join(results_root, "worker_trust.json")
+        CLIENT = SecureClient(wallet.private_seed(key["address"]), trust_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ шифрование транспорта недоступно ({e}); мастер ответит 426 из сети")
+        CLIENT = None
+
     # Регистрация воркера (POST с name + адресом кошелька)
     reg_url = f"{base_url}/register-worker"
     reg = register_with_retry(reg_url, worker_name, pubkey_hash,
@@ -616,7 +646,7 @@ def main():
                     last_peer_refresh = time.time()
                     discover_peers(masters, logger)
 
-                response = requests.get(
+                response = _http().get(
                     task_url,
                     params={"worker_id": worker_id, "session": session},
                     timeout=10,
@@ -675,7 +705,7 @@ def main():
                     "data": send_data,
                 }
 
-                sub_resp = requests.post(submit_url, json=payload, timeout=60)
+                sub_resp = _http().post(submit_url, json=payload, timeout=60)
                 sub_resp.raise_for_status()
                 sub_data = sub_resp.json()
                 status = sub_data.get("status")

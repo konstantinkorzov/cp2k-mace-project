@@ -97,7 +97,7 @@ def prepare_env():
     for f in ("main.py", "cp2k_runner.py", "structure_generator.py", "worker.py",
               "config_loader.py", "archive_maker.py", "identity.py", "chain.py",
               "consensus.py", "crypto.py", "wallet_store.py", "wallet.py",
-              "webwallet.py"):
+              "webwallet.py", "secure.py", "secure_http.py", "secure_client.py"):
         shutil.copy(os.path.join(SRC, f), os.path.join(ENV, f))
 
     # реальный config.json проекта (формат {"value":..., "help":...})

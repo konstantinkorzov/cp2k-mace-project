@@ -66,6 +66,12 @@ warnings.filterwarnings(
 # (см. src/worker.py + src/structure_generator.py)
 import cp2k_runner
 import consensus
+
+try:                     # шифрование транспорта требует cryptography
+    import secure
+except Exception as _e:  # noqa: BLE001
+    secure = None
+    print(f"[Master] ! шифрование транспорта недоступно: {_e}")
 import crypto
 import chain as chain_mod
 import wallet_store
@@ -1285,6 +1291,71 @@ def _persist_verified_state(task_data: dict, payload: dict, verdict: dict,
 app = FastAPI()
 
 
+# ---------- шифрованный транспорт мастер↔воркер/мастер ----------
+def _transport_seed() -> bytes:
+    """Ключ шифрования узла — из seed кошелька (X25519 выводится из него)."""
+    wallet = CONFIG.get("wallet")
+    if wallet is None:
+        raise RuntimeError("кошелёк мастера не разблокирован: шифрование недоступно")
+    latest = wallet.latest_key()
+    if latest is None:
+        raise RuntimeError("у мастера нет ключей")
+    return wallet.private_seed(latest["address"])
+
+
+try:                       # в оффлайн-тестах заглушка fastapi не умеет add_middleware
+    from secure_http import SecureASGIMiddleware
+    app.add_middleware(SecureASGIMiddleware, seed_provider=_transport_seed)
+except Exception as _e:    # noqa: BLE001
+    print(f"[Master] ! шифрованный транспорт не подключён: {_e}")
+
+
+@app.get("/secure/hello")
+def secure_hello():
+    """Публичный ключ узла + самоподпись: клиент запоминает его (TOFU)."""
+    if secure is None:
+        raise HTTPException(status_code=503, detail="cryptography не установлена")
+    try:
+        return secure.hello_payload(_transport_seed())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+# одноразовые тикеты на загрузку состояния (чтобы не светить session в URL)
+STATE_TICKET_TTL = 120
+_STATE_TICKETS: dict[str, tuple[str, float]] = {}
+_TICKET_LOCK = threading.Lock()
+
+
+def _issue_state_ticket(worker_id: str) -> str:
+    ticket = secrets.token_hex(24)
+    now = time.time()
+    with _TICKET_LOCK:
+        for t, (_w, ts) in list(_STATE_TICKETS.items()):
+            if now - ts > STATE_TICKET_TTL:
+                _STATE_TICKETS.pop(t, None)
+        _STATE_TICKETS[ticket] = (str(worker_id), now)
+    return ticket
+
+
+def _consume_state_ticket(ticket: str) -> str | None:
+    now = time.time()
+    with _TICKET_LOCK:
+        rec = _STATE_TICKETS.pop(str(ticket), None)
+    if not rec:
+        return None
+    worker_id, ts = rec
+    return worker_id if now - ts <= STATE_TICKET_TTL else None
+
+
+@app.post("/state-ticket")
+def state_ticket(worker_id: str, session: str | None = None,
+                 struct_id: str | None = None):
+    """Тикет на одну загрузку .wfn (сессия проверяется, дальше её не светим)."""
+    _auth_worker(worker_id, session)
+    return {"ticket": _issue_state_ticket(worker_id), "ttl": STATE_TICKET_TTL}
+
+
 def _body_limit_bytes() -> int:
     """Лимит тела = base64 от максимально допустимого wfn + запас.
 
@@ -2185,8 +2256,9 @@ def _ready_binding(payload: dict, sid: str):
 
 
 @app.post("/submit-state")
-async def submit_state(request: Request, worker_id: str, session: str,
-                       struct_id: str):
+async def submit_state(request: Request, worker_id: str | None = None,
+                       session: str | None = None, struct_id: str = "",
+                       ticket: str | None = None):
     """
     Приём файла состояния потоком (application/octet-stream).
 
@@ -2198,6 +2270,13 @@ async def submit_state(request: Request, worker_id: str, session: str,
     Ответ: {"status": "ok", "sha256": ..., "size": ...}. Дальше воркер шлёт
     state_sha256 в /submit-result.
     """
+    # Основной путь: одноразовый тикет, выданный по зашифрованному каналу.
+    # Сессия напрямую (loopback/старый клиент) — тоже принимается.
+    if ticket:
+        resolved = _consume_state_ticket(ticket)
+        if not resolved:
+            raise HTTPException(status_code=403, detail="тикет неверен или истёк")
+        worker_id = resolved
     _auth_worker(worker_id, session)
     if not isinstance(struct_id, str) or not STRUCT_ID_RE.match(struct_id):
         raise HTTPException(status_code=400, detail="недопустимый struct_id")
