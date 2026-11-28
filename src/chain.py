@@ -33,9 +33,13 @@ from datetime import datetime
 
 import numpy as np
 
+import consensus
 import crypto
 
-BLOCK_VERSION = 5
+# Консенсусные константы живут в consensus.py (один источник правды для
+# мастера, воркера и проверки цепочки). Здесь — реэкспорт: остальной код
+# продолжает обращаться к chain.COINBASE_VALUE и т. п.
+BLOCK_VERSION = consensus.BLOCK_VERSION
 ZERO_HASH = "0" * 64
 HEADER_NAME = "header.json"
 DFT_NAME = "dft.json"
@@ -44,17 +48,17 @@ DFT_NAME = "dft.json"
 # Bitcoin-подобная схема (1 BTC = 1e8 сатоши), но без дробей вообще: float в
 # консенсусе даёт расхождения при суммировании и позволяет обходить проверки
 # (NaN/округление). Любая сумма обязана быть int.
-COINBASE_VALUE = 50_000_000
-REWARD_VALUE = 25_000_000
-TX_FEE = 100_000                 # комиссия за перевод (входы − выходы), int
+COINBASE_VALUE = consensus.COINBASE_VALUE
+REWARD_VALUE = consensus.REWARD_VALUE
+TX_FEE = consensus.TX_FEE           # комиссия за перевод (входы − выходы), int
 # Консенсусный предел переводов в блоке: блок не должен расти безгранично,
 # иначе «дорогие первыми» в мемпуле не имеет смысла.
-MAX_TXS_PER_BLOCK = 2_000
-DEFAULT_CONFIRMATIONS = 1
+MAX_TXS_PER_BLOCK = consensus.MAX_TXS_PER_BLOCK
+DEFAULT_CONFIRMATIONS = consensus.DEFAULT_CONFIRMATIONS
 # Зрелость coinbase — КОНСЕНСУС (не настройка): coinbase-выход блока N можно
 # тратить только в блоке N + COINBASE_MATURITY. Bitcoin держит 100; здесь 1 —
 # текущая совместимость, поднять = новая версия протокола (см. docs/AUDIT.md).
-COINBASE_MATURITY = 1
+COINBASE_MATURITY = consensus.COINBASE_MATURITY
 
 
 # ---------- общее ----------
@@ -692,8 +696,8 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
         problems.append(f"система блока {system} != {expected_system}")
 
     n_atoms = header.get("n_atoms")
-    if type(n_atoms) is not int or not 1 <= n_atoms <= 10_000:
-        problems.append(f"n_atoms {n_atoms!r} — не целое 1..10000")
+    if type(n_atoms) is not int or not 1 <= n_atoms <= consensus.MAX_N_ATOMS:
+        problems.append(f"n_atoms {n_atoms!r} — не целое 1..{consensus.MAX_N_ATOMS}")
     elif expected_n_atoms is not None and n_atoms != expected_n_atoms:
         problems.append(f"n_atoms {n_atoms} != ожидаемого {expected_n_atoms}")
 
@@ -715,9 +719,20 @@ def validate_header(header: dict, *, expected_seq: int | None = None,
             # composition — формульная единица (Cu:1, Al2O3:5), n_atoms кратно ей
             if n_atoms % total:
                 problems.append(f"n_atoms {n_atoms} не кратно формуле ({total} атомов)")
+            elif (type(seq) is int and seq >= 1 and type(n_atoms) is int
+                  and 1 <= n_atoms <= consensus.MAX_N_ATOMS):
+                # Размер кластера задаёт расписание сети, а не сборщик блока.
+                # Без этой проверки «строгое расписание» держалось только на
+                # мастере: пир принимал любой n (до MAX_N_ATOMS) и сеть могла
+                # копить работу, которую никто больше не воспроизведёт.
+                want = consensus.expected_n_atoms(seq - 1, total)
+                if n_atoms != want:
+                    problems.append(
+                        f"n_atoms {n_atoms} != расписания {want} для высоты {seq}")
 
-    if type(header.get("dim")) is not int or header["dim"] not in (1, 2, 3):
-        problems.append(f"dim {header.get('dim')!r} — не 1/2/3")
+    if type(header.get("dim")) is not int or header["dim"] not in consensus.DIM_CYCLE:
+        problems.append(f"dim {header.get('dim')!r} — не из расписания "
+                        f"{consensus.DIM_CYCLE}")
     if not _is_number(header.get("atom_diameter")) or float(header["atom_diameter"]) <= 0:
         problems.append("atom_diameter — не положительное число")
 

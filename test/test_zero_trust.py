@@ -95,7 +95,8 @@ def prepare_env():
     # реальные модули проекта
     for f in ("main.py", "cp2k_runner.py", "structure_generator.py", "worker.py",
               "config_loader.py", "archive_maker.py", "identity.py", "chain.py",
-              "crypto.py", "wallet_store.py", "wallet.py", "webwallet.py"):
+              "consensus.py", "crypto.py", "wallet_store.py", "wallet.py",
+              "webwallet.py"):
         shutil.copy(os.path.join(SRC, f), os.path.join(ENV, f))
 
     # реальный config.json проекта (формат {"value":..., "help":...})
@@ -632,6 +633,23 @@ def chain_tests():
               h1["cp2k_version"] == "2024.3" and h1["cp2k_params"]["cutoff"] == 400)
         check("первый блок: prev = нули", h1["prev_id"] == chain.ZERO_HASH)
 
+        # --- расписание размеров проверяется и пиром, а не только мастером ---
+        off = dict(h1, n_atoms=3)
+        p_off = chain.validate_header(off)
+        check("n_atoms не по расписанию отвергается",
+              any("расписания" in p for p in p_off), p_off[:2])
+
+        ok_n = chain.validate_header(dict(h1, block_id=h1["block_id"]))
+        check("свой n_atoms расписанию соответствует",
+              not any("расписания" in p for p in ok_n), ok_n[:2])
+
+        p_dim = chain.validate_header(dict(h1, dim=1))
+        check("dim вне расписания (1) отвергается",
+              any("не из расписания" in p for p in p_dim), p_dim[:2])
+        check("расписание: высота 10 → n=3, высота 0 → n=2",
+              main.stage_for_height(0, {"formula_size": 1})["n_atoms"] == 2
+              and main.stage_for_height(10, {"formula_size": 1})["n_atoms"] == 3)
+
         # --- молекула: слаг системы + состав в заголовке ---
         tmpm = tempfile.mkdtemp(prefix="chain_mol_")
         try:
@@ -783,6 +801,17 @@ def chain_tests():
             vb2 = chain.verify_block(edir, p3, expected_seq=2,
                                      expected_prev=chain.ZERO_HASH)
             check("verify_block отвергает не тот seq", not vb2["ok"])
+
+            # блок с размером не по расписанию (высота 1 → 3 атома нельзя)
+            p_off3 = chain.write_block(edir, "Cu", 3, sha4, rel4,
+                                       [chain.make_coinbase(2, master)],
+                                       dft=block_dft(edir, n_atoms=3), **cp2k)
+            vb3 = chain.verify_block(edir, p_off3, expected_seq=2,
+                                     expected_prev=h1["block_id"])
+            check("verify_block отвергает блок не по расписанию",
+                  (not vb3["ok"])
+                  and any("расписания" in p for p in vb3["problems"]),
+                  vb3["problems"][:2])
         finally:
             shutil.rmtree(tmp3, ignore_errors=True)
 

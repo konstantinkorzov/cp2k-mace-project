@@ -59,6 +59,7 @@ warnings.filterwarnings(
 # generate_structures больше не используется: структуры генерирует воркер
 # (см. src/worker.py + src/structure_generator.py)
 import cp2k_runner
+import consensus
 import crypto
 import chain as chain_mod
 import wallet_store
@@ -114,15 +115,15 @@ MAX_TASK_ATTEMPTS = 5      # сколько раз задача возвраща
 # atom_diameter — параметр ГЕНЕРАЦИИ (как координаты) и в приёмку не входит:
 # иначе мастера с разными диаметрами принимали бы разные структуры — это форк.
 # Консенсусный минимум — физический: ближе 0.5 Å атомы не бывают ни в одной
-# реальной системе (короче всего H–H ≈ 0.74 Å).
-MIN_ATOM_DISTANCE_ANG = 0.5
+# реальной системе (короче всего H–H ≈ 0.74 Å). Константа — в consensus.py.
+MIN_ATOM_DISTANCE_ANG = consensus.MIN_ATOM_DISTANCE_ANG
 MIN_DIST_TOLERANCE = 0.9   # только для проверки шаблона при старте (генерация)
 
 # Потолок размера задачи для приёмки: n_atoms приходит из запроса, поэтому
-# всё, что больше, отбивается ДО аллокаций numpy и запуска CP2K. Расписание
-# растёт медленно; 2000 атомов — далеко за пределами практичного кластера,
-# и такой запрос — попытка съесть память мастера, а не работа.
-MAX_TASK_ATOMS = 2000
+# всё, что больше, отбивается ДО аллокаций numpy и запуска CP2K. Живёт в
+# consensus.py вместе с потолком расписания — иначе расписание выдавало бы
+# задачи, которые мастер тут же отказывается принимать.
+MAX_TASK_ATOMS = consensus.MAX_TASK_ATOMS
 
 
 
@@ -371,20 +372,16 @@ def _master_password() -> str | None:
 # ---------- Очередь заданий: мастер раздаёт только число атомов ----------
 # ---------- Расписание размеров по высоте цепочки ----------
 # =====================================================================
-# РАСПИСАНИЕ РАЗМЕРОВ — КОНСЕНСУСНЫЕ КОНСТАНТЫ, НЕ ЧИТАЮТСЯ ИЗ config.json
+# РАСПИСАНИЕ РАЗМЕРОВ — в consensus.py (один источник правды с chain.py)
 # =====================================================================
 # Эти числа определяют, какой размер кластера считается на каждой высоте
 # цепочки. Если у двух мастеров они разные — цепочки разойдутся, поэтому
-# менять их можно только вместе с версией протокола (форк сознательно).
-ATOM_SCHEDULE = {
-    "start_atoms": 2,     # первый размер кластера
-    "base_blocks": 10,    # блоков на первый этап
-    "exponent": 1.5,      # B(s) = base_blocks * s^exponent
-    "max_atoms": 0,       # 0 — без потолка, размер растёт с высотой
-}
+# меняются только вместе с версией протокола. Пиры проверяют то же самое
+# при приёме блока (chain.validate_header), а не только мастер.
+ATOM_SCHEDULE = consensus.ATOM_SCHEDULE
 
 # Размерности чередуются: объёмная (3) и плоская (2) структуры через одну.
-DIM_CYCLE = (3, 2)
+DIM_CYCLE = consensus.DIM_CYCLE
 
 # Тег запуска мастера. Без него после перезапуска снова выдавался n2_t00000,
 # и в цепочке могли оказаться два блока с ОДИНАКОВЫМ struct_id (структуры
@@ -415,31 +412,13 @@ def schedule_enabled(cfg=None) -> bool:
 
 def stage_for_height(height: int, cfg) -> dict:
     """
-    Этап = размер кластера. Для этапа s:
-      n_atoms = start + (s-1)*formula_size
-      blocks  = base * s^exponent
+    Этап = размер кластера. Расчёт — в consensus.stage_for_height, чтобы
+    мастер и проверка блока считали по одной и той же функции.
 
-    Параметры — константы ATOM_SCHEDULE (общие для всей сети).
     Высота height — сколько блоков уже принято; этап s покрывает
     [C(s-1), C(s)), где C — сумма blocks по предыдущим этапам.
     """
-    base = max(1, int(ATOM_SCHEDULE["base_blocks"]))
-    power = float(ATOM_SCHEDULE["exponent"])
-    unit = max(1, int(cfg.get("formula_size") or 1))
-    start = max(int(ATOM_SCHEDULE["start_atoms"]), unit)
-    max_atoms = int(ATOM_SCHEDULE["max_atoms"] or 0)
-
-    acc, s = 0, 1
-    while True:
-        blocks = max(1, int(round(base * (s ** power))))
-        n_atoms = start + (s - 1) * unit
-        if max_atoms and n_atoms > max_atoms:
-            n_atoms = max_atoms
-        if height < acc + blocks:
-            return {"stage": s, "n_atoms": n_atoms, "blocks": blocks,
-                    "done": height - acc, "height": height}
-        acc += blocks
-        s += 1
+    return consensus.stage_for_height(height, int(cfg.get("formula_size") or 1))
 
 
 GEOMETRY_RETRIES = 5          # сколько разных seed-ов перебрать при неудаче генерации
