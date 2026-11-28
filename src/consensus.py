@@ -24,6 +24,11 @@ DEFAULT_CONFIRMATIONS = 1
 # Зрелость coinbase — консенсус: выход блока N тратится не раньше N + 1.
 COINBASE_MATURITY = 1
 
+# atom_diameter попадает в заголовок и в block_id. JSON «2» и «2.0» —
+# разные байты при одном и том же числе, то есть разные block_id у
+# эквивалентных блоков. Поэтому диаметр — всегда float и не больше 6 знаков.
+DIAMETER_DECIMALS = 6
+
 # ---------- расписание размеров ----------
 ATOM_SCHEDULE = {
     "start_atoms": 2,     # первый размер кластера
@@ -71,15 +76,22 @@ PROFILE_KEYS = tuple(sorted(CP2K_PROFILE))
 
 
 def profile_mismatch(params) -> list[str]:
-    """Какие ключи профиля не совпадают с сетью (пусто — блок наш)."""
+    """
+    Какие ключи профиля не совпадают с сетью (пусто — блок наш).
+
+    Сверяем И значение, И тип: `400.0` вместо `400` — то же число, но другие
+    байты JSON, а значит другой `block_id` у того же блока. Один профиль —
+    одно каноническое представление.
+    """
     if not isinstance(params, dict):
         return ["cp2k_params — не объект"]
     bad = []
     for key in PROFILE_KEYS:
+        want = CP2K_PROFILE[key]
         if key not in params:
             bad.append(f"{key}: нет")
-        elif params[key] != CP2K_PROFILE[key]:
-            bad.append(f"{key}: {params[key]!r} != {CP2K_PROFILE[key]!r}")
+        elif type(params[key]) is not type(want) or params[key] != want:
+            bad.append(f"{key}: {params[key]!r} != {want!r}")
     return bad
 
 

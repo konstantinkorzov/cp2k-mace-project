@@ -1828,6 +1828,26 @@ def audit4_tests():
         check("L2: keys.db в WAL", str(mode).lower() == "wal", mode)
         check("L2: busy_timeout выставлен", int(busy) == 5000, busy)
 
+        # ---------- канонизация: один и тот же блок — один block_id ----------
+        header1, _d1, _t1, _n1 = chain.read_block(p1)
+        check("канонизация: диаметр блока — float",
+              type(header1.get("atom_diameter")) is float,
+              type(header1.get("atom_diameter")).__name__)
+        probs = chain.validate_header(dict(header1, atom_diameter=2))
+        check("канонизация: atom_diameter 2 (int) отвергается",
+              any("не float" in x for x in probs), probs[:2])
+        probs = chain.validate_header(dict(header1, atom_diameter=2.5600001))
+        check("канонизация: лишние знаки диаметра отвергаются",
+              any("знаков" in x for x in probs), probs[:2])
+        check("канонизация: 2 и 2.0 дают разные block_id (и второй теперь невалиден)",
+              chain.block_id_of(dict(header1, atom_diameter=2))
+              != chain.block_id_of(dict(header1, atom_diameter=2.0)))
+        check("канонизация: профиль с cutoff=400.0 отвергается",
+              bool(chain.consensus.profile_mismatch(
+                  dict(header1["cp2k_params"], cutoff=400.0))))
+        check("канонизация: канонический профиль принимается",
+              not chain.consensus.profile_mismatch(dict(header1["cp2k_params"])))
+
         # ---------- L3: лимиты тела ----------
         check("L3: обычный JSON-запрос ограничен 8 МБ",
               main._body_limit_bytes("/tx/submit") == main.JSON_BODY_MAX_BYTES)
