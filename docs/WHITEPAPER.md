@@ -313,7 +313,8 @@ flowchart LR
 |---|---|
 | `BLOCK_VERSION` | 2 |
 | `GEOM_VERSION` | 1 |
-| `COINBASE_VALUE` / `REWARD_VALUE` / `TX_FEE` | 50 000 000 / 25 000 000 / 100 000 |
+| `COINBASE_VALUE` / `REWARD_VALUE` | 50 000 000 / 25 000 000 |
+| `DEFAULT_FEE` (политика кошелька, не консенсус) | 100 000 |
 | `COINBASE_MATURITY` | 1 блок |
 | `MAX_TXS_PER_BLOCK` / `MEMPOOL_MAX_TX` | 2 000 / 10 000 |
 | `RESTART_VERIFY_SCF` | 3 шага |

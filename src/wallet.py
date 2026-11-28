@@ -350,7 +350,7 @@ def main():
                          "(для мастеров применится при следующем запуске)")
     ap.add_argument("--send-to", default=None, help="адрес получателя")
     ap.add_argument("--amount", type=int, default=None, help="сумма перевода (целые монеты)")
-    ap.add_argument("--fee", type=int, default=chain.TX_FEE, help="комиссия (целые монеты)")
+    ap.add_argument("--fee", type=int, default=chain.DEFAULT_FEE, help="комиссия (целые монеты)")
     ap.add_argument("--master", action="append", default=None,
                     help="URL мастера для отправки tx (можно несколько)")
     ap.add_argument("--new-address", action="store_true",

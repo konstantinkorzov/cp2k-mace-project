@@ -123,6 +123,8 @@ class Wallet:
         return crypto.sign(self.private_seed(address), message)
 
     def change_password(self, old: str, new: str):
+        if len(new) < MIN_PASSWORD:
+            raise WalletError(f"пароль кошелька короче {MIN_PASSWORD} символов")
         row = self.conn.execute("SELECT * FROM wallets WHERE id = ?", (self.id,)).fetchone()
         if not _check_password(row, old):
             raise WalletError("старый пароль неверен")

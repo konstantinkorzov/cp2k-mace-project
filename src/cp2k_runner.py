@@ -1110,8 +1110,12 @@ def check_restart_reading(log_path: str, wfn_name: str = "") -> dict:
     res = {"mentioned": False, "warnings": [], "lines": []}
     if not os.path.exists(log_path):
         return res
-    warn_keys = ("NOT COMPATIBLE", "INCOMPATIBLE", "DIFFERENT NUMBER", "ATOMIC GUESS",
-                 "COULD NOT READ", "CANNOT READ", "NOT FOUND", "IGNORED")
+    # Реальный CP2K пишет "READ RESTART : WARNING : DIFFERENT natom,
+    # returning 2 ..." — раньше ни один из шаблонов под это не подходил,
+    # и несовместимый restart проходил как «прочитан без предупреждений».
+    warn_keys = ("NOT COMPATIBLE", "INCOMPATIBLE", "DIFFERENT NUMBER",
+                 "DIFFERENT NATOM", "ATOMIC GUESS", "COULD NOT READ",
+                 "CANNOT READ", "NOT FOUND", "IGNORED", "RETURNING")
     with open(log_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             up = line.upper()
@@ -1121,6 +1125,9 @@ def check_restart_reading(log_path: str, wfn_name: str = "") -> dict:
                 res["mentioned"] = True
             if any(k in up for k in warn_keys) and ("RESTART" in up or "WFN" in up or
                                                    "WAVEFUNCTION" in up or "GUESS" in up):
+                res["warnings"].append(line.strip())
+            elif "WARNING" in up and "READ RESTART" in up:
+                # "READ RESTART : WARNING : ..." — предупреждение без наших ключей
                 res["warnings"].append(line.strip())
     return res
 

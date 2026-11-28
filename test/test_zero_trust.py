@@ -724,14 +724,14 @@ def chain_tests():
 
         reward = chain.build_transfer(tmp, {master}, worker, master,
                                       chain.REWARD_VALUE, 1, height=2,
-                                      fee=chain.TX_FEE)
+                                      fee=chain.DEFAULT_FEE)
         check("перевод 25 воркеру собирается", reward is not None
               and any(o["address"] == worker and o["value"] == chain.REWARD_VALUE
                       for o in reward["outputs"]))
 
         utxo = chain.utxo_set(tmp)
         fee = chain.tx_fee(reward, utxo)
-        check("комиссия = входы − выходы", fee == chain.TX_FEE, fee)
+        check("комиссия = входы − выходы", fee == chain.DEFAULT_FEE, fee)
         chain.sign_transaction(reward, wallet, utxo)
         check("входы подписаны Ed25519",
               all(i.get("signature") and i.get("public_key") for i in reward["inputs"]))
@@ -777,7 +777,7 @@ def chain_tests():
         # --- мемпул: сборка и проверка перевода ---
         to_addr = "c" * 64
         tx = chain.build_wallet_transfer(wallet, tmp, to_addr, 10.0,
-                                         fee=chain.TX_FEE, confirmations=1, height=3)
+                                         fee=chain.DEFAULT_FEE, confirmations=1, height=3)
         check("кошелёк собрал перевод",
               tx is not None and any(o["address"] == to_addr for o in tx["outputs"]))
         ok_tx, probs = chain.validate_tx(tx, tmp, height=3, confirmations=1)
@@ -803,7 +803,7 @@ def chain_tests():
             main.MEMPOOL[tx["txid"]] = tx
             inc, mem_fee = main._drain_mempool(chain.utxo_set(tmp), 3, 1)
             check("мемпул включён в блок",
-                  len(inc) == 1 and abs(mem_fee - chain.TX_FEE) < 1e-9
+                  len(inc) == 1 and abs(mem_fee - chain.DEFAULT_FEE) < 1e-9
                   and not main.MEMPOOL, mem_fee)
         finally:
             main.CONFIG["output_dir"] = saved_out
@@ -1509,6 +1509,170 @@ def money_int_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def audit3_tests():
+    print("\n--- 37. Аудит 3: F1-F9 ---")
+    import zipfile
+
+    tmp = tempfile.mkdtemp(prefix="audit3_")
+    saved = {k: main.CONFIG.get(k) for k in
+             ("output_dir", "element", "composition", "formula_size", "atom_diameter")}
+    old_verify = cp2k_runner.verify_state_from_wfn
+    old_sync = main.sync_all_peers
+    seen = {}
+    try:
+        edir = os.path.join(tmp, "Cu")
+        os.makedirs(edir, exist_ok=True)
+        main.CONFIG.update({"output_dir": edir, "element": "Cu",
+                            "composition": {"Cu": 1}, "formula_size": 1,
+                            "atom_diameter": 2.56})
+
+        # ---------- F1: сжатый blob обязан быть распакован для CP2K ----------
+        wfn = os.path.join(tmp, "state.wfn")
+        with open(wfn, "wb") as f:
+            f.write(b"CP2K-WFN" + b"\x00" * 20000)     # хорошо сжимается
+        sha, rel = chain.store_blob(edir, wfn)
+        stored = chain.blob_path(edir, rel)
+        with open(stored, "rb") as f:
+            is_gz = f.read(2) == b"\x1f\x8b"
+
+        issued = main._issue_geometry({"n_atoms": 2, "dim": chain.consensus.dim_for_height(0),
+                                       "nonce": 11})
+        dft = {"energy_ev": -123.456, "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
+               "geometry": issued["coords"], "species": issued["species"]}
+        bpath = chain.write_block(
+            edir, "Cu", 2, sha, rel,
+            [chain.make_coinbase(1, "a" * 64)],
+            cp2k_version="2024.3", cp2k_build="test",
+            cp2k_params=dict(cp2k_runner.CP2K_PARAMS), dft=dft, nonce=11,
+            atom_diameter=2.56, composition={"Cu": 1})
+
+        def fake_verify(coords, wfn_path, cfg, project=None):
+            # что именно получил CP2K: gzip-байты или распакованный файл?
+            with open(wfn_path, "rb") as f:
+                head = f.read(2)
+            seen["gz"] = (head == b"\x1f\x8b")
+            seen["sha"] = chain.sha256_file(wfn_path)
+            return {"ok": True, "energy_ev": -123.456, "gap": 0.5, "mag": 0.0,
+                    "props": {}, "scf": {"converged": True}}
+
+        cp2k_runner.verify_state_from_wfn = fake_verify
+        with open(bpath, "rb") as f:
+            block_bytes = f.read()
+        os.remove(bpath)     # «чужой» блок приходит на пустую цепочку
+        ok, why = main._accept_peer_block("http://127.0.0.1:1", 1,
+                                          chain.ZERO_HASH, block_bytes)
+        check("F1: блок пира со сжатым blob принят", ok, why[:2])
+        check("F1: CP2K получил РАСПАКОВАННЫЙ wfn", seen.get("gz") is False, seen)
+        check("F1: распакованный wfn совпадает по sha", seen.get("sha") == sha, seen)
+        check("F1: blob на диске действительно сжат", is_gz)
+
+        # ---------- F2: мастер не задаёт exec/пути ----------
+        cfg = worker._local_cfg(
+            {"element": "Cu", "potential": "GTH-PBE-q11",
+             "cp2k_cmd": "sh -c id", "output_dir": "/etc",
+             "cp2k_timeout_sec": 1, "composition": {"Cu": 1}},
+            tmp, os.path.join(tmp, "res"))
+        check("F2: cp2k_cmd не из задания",
+              cfg["cp2k_cmd"] == worker.LOCAL_CP2K_CMD and cfg["cp2k_cmd"] != "sh -c id",
+              cfg["cp2k_cmd"])
+        check("F2: output_dir под results воркера",
+              cfg["output_dir"] == os.path.join(tmp, "res", "Cu"), cfg["output_dir"])
+        check("F2: таймаут локальный", cfg["cp2k_timeout_sec"] != 1)
+        for bad_cfg, name in (
+            ({"element": "Cu", "potential": "GTH; &END"}, "потенциал-инъекция"),
+            ({"element": "../../etc", "potential": "GTH-PBE-q11"}, "имя системы с .."),
+            ({"element": "Cu", "potential": "GTH-PBE-q11",
+              "composition": {"Cu\n&END": 1}}, "состав-инъекция"),
+        ):
+            try:
+                worker._local_cfg(bad_cfg, tmp, os.path.join(tmp, "res"))
+                check(f"F2: {name} отклонена", False)
+            except Exception:
+                check(f"F2: {name} отклонена", True)
+
+        # ---------- F3: announce single-flight ----------
+        main._SYNC_ACTIVE.clear()
+        main._ANNOUNCE_LAST = 0.0
+        calls = []
+
+        def fake_sync():
+            calls.append(time.time())
+            time.sleep(0.2)
+
+        main.sync_all_peers = fake_sync
+        started = sum(1 for _ in range(50) if main._start_sync("test"))
+        time.sleep(0.4)
+        check("F3: 50 запросов → один поток синка", started == 1 and len(calls) <= 1,
+              (started, len(calls)))
+
+        # ---------- F4: квоты и обрезка incoming ----------
+        main._STATE_HITS.clear()
+        check("F4: квота на воркера соблюдается",
+              main._state_quota_ok("w1", main.STATE_QUOTA_BYTES_HOUR - 10)
+              and not main._state_quota_ok("w1", 100))
+        d = main._incoming_dir()
+        for i in range(3):
+            p = os.path.join(d, f"old{i}.wfn")
+            with open(p, "wb") as f:
+                f.write(b"x" * 1000)
+            os.utime(p, (time.time() - 100 + i, time.time() - 100 + i))
+        removed = main._incoming_trim(max_bytes=1500)
+        check("F4: каталог обрезается по размеру", removed >= 1 and
+              sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d)) <= 1500,
+              removed)
+
+        # ---------- F6: предупреждение CP2K о несовместимом restart ----------
+        log = os.path.join(tmp, "cp2k.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(" READ RESTART : WARNING : DIFFERENT natom, returning 2 "
+                    "density matrix elements\n")
+        r = cp2k_runner.check_restart_reading(log)
+        check("F6: 'READ RESTART : WARNING' ловится", bool(r["warnings"]), r)
+
+        # ---------- F8: битый блок не выпадает молча ----------
+        chain.BROKEN_BLOCKS.clear()
+        bad = os.path.join(chain.blocks_dir(edir), "000009_Cu_2.zip")
+        with open(bad, "wb") as f:
+            f.write(b"not a zip")
+        chain.utxo_set(edir)
+        check("F8: битый блок помечен", bad in chain.BROKEN_BLOCKS, chain.BROKEN_BLOCKS)
+        chain.BROKEN_BLOCKS.clear()
+        os.remove(bad)
+
+        # ---------- F9: короткий пароль при смене ----------
+        conn = wallet_store.open_db(os.path.join(tmp, "keys.db"))
+        w = wallet_store.create_wallet(conn, "pwtest", "root")
+        try:
+            w.change_password("root", "x")
+            check("F9: смена пароля короче минимума отклонена", False)
+        except wallet_store.WalletError:
+            check("F9: смена пароля короче минимума отклонена", True)
+
+        # ---------- комиссия: любая, не консенсус ----------
+        utxo = {("a" * 64, 0): {"value": 1000, "address": "b" * 64,
+                                "height": 1, "coinbase": False}}
+        for fee, name in ((0, "нулевая"), (1, "минимальная"), (999, "большая")):
+            tx = {"version": 1, "type": "transfer",
+                  "inputs": [{"txid": "a" * 64, "vout": 0}],
+                  "outputs": [{"value": 1000 - fee, "address": "c" * 64}]}
+            tx["txid"] = chain.txid_of(tx)
+            ok, probs = chain.validate_tx(tx, edir, height=10, confirmations=0,
+                                          utxo=dict(utxo))
+            check(f"комиссия {fee} ({name}) — валидна",
+                  not any("сумма" in p for p in probs), probs)
+        check("комиссия не в консенсусе: TX_FEE нет в consensus",
+              not hasattr(chain.consensus, "TX_FEE")
+              and chain.DEFAULT_FEE == 100_000)
+    finally:
+        cp2k_runner.verify_state_from_wfn = old_verify
+        main.sync_all_peers = old_sync
+        main._SYNC_ACTIVE.clear()
+        chain.BROKEN_BLOCKS.clear()
+        main._STATE_HITS.clear()
+        main.CONFIG.update(saved)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2033,6 +2197,7 @@ def _run_tests():
     master_geometry_tests()
     ready_binding_tests()
     money_int_tests()
+    audit3_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()

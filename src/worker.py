@@ -19,6 +19,7 @@ RESTART_VERIFY_SCF шагов.
 
 import hashlib
 import os
+import re
 import sys
 import time
 import json
@@ -74,6 +75,64 @@ def setup_logger(worker_id: str, log_dir: str):
     logger.addHandler(ch)
 
     return logger
+
+
+# Что мастер НЕ имеет права задавать воркеру: исполняемый файл, таймауты и
+# каталоги. Иначе мастер (или подменённый адрес мастера) присылает
+# cp2k_cmd = "sh -c id" и получает выполнение команд на машине воркера.
+LOCAL_CP2K_CMD = os.environ.get("CP2K_CMD") or "cp2k"
+LOCAL_CP2K_TIMEOUT = int(os.environ.get("WORKER_CP2K_TIMEOUT") or 86400)
+_SYMBOL_RE = re.compile(r"^[A-Z][a-z]?$")
+
+
+def _local_cfg(task_cfg: dict, project_root: str, results_root: str,
+               verbose: bool | None = None) -> dict:
+    """
+    Конфиг задания для CP2K: физика — от мастера, исполнение — своё.
+
+    От мастера берём только то, что определяет расчёт: элемент/систему,
+    псевдопотенциал (сверенный со справочником), состав, заряд,
+    мультиплетность, профиль сети и E_iso. Всё, что касается запуска
+    процессов и путей, задаётся локально.
+    """
+    import cp2k_runner
+
+    cfg = dict(task_cfg or {})
+    element = str(cfg.get("element") or "")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,63}", element):
+        raise ValueError(f"недопустимое имя системы: {element!r}")
+
+    # псевдопотенциал: только из справочника (строка уходит в CP2K-ввод)
+    potential = str(cfg.get("potential") or "")
+    if potential not in set(cp2k_runner.PSEUDOPOTENTIALS.values()):
+        raise ValueError(f"неизвестный псевдопотенциал: {potential!r}")
+
+    # виды атомов: только химические символы из справочника
+    species = cfg.get("species")
+    if isinstance(species, list):
+        for sym in species:
+            if not isinstance(sym, str) or not _SYMBOL_RE.match(sym) \
+                    or sym not in cp2k_runner.PSEUDOPOTENTIALS:
+                raise ValueError(f"недопустимый вид атома в задании: {sym!r}")
+
+    comp = cfg.get("composition")
+    if isinstance(comp, dict):
+        for sym, cnt in comp.items():
+            if not isinstance(sym, str) or not _SYMBOL_RE.match(sym) \
+                    or sym not in cp2k_runner.PSEUDOPOTENTIALS:
+                raise ValueError(f"недопустимый элемент состава: {sym!r}")
+            if type(cnt) is not int or cnt < 1:
+                raise ValueError(f"неверное количество {sym}: {cnt!r}")
+
+    # локальное исполнение: команда, таймаут, каталоги — свои
+    out_dir = os.path.join(results_root, element)
+    cfg["cp2k_cmd"] = LOCAL_CP2K_CMD
+    cfg["cp2k_timeout_sec"] = LOCAL_CP2K_TIMEOUT
+    cfg["output_dir"] = out_dir
+    cfg["failed_ids_file"] = os.path.join(out_dir, f"{element}_failed_ids.txt")
+    if verbose is not None:
+        cfg["verbose_cp2k"] = bool(verbose)
+    return cfg
 
 
 def _sha256_file(path: str) -> str:
@@ -583,11 +642,10 @@ def main():
                 struct_id = task["struct_id"]
                 n_atoms = int(task["n_atoms"])
                 dim = int(task.get("dim", 3))
-                cfg = task["cfg"]
-
-                # Рабочий каталог воркера (кэш CP2K: inp/out/json).
-                # В Docker контейнеры монтируют одну и ту же папку проекта,
-                # поэтому путь совпадает с results/<element> мастера.
+                # Физика — из задания, исполнение — локальное (см. _local_cfg):
+                # мастер не должен выбирать бинарник и каталоги воркера.
+                cfg = _local_cfg(task["cfg"], project_root, results_root,
+                                 verbose=args.verbose)
                 os.makedirs(cfg["output_dir"], exist_ok=True)
 
                 logger.info(f"Получено задание {struct_id}: элемент {cfg['element']} "

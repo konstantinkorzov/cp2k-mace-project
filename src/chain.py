@@ -51,7 +51,10 @@ DFT_NAME = "dft.json"
 # (NaN/округление). Любая сумма обязана быть int.
 COINBASE_VALUE = consensus.COINBASE_VALUE
 REWARD_VALUE = consensus.REWARD_VALUE
-TX_FEE = consensus.TX_FEE           # комиссия за перевод (входы − выходы), int
+# Комиссия по умолчанию для кошелька — ПОЛИТИКА, не консенсус.
+# Любая комиссия (включая 0) валидна, если входы ≥ выходов; консенсус
+# ограничивает только coinbase (≤ субсидии + комиссий блока).
+DEFAULT_FEE = 100_000
 # Консенсусный предел переводов в блоке: блок не должен расти безгранично,
 # иначе «дорогие первыми» в мемпуле не имеет смысла.
 MAX_TXS_PER_BLOCK = consensus.MAX_TXS_PER_BLOCK
@@ -409,6 +412,11 @@ def read_block_txs(path: str) -> list[dict]:
     return txs
 
 
+# Блоки, которые не читаются (битый zip, обрыв записи). Молча выпадать из
+# UTXO-множества они не должны: мастер собрал бы блок на неверном взгляде.
+BROKEN_BLOCKS: set[str] = set()
+
+
 def utxo_set(element_dir: str) -> dict:
     """
     Текущее множество непотраченных выходов: (txid, vout) -> {value, address, height, coinbase}.
@@ -417,7 +425,10 @@ def utxo_set(element_dir: str) -> dict:
     for b in list_blocks(element_dir):
         try:
             txs = read_block_txs(b["path"])
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            BROKEN_BLOCKS.add(b["path"])
+            print(f"[Chain] ✗ блок {b['name']} не читается ({e}) — "
+                  f"новые блоки строить нельзя, нужен verify_chain/восстановление")
             continue
         for tx in txs:
             txid = tx.get("txid") or txid_of(tx)
@@ -454,7 +465,7 @@ def build_transfer(element_dir: str, from_addresses: set[str], to_address: str,
                    change_address: str, value: int = REWARD_VALUE,
                    confirmations: int = DEFAULT_CONFIRMATIONS,
                    height: int | None = None,
-                   fee: int = TX_FEE,
+                   fee: int = DEFAULT_FEE,
                    exclude: set[tuple[str, int]] | None = None) -> dict | None:
     """
     Собирает перевод `value` монет на `to_address` с подтверждённых выходов
@@ -554,7 +565,7 @@ def validate_tx(tx: dict, element_dir: str, height: int | None = None,
 
 
 def build_wallet_transfer(wallet, element_dir: str, to_address: str,
-                          value: int, fee: int = TX_FEE,
+                          value: int, fee: int = DEFAULT_FEE,
                           confirmations: int = DEFAULT_CONFIRMATIONS,
                           height: int | None = None,
                           exclude: set[tuple[str, int]] | None = None) -> dict | None:

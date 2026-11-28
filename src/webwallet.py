@@ -504,7 +504,7 @@ def main() -> int:
     ap.add_argument("--confirmations", type=int, default=None)
     ap.add_argument("--to", default=None)
     ap.add_argument("--amount", type=int, default=0)
-    ap.add_argument("--fee", type=int, default=chain.TX_FEE)
+    ap.add_argument("--fee", type=int, default=chain.DEFAULT_FEE)
     ap.add_argument("--change-to", default=None)
     ap.add_argument("--txid", default=None)
     ap.add_argument("--master", action="append", default=None)

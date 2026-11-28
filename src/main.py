@@ -507,13 +507,12 @@ def task_cfg_payload(cfg) -> dict:
     return {
         "element": cfg["element"],
         "potential": cfg["potential"],
-        "cp2k_cmd": cfg["cp2k_cmd"],
-        "cp2k_timeout_sec": int(cfg.get("cp2k_timeout_sec") or 3600),
+        # Команда запуска, таймауты и каталоги НЕ передаются: воркер берёт
+        # свои (src/worker.py::_local_cfg). Иначе мастер мог бы заставить
+        # воркер выполнить произвольную команду и писать в чужой каталог.
         "verbose_cp2k": cfg["verbose_cp2k"],
         "hartree_to_ev": cfg["hartree_to_ev"],
         "hartree_bohr_to_ev_ang": cfg["hartree_bohr_to_ev_ang"],
-        "output_dir": cfg["output_dir"],
-        "failed_ids_file": cfg["failed_ids_file"],
         # единственный параметр генерации: диаметр атома (min/max_dist — константы
         # structure_generator: min_dist = diameter, max_dist = 2*diameter)
         "atom_diameter": cfg["atom_diameter"],
@@ -611,6 +610,56 @@ def _incoming_state_path(sha) -> str | None:
         return None
     path = os.path.join(_incoming_dir(), f"{sha}.wfn")
     return path if os.path.exists(path) else None
+
+
+# Квоты на загрузку состояний: без них один воркер льёт гигабайты в минуты.
+STATE_RATE_SEC = 10.0                    # не чаще одного состояния в 10 с
+STATE_QUOTA_BYTES_HOUR = 2 * 1024 ** 3   # 2 ГБ в час на воркера
+INCOMING_MAX_BYTES = 4 * 1024 ** 3       # 4 ГБ на каталог incoming
+_STATE_HITS: dict[str, list[tuple[float, int]]] = {}
+_STATE_LOCK = threading.Lock()
+
+
+def _state_quota_ok(worker_id: str, size: int) -> bool:
+    now = time.time()
+    with _STATE_LOCK:
+        hits = [(t, n) for t, n in _STATE_HITS.get(str(worker_id), [])
+                if now - t < 3600]
+        total = sum(n for _t, n in hits) + int(size)
+        if total > STATE_QUOTA_BYTES_HOUR:
+            _STATE_HITS[str(worker_id)] = hits
+            return False
+        hits.append((now, int(size)))
+        _STATE_HITS[str(worker_id)] = hits
+        if len(_STATE_HITS) > 4096:
+            for k, v in list(_STATE_HITS.items()):
+                if not v or now - v[-1][0] > 3600:
+                    _STATE_HITS.pop(k, None)
+    return True
+
+
+def _incoming_trim(max_bytes: int = INCOMING_MAX_BYTES) -> int:
+    """Удаляет самые старые загрузки, пока каталог не влезет в лимит."""
+    d = _incoming_dir()
+    files = []
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        try:
+            files.append((os.path.getmtime(p), os.path.getsize(p), p))
+        except OSError:
+            pass
+    total = sum(size for _m, size, _p in files)
+    removed = 0
+    for _mtime, size, p in sorted(files):
+        if total <= max_bytes:
+            break
+        try:
+            os.remove(p)
+            total -= size
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _incoming_sweep(max_age_sec: int = 6 * 3600) -> int:
@@ -936,6 +985,13 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
 
 def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
                        info: dict | None = None) -> str | None:
+    """Собирает блок под CHAIN_LOCK: не пересекается с реоргом и с пиром."""
+    with CHAIN_LOCK:
+        return _write_chain_block_inner(task_data, payload, verdict, info=info)
+
+
+def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
+                             info: dict | None = None) -> str | None:
     """
     Кладёт проверенный результат в блокчейн-блок: blob + подписанные UTXO-транзакции.
 
@@ -992,6 +1048,16 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
         return None
     if cu["accepted"]:
         print(f"[Master] догнал сеть: высота {cu['height']} (принято {cu['accepted']} блоков)")
+
+    # Битый блок в цепочке = неверный UTXO-взгляд: свой блок соберётся, но
+    # пиры его отвергнут (или он сам себя не пройдёт). Лучше не писать вовсе.
+    broken = [p for p in chain_mod.BROKEN_BLOCKS
+              if os.path.dirname(p) == chain_mod.blocks_dir(CONFIG["output_dir"])]
+    if broken:
+        print(f"[Master] ✗ есть нечитаемые блоки ({len(broken)}), блок не собираю: "
+              f"{os.path.basename(broken[0])}; запустите verify_chain")
+        _fail("в цепочке есть нечитаемый блок")
+        return None
 
     seq = chain_mod.next_seq(CONFIG["output_dir"])
     worker_address = (registered_workers.get(w_id) or {}).get("pubkey_hash")
@@ -1311,6 +1377,10 @@ async def _admin_guard(request, call_next):
     return await call_next(request)
 
 task_queue_lock = threading.RLock()   # RLock: блок пишется под этим же lock, а внутри зовётся _sync_stage()
+# Отдельный lock на МУТАЦИИ ЦЕПОЧКИ: запись своего блока, приём блока пира,
+# реорг. Порядок захвата — всегда task_queue_lock → CHAIN_LOCK; реорг держит
+# только CHAIN_LOCK и очередь не берёт, поэтому цикла ожидания нет.
+CHAIN_LOCK = threading.RLock()
 pending_tasks = []      # Список нерешенных структур
 active_tasks = {}       # struct_id -> {"task": dict, "time_sent": float, "worker_id": str}
 verifying_tasks = set() # struct_id, результаты которых проверяются прямо сейчас
@@ -2132,6 +2202,7 @@ async def submit_state(request: Request, worker_id: str, session: str,
     if not isinstance(struct_id, str) or not STRUCT_ID_RE.match(struct_id):
         raise HTTPException(status_code=400, detail="недопустимый struct_id")
 
+    _rate_limit("state", str(worker_id), STATE_RATE_SEC)
     n = int(consensus.stage_for_height(
         chain_mod.next_seq(CONFIG["output_dir"]) - 1)["n_atoms"])
     limit = consensus.max_state_bytes(n)
@@ -2139,6 +2210,10 @@ async def submit_state(request: Request, worker_id: str, session: str,
     if declared and declared.isdigit() and int(declared) > limit:
         raise HTTPException(status_code=413,
                             detail=f"файл состояния больше {limit} байт (n={n})")
+    if declared and declared.isdigit() and not _state_quota_ok(
+            str(worker_id), int(declared)):
+        raise HTTPException(status_code=429,
+                            detail="квота загрузок состояния исчерпана")
 
     tmp = os.path.join(_incoming_dir(), f"{os.urandom(8).hex()}.part")
     h = hashlib.sha256()
@@ -2171,6 +2246,16 @@ async def submit_state(request: Request, worker_id: str, session: str,
         raise HTTPException(status_code=500, detail=str(e))
 
     _incoming_sweep()
+    if not _state_quota_ok(str(worker_id), int(total)):
+        try:
+            os.remove(os.path.join(_incoming_dir(), f"{sha}.wfn"))
+        except OSError:
+            pass
+        raise HTTPException(status_code=429,
+                            detail="квота загрузок состояния исчерпана")
+    removed = _incoming_trim()
+    if removed:
+        print(f"[Master] incoming: удалено {removed} старых загрузок (лимит каталога)")
     print(f"[Master] ⇪ состояние от {worker_id}: {struct_id}, {total} байт, "
           f"sha {sha[:12]}…")
     return {"status": "ok", "sha256": sha, "size": total}
@@ -2530,7 +2615,7 @@ def _accept_peer_block(peer: str, seq: int, head: str,
         accepted = False
         try:
             if not os.path.exists(blob_path):
-                if _fetch_blob(peer, sha, n_atoms) is None:
+                if _fetch_blob(peer, sha, expected_n) is None:
                     return False, [f"пир не отдал blob {sha[:12]}…"]
                 created_blob = True
 
@@ -2540,13 +2625,22 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                 return False, v["problems"][:4]
 
             coords = dft.get("geometry")
-            res = cp2k_runner.verify_state_from_wfn(
-                coords, blob_path, CONFIG, project=f"peer_{seq}")
+            # Blob на диске может лежать gzip-ом (store_blob сжимает, если
+            # экономит ≥5%). CP2K не умеет читать gzip: без распаковки он
+            # получает мусор, SCF не сходится и ЛЮБОЙ блок пира отбраковывается —
+            # сеть из двух мастеров не сходится вообще. materialize_blob
+            # отдаёт путь к несжатому файлу (или тот же, если он не сжат).
+            with tempfile.TemporaryDirectory(prefix="peer_wfn_") as wd:
+                raw_wfn = chain_mod.materialize_blob(
+                    element_dir, header["state_path"],
+                    os.path.join(wd, "state.wfn"))
+                res = cp2k_runner.verify_state_from_wfn(
+                    coords, raw_wfn, CONFIG, project=f"peer_{seq}")
             if not res.get("ok"):
                 return False, [f"DFT-проверка: {res.get('reason')}"]
 
             e_block = float(dft.get("energy_ev"))
-            tol_e = consensus.peer_tol_energy_ev(n_atoms)
+            tol_e = consensus.peer_tol_energy_ev(expected_n)
             if abs(res["energy_ev"] - e_block) > tol_e:
                 return False, [f"энергия блока {e_block:.6f} != "
                                f"пересчёт {res['energy_ev']:.6f} eV"]
@@ -2568,9 +2662,14 @@ def _accept_peer_block(peer: str, seq: int, head: str,
                     return False, [f"{key}: в блоке {float(claimed):.6f}, "
                                    f"пересчёт {float(mine):.6f} {unit}"]
 
-            dst = os.path.join(blocks_dir,
-                               chain_mod.block_name(seq, CONFIG["element"], expected_n))
-            shutil.move(path, dst)
+            with CHAIN_LOCK:
+                # Проверка и запись — атомарно: иначе блок, собранный
+                # параллельно, получает тот же seq и перезаписывается.
+                if any(b["seq"] == seq for b in chain_mod.list_blocks(element_dir)):
+                    return False, [f"блок с seq {seq} уже есть"]
+                dst = os.path.join(
+                    blocks_dir, chain_mod.block_name(seq, CONFIG["element"], expected_n))
+                shutil.move(path, dst)
             accepted = True
             print(f"[Peer] ✓ блок {seq} от {peer}: DFT-пересчёт сошёлся "
                   f"(E={res['energy_ev']:.6f} eV), блок записан")
@@ -2618,6 +2717,29 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
     print(f"[Reorg] ветка {peer} длиннее: общий предок {ancestor}, "
           f"догоняю до {remote}")
 
+    # Пока переключаем ветку, новые работы не выдаются (BUSY) и свой блок не
+    # пишется: CHAIN_LOCK сериализует реорг с записью блока в submit-result.
+    BUSY.set()
+    try:
+        with CHAIN_LOCK:
+            return _reorg_locked(peer, ancestor, remote, element_dir)
+    finally:
+        BUSY.clear()
+        # Мемпул вернулся вместе с веткой — чистим уже включённые tx, даже
+        # если реорг сорвался (иначе протухшие tx остаются висеть).
+        try:
+            _prune_mempool("reorg")
+        except Exception as e:  # noqa: BLE001
+            print(f"[Reorg] ! prune: {e}")
+        # Этап мог смениться вместе с высотой; вызывать _sync_stage под
+        # CHAIN_LOCK нельзя — он берёт task_queue_lock (обратный порядок).
+        try:
+            _sync_stage("reorg")
+        except Exception as e:  # noqa: BLE001
+            print(f"[Reorg] ! этап: {e}")
+
+
+def _reorg_locked(peer: str, ancestor: int, remote: int, element_dir: str) -> dict:
     removed, txs = chain_mod.truncate_chain(element_dir, ancestor)
     if removed:
         print(f"[Reorg] откатил {len(removed)} блок(ов) короткой ветки")
@@ -2643,8 +2765,6 @@ def reorg_from_peer(peer: str, ancestor: int, remote: int) -> dict:
                 raise RuntimeError(f"блок {seq}: {'; '.join(why)}")
             accepted += 1
         print(f"[Reorg] ✓ переключился на ветку {peer} (высота {remote})")
-        _prune_mempool("reorg")
-        _sync_stage("reorg")
         return {"accepted": accepted, "errors": []}
     except Exception as e:  # noqa: BLE001
         # Откат: удалить новые блоки и вернуть старые из orphan
@@ -2752,9 +2872,7 @@ def _gossip_loop(interval: int = PEER_GOSSIP_INTERVAL):
         try:
             _gossip_peers()
             if CONFIG.get("peers"):
-                for res in sync_all_peers():
-                    if res.get("accepted"):
-                        print(f"[Peer] {res['peer']}: догнал {res['accepted']} блок(ов)")
+                _start_sync("gossip")
         except Exception as e:  # noqa: BLE001
             print(f"[Peer] gossip ошибка: {e}")
 
@@ -2981,14 +3099,44 @@ class Announce(BaseModel):
     element: str | None = None
 
 
+# ---------- синхронизация: один поток, не чаще раза в N секунд ----------
+# /chain/announce без auth: раньше каждый запрос поднимал свой поток синка,
+# и 300 запросов за секунду давали 301 поток с сокетами к «чёрной дыре».
+ANNOUNCE_MIN_INTERVAL = 3.0
+_ANNOUNCE_LOCK = threading.Lock()
+_ANNOUNCE_LAST = 0.0
+_SYNC_ACTIVE = threading.Event()
+
+
+def _start_sync(reason: str) -> bool:
+    """Запускает sync_all_peers в одном потоке (single-flight + кулдаун)."""
+    global _ANNOUNCE_LAST
+    now = time.time()
+    with _ANNOUNCE_LOCK:
+        if _SYNC_ACTIVE.is_set() or now - _ANNOUNCE_LAST < ANNOUNCE_MIN_INTERVAL:
+            return False
+        _ANNOUNCE_LAST = now
+        _SYNC_ACTIVE.set()
+
+    def run():
+        try:
+            sync_all_peers()
+        finally:
+            _SYNC_ACTIVE.clear()
+
+    threading.Thread(target=run, daemon=True, name=f"sync:{reason}").start()
+    return True
+
+
 @app.post("/chain/announce")
 def chain_announce(a: Announce):
     if a.element and a.element != CONFIG["element"]:
         return {"ok": False, "reason": "element mismatch"}
     local, _ = _local_head()
+    started = False
     if a.height > local:
-        threading.Thread(target=sync_all_peers, daemon=True).start()
-    return {"ok": True, "local": local}
+        started = _start_sync("announce")
+    return {"ok": True, "local": local, "sync_started": started}
 
 
 # =====================================================================
