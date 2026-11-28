@@ -170,21 +170,26 @@
         </p>
         <div class="row">
           <div>
+            <label>Элемент</label>
+            <select id="m-element">
+              <option value="Au">Золото (Au)</option>
+              <option value="Ag">Серебро (Ag)</option>
+              <option value="Cu" selected>Медь (Cu)</option>
+              <option value="Fe">Железо (Fe)</option>
+              <option value="Al">Алюминий (Al)</option>
+              <option value="__config__">Config.json — свой состав</option>
+            </select>
+          </div>
+          <div>
             <label>Порт (пусто = авто)</label>
             <input type="number" id="m-port" placeholder="авто" min="1" max="65535" />
           </div>
-          <div>
-            <label>Кошелёк (имя)</label>
-            <select id="m-wallet"></select>
-          </div>
-          <div>
-            <label>Пароль кошелька</label>
-            <input type="password" id="m-wallet-pass" />
-          </div>
         </div>
         <p class="muted" style="margin:2px 0 0">
-          Кошелёк создаётся на вкладке «Кошелёк» — сам он не появится, и мастер
-          без него не стартует.
+          Два клика: выбрать элемент → «Запустить». Составные системы (Al₂O₃,
+          NaCl) задаются в <code>src/config.json</code> вручную — пункт
+          «Config.json». Кошелёк мастер берёт тот, что открыт на вкладке
+          «Кошелёк» (ему нужен адрес для эмиссии).
         </p>
         <div class="actions">
           <button class="btn" id="btn-master-start">Запустить мастера</button>
@@ -240,15 +245,11 @@
             <label>Имя процесса</label>
             <input type="text" id="w-name" placeholder="авто: worker1, worker2…" />
           </div>
-          <div>
-            <label>Кошелёк (имя)</label>
-            <select id="w-wallet"></select>
-          </div>
-          <div>
-            <label>Пароль кошелька</label>
-            <input type="password" id="w-wallet-pass" />
-          </div>
         </div>
+        <p class="muted" style="margin:2px 0 0">
+          Кошелёк воркер берёт с вкладки «Кошелёк»: адрес нужен, чтобы получить
+          награду за блок, а подпись ключа — чтобы мастер выдал задачу.
+        </p>
 
         <h3>Адреса мастеров в сети</h3>
         <p class="muted" style="margin:2px 0 6px">
@@ -652,19 +653,32 @@ $('#mace-log-refresh').addEventListener('click', () => pollLog('mace'));
 
 $('#btn-master-start').addEventListener('click', async () => {
   const btn = $('#btn-master-start');
+  const msg = $('#m-msg');
+  if (!openedWallet) {
+    msg.innerHTML = '<span class="err">сначала откройте кошелёк на вкладке «Кошелёк»</span>';
+    return;
+  }
+  const element = $('#m-element').value;
+  if (element === '__config__') {
+    // свой состав: панель ничего не перезаписывает, мастер прочтёт config.json
+    if (!confirm('Мастер будет запущен с составом из src/config.json. Продолжить?')) return;
+  }
   btn.disabled = true;
-  $('#m-msg').textContent = 'запускаю…';
+  msg.textContent = 'запускаю…';
   const r = await api('/api/master/start', {
     port: $('#m-port').value || null,
-    wallet: $('#m-wallet').value || '',
-    password: $('#m-wallet-pass').value || '',
+    element: element === '__config__' ? null : element,
+    wallet: openedWallet.name,
+    password: openedWallet.password,
   });
   btn.disabled = false;
   if (r.ok) {
-    $('#m-msg').innerHTML = `<span class="ok">порт ${r.process.port}, папка ${esc((r.process.dir || '').replace(overview.root + '/', ''))}</span>`;
+    msg.innerHTML = `<span class="ok">${esc(r.process.element || '')} · порт ${r.process.port}, `
+      + `папка ${esc((r.process.dir || '').replace(overview.root + '/', ''))}</span>`;
     refreshOverview();
+    loadConfigForm('master');
   } else {
-    $('#m-msg').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+    msg.innerHTML = `<span class="err">${esc(r.error)}</span>`;
   }
 });
 
@@ -732,10 +746,15 @@ $('#btn-worker-start').addEventListener('click', async () => {
   }
   btn.disabled = true;
   $('#w-msg').textContent = 'запускаю…';
+  if (!openedWallet) {
+    btn.disabled = false;
+    $('#w-msg').innerHTML = '<span class="err">сначала откройте кошелёк на вкладке «Кошелёк»</span>';
+    return;
+  }
   const r = await api('/api/worker/start', {
     name: $('#w-name').value.trim() || null,
-    wallet: $('#w-wallet').value || '',
-    password: $('#w-wallet-pass').value || '',
+    wallet: openedWallet.name,
+    password: openedWallet.password,
     masters,
     verbose: $('#w-verbose').checked,
   });
@@ -926,6 +945,10 @@ async function refreshWalletNames(ids, root) {
   return list;
 }
 
+// Кошелёк, открытый на вкладке «Кошелёк»: его используют мастер и воркер.
+// Пароль хранится только в памяти страницы, на диск не пишется.
+let openedWallet = null;
+
 async function openWallet() {
   const name = document.getElementById('wal-name').value;
   const password = document.getElementById('wal-password').value;
@@ -946,6 +969,7 @@ async function openWallet() {
     return;
   }
   walletState = data;
+  openedWallet = { name, password };
   document.getElementById('wal-send-card').style.display = 'block';
   if (data.chains) applyChains(data.chains, data.element);
   renderWallet(data);
@@ -970,7 +994,7 @@ async function createWallet() {
   box.innerHTML = `<span class="ok">кошелёк «${esc(r.name)}» создан, адрес ${esc(String(r.address).slice(0, 16))}…</span>`;
   document.getElementById('wal-new-name').value = '';
   document.getElementById('wal-new-pass').value = '';
-  await refreshWalletNames(['wal-name', 'm-wallet', 'w-wallet'],
+  await refreshWalletNames(['wal-name'],
                            document.getElementById('wal-root').value || null);
   document.getElementById('wal-name').value = r.name;
   document.getElementById('wal-password').value = password;
@@ -1247,8 +1271,11 @@ function fillWalletRoots(dirs) {
 
 /* ==================== настройки (src/config.json) ==================== */
 
-// Эти ключи в настройках мастера не показываем
-const HIDDEN_IN_MASTER = ['port', 'coinbase_confirmations'];
+// Эти ключи в настройках мастера не показываем: либо задаются самим
+// мастером (порт, подтверждения), либо это тонкая настройка под конкретное
+// железо и конкретную систему — её место в src/config.json, а не в панели.
+const HIDDEN_IN_MASTER = ['port', 'coinbase_confirmations', 'charge',
+  'multiplicity', 'restart_max_mb', 'cp2k_timeout_sec', 'task_timeout_sec'];
 
 function configField(key, entry) {
   const wrapped = entry && typeof entry === 'object' && 'value' in entry;
@@ -1351,7 +1378,6 @@ refreshOverview().then(() => {
   $('#wal-root').value = overview.dirs[0] || '';
   refreshChains();
   refreshWalletNames(['wal-name'], $('#wal-root').value || null);
-  refreshWalletNames(['m-wallet', 'w-wallet'], null);
 });
 
 // подсказываем порт мастера из настроек (config.json → port)

@@ -17,6 +17,7 @@ verify_state_payload) и принимает результат, только е�
 RESTART_VERIFY_SCF шагов.
 """
 
+import hashlib
 import os
 import sys
 import time
@@ -73,6 +74,46 @@ def setup_logger(worker_id: str, log_dir: str):
     logger.addHandler(ch)
 
     return logger
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _upload_state(base_url: str, session: str, worker_id: str,
+                  struct_id: str, path: str | None, logger,
+                  timeout: int = 1800) -> str | None:
+    """
+    Заливает -RESTART.wfn на мастер ПОТОКОМ (requests читает файл кусками).
+
+    В JSON состояние не кладём: на кластере это гигабайты base64 в памяти у
+    обеих сторон. Мастер вернёт sha256, его и передаём в /submit-result.
+    """
+    if not path or not os.path.exists(path):
+        logger.warning("нет файла состояния — заливать нечего")
+        return None
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                base_url + "/submit-state",
+                params={"worker_id": worker_id, "session": session,
+                        "struct_id": struct_id},
+                data=f,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=timeout)
+        if r.status_code != 200:
+            logger.warning(f"мастер не принял состояние: HTTP {r.status_code} "
+                           f"{r.text[:200]}")
+            return None
+        sha = str((r.json() or {}).get("sha256") or "")
+        return sha or None
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"ошибка заливки состояния: {e}")
+        return None
 
 
 def _register_once(reg_url: str, name: str, pubkey_hash: str, public_key: str,
@@ -213,8 +254,10 @@ def run_task(task: dict, cfg: dict, logger, verbose: bool | None = None):
         logger.error("CP2K не создал файл состояния (-RESTART.wfn)")
         return False, {"error": True,
                        "message": "CP2K не создал файл состояния (-RESTART.wfn)"}
-    with open(wfn_path, "rb") as f:
-        wfn_bytes = f.read()
+    # Файл не читаем в память: размер и хэш считаем потоком, а сам файл
+    # воркер зальёт на мастера отдельным запросом (/submit-state).
+    wfn_size = os.path.getsize(wfn_path)
+    wfn_sha256 = _sha256_file(wfn_path)
 
     data = {
         "geometry": coords.tolist(),
@@ -230,8 +273,9 @@ def run_task(task: dict, cfg: dict, logger, verbose: bool | None = None):
         "elapsed": res.get("elapsed", elapsed),
         "hash": res.get("hash"),
         "wfn_name": os.path.basename(wfn_path),
-        "wfn_b64": base64.b64encode(wfn_bytes).decode("ascii"),
-        "wfn_size": len(wfn_bytes),
+        "wfn_path": wfn_path,          # локальный путь: уйдёт потоком, не в JSON
+        "wfn_sha256": wfn_sha256,
+        "wfn_size": wfn_size,
         # ниже — только телеметрия, мастер её перепроверит сам
         "energy_ev": res["energy_ev"],
         "gap": res.get("gap"),
@@ -259,7 +303,7 @@ def run_task(task: dict, cfg: dict, logger, verbose: bool | None = None):
         parts.append(f"|μ| = {res['dipole_total_debye']:.2e} Д")
     logger.info(
         f"Расчёт {struct_id} СОШЁЛСЯ за {elapsed:.1f} с: " + ", ".join(parts)
-        + f", состояние {len(wfn_bytes)} байт — отправляю мастеру"
+        + f", состояние {wfn_size} байт — отправляю мастеру"
     )
     return True, data
 
@@ -311,7 +355,7 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
                    pubkey_hash: str, struct_id: str, data: dict, logger,
                    attempts: int = 30, delay: int = 10,
                    wallet=None, public_key: str | None = None,
-                   task: dict | None = None):
+                   task: dict | None = None, state_path: str | None = None):
     """
     Ищет мастера, который возьмёт готовый результат (ready):
     GET /work/height (поддерживает ли элемент) → POST /register-worker с
@@ -341,6 +385,15 @@ def deliver_result(masters: list[str], primary: str, element: str, name: str,
                     logger.warning(f"{url}: регистрация с подписью не удалась")
                     continue
                 ready_data = dict(data or {})
+                ready_data.pop("wfn_path", None)
+                if state_path:
+                    # другому мастеру — своя заливка: состояние у него своё
+                    sha = _upload_state(url, reg["session"], reg["worker_id"],
+                                        struct_id, state_path, logger)
+                    if not sha:
+                        logger.warning(f"{url}: состояние не залито")
+                        continue
+                    ready_data["state_sha256"] = sha
                 if task:
                     # Привязка к голове: (prev_id, nonce) — это та самая работа,
                     # которую выдал первый мастер. Без неё новый мастер не может
@@ -547,12 +600,21 @@ def main():
                 else:
                     logger.error(f"Задание {struct_id} не выполнено: {data.get('message')}")
 
+                send_data = {k: v for k, v in data.items() if k != "wfn_path"}
+                if success:
+                    sha = _upload_state(base_url, session, worker_id,
+                                        struct_id, data.get("wfn_path"), logger)
+                    if sha:
+                        send_data["state_sha256"] = sha
+                    else:
+                        logger.warning("состояние не залито — мастер отклонит сдачу")
+
                 payload = {
                     "worker_id": worker_id,
                     "session": session,
                     "struct_id": struct_id,
                     "success": success,
-                    "data": data,
+                    "data": send_data,
                 }
 
                 sub_resp = requests.post(submit_url, json=payload, timeout=60)
@@ -566,7 +628,8 @@ def main():
                         target, res = deliver_result(
                             masters, base_url, cfg["element"], worker_name,
                             pubkey_hash, struct_id, data, logger,
-                            wallet=wallet, public_key=public_key, task=task)
+                            wallet=wallet, public_key=public_key, task=task,
+                            state_path=data.get("wfn_path"))
                         if target:
                             logger.info(f"Готовый результат {struct_id} принят мастером "
                                         f"{target} ({res.get('kept')})")

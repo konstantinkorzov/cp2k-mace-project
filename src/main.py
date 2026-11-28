@@ -39,6 +39,12 @@ import traceback
 import numpy as np
 
 from fastapi import FastAPI, HTTPException
+
+try:                      # оффлайн-тесты подменяют fastapi заглушкой
+    from fastapi import Request
+except Exception:         # noqa: BLE001
+    class Request:        # noqa: D101
+        pass
 import uvicorn
 from pydantic import BaseModel
 
@@ -582,7 +588,7 @@ _NAO_TOTAL: dict[tuple[str, int], int] = {}
 
 
 def _decode_wfn_b64(payload: dict):
-    """Раскодирует присланный файл состояния из payload (base64)."""
+    """Раскодирует присланный файл состояния из payload (base64, старый путь)."""
     raw = payload.get("wfn_b64")
     if not raw:
         return None
@@ -590,6 +596,37 @@ def _decode_wfn_b64(payload: dict):
         return base64.b64decode(raw, validate=False)
     except Exception:
         return None
+
+
+def _incoming_dir() -> str:
+    d = os.path.join(CONFIG["output_dir"], "incoming")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _incoming_state_path(sha) -> str | None:
+    """Путь к состоянию, загруженному через POST /submit-state (по sha256)."""
+    sha = str(sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return None
+    path = os.path.join(_incoming_dir(), f"{sha}.wfn")
+    return path if os.path.exists(path) else None
+
+
+def _incoming_sweep(max_age_sec: int = 6 * 3600) -> int:
+    """Чистит брошенные загрузки: иначе они копятся гигабайтами."""
+    d = _incoming_dir()
+    now = time.time()
+    removed = 0
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        try:
+            if now - os.path.getmtime(p) > max_age_sec:
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _geometry_key(coords, cfg) -> str:
@@ -740,18 +777,25 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
     run_cfg = dict(cfg)
     run_cfg["species"] = cfg_species
 
-    raw = _decode_wfn_b64(payload)
-    if raw is None:
-        return fail("нет файла состояния (wfn_b64)")
-    max_bytes = float(cfg.get("restart_max_mb", 50)) * 1024 * 1024
-    if len(raw) > max_bytes:
-        return fail(f"файл состояния {len(raw)} байт > лимита {max_bytes:.0f}")
-
+    max_bytes = consensus.max_state_bytes(n_atoms)
     workdir = tempfile.mkdtemp(prefix="wfn_recv_")
     try:
-        wfn_path = os.path.join(workdir, "submitted-RESTART.wfn")
-        with open(wfn_path, "wb") as f:
-            f.write(raw)
+        raw = _decode_wfn_b64(payload)
+        if raw is not None:
+            if len(raw) > max_bytes:
+                return fail(f"файл состояния {len(raw)} байт > лимита {max_bytes}")
+            wfn_path = os.path.join(workdir, "submitted-RESTART.wfn")
+            with open(wfn_path, "wb") as f:
+                f.write(raw)
+        else:
+            # Основной путь: воркер залил состояние потоком в /submit-state,
+            # в payload — только sha256. Ни base64, ни копии в памяти.
+            wfn_path = _incoming_state_path(payload.get("state_sha256"))
+            if not wfn_path:
+                return fail("нет файла состояния (state_sha256 или wfn_b64)")
+            size = os.path.getsize(wfn_path)
+            if size > max_bytes:
+                return fail(f"файл состояния {size} байт > лимита {max_bytes}")
 
         head = cp2k_runner.parse_wfn_header(wfn_path)
         if not head["ok"]:
@@ -903,25 +947,31 @@ def _write_chain_block(task_data: dict, payload: dict, verdict: dict,
             info["reason"] = reason
 
     raw = payload.get("wfn_b64")
-    if not raw:
-        print("[Master] ! в payload нет wfn — блок не создан")
-        _fail("в payload нет wfn")
-        return None
-    try:
-        wfn_bytes = base64.b64decode(raw)
-    except Exception as e:  # noqa: BLE001
-        print(f"[Master] ! wfn_b64 не декодируется: {e}")
-        _fail(f"wfn_b64 не декодируется: {e}")
-        return None
+    wfn_bytes = None
+    if raw:
+        try:
+            wfn_bytes = base64.b64decode(raw)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Master] ! wfn_b64 не декодируется: {e}")
+            _fail(f"wfn_b64 не декодируется: {e}")
+            return None
 
     struct_id = task_data["struct_id"]
     n_atoms = int(task_data["n_atoms"])
     w_id = payload.get("worker_id")
 
     with tempfile.TemporaryDirectory(prefix="chain_block_") as td:
-        wfn_path = os.path.join(td, f"{struct_id}.wfn")
-        with open(wfn_path, "wb") as f:
-            f.write(wfn_bytes)
+        if wfn_bytes is not None:
+            wfn_path = os.path.join(td, f"{struct_id}.wfn")
+            with open(wfn_path, "wb") as f:
+                f.write(wfn_bytes)
+        else:
+            wfn_path = _incoming_state_path(payload.get("state_sha256"))
+            if not wfn_path:
+                print("[Master] ! нет файла состояния — блок не создан")
+                _fail("нет файла состояния (state_sha256)")
+                return None
+        # store_blob сам сжимает (если есть выигрыш) и хэширует НЕсжатые байты
         state_sha, state_rel = chain_mod.store_blob(CONFIG["output_dir"], wfn_path)
 
     wallet = CONFIG.get("wallet")
@@ -1175,12 +1225,24 @@ def _body_limit_bytes() -> int:
     Легитимный wfn ограничен restart_max_mb, base64 даёт 1.33×. Один knob:
     подняли restart_max_mb для 55+ атомов — поднялся и лимит.
     """
-    mb = max(1, int(CONFIG.get("restart_max_mb", 50)))
+    # Бюджет состояния зависит от размера кластера на текущей высоте:
+    # n²-рост wfn означает, что фиксированный «512 МБ» либо режет большие
+    # системы, либо позволяет маленьким запросам съесть память.
+    n = consensus.stage_for_height(
+        chain_mod.next_seq(CONFIG["output_dir"]) - 1)["n_atoms"]
+    mb = max(1, int(consensus.max_state_bytes(n) / (1024 * 1024)))
     return int(mb * 1024 * 1024 * 1.4) + 2 * 1024 * 1024
 
 
 @app.middleware("http")
 async def _body_guard(request, call_next):
+    # /submit-state принимает бинарный wfn потоком: буферизовать его в теле
+    # запроса — ровно та ошибка, от которой мы уходим.
+    try:
+        if (request.url.path or "").rstrip("/").endswith("/submit-state"):
+            return await call_next(request)
+    except Exception:  # noqa: BLE001
+        pass
     if request.method in ("POST", "PUT", "PATCH"):
         limit = _body_limit_bytes()
         declared = request.headers.get("content-length")
@@ -2052,6 +2114,68 @@ def _ready_binding(payload: dict, sid: str):
     return issued, task_data, None
 
 
+@app.post("/submit-state")
+async def submit_state(request: Request, worker_id: str, session: str,
+                       struct_id: str):
+    """
+    Приём файла состояния потоком (application/octet-stream).
+
+    Раньше wfn ехал в base64 внутри JSON: состояние на 0.6 ГБ превращалось в
+    0.8 ГБ текста, который целиком разбирался в память и воркером, и мастером.
+    Здесь тело пишется на диск кусками, хэшируется на лету и ограничено
+    бюджетом состояния для текущего размера кластера.
+
+    Ответ: {"status": "ok", "sha256": ..., "size": ...}. Дальше воркер шлёт
+    state_sha256 в /submit-result.
+    """
+    _auth_worker(worker_id, session)
+    if not isinstance(struct_id, str) or not STRUCT_ID_RE.match(struct_id):
+        raise HTTPException(status_code=400, detail="недопустимый struct_id")
+
+    n = int(consensus.stage_for_height(
+        chain_mod.next_seq(CONFIG["output_dir"]) - 1)["n_atoms"])
+    limit = consensus.max_state_bytes(n)
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(status_code=413,
+                            detail=f"файл состояния больше {limit} байт (n={n})")
+
+    tmp = os.path.join(_incoming_dir(), f"{os.urandom(8).hex()}.part")
+    h = hashlib.sha256()
+    total = 0
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"файл состояния больше {limit} байт (n={n})")
+                h.update(chunk)
+                f.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="пустое тело")
+        sha = h.hexdigest()
+        os.replace(tmp, os.path.join(_incoming_dir(), f"{sha}.wfn"))
+    except HTTPException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    except Exception as e:  # noqa: BLE001
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+    _incoming_sweep()
+    print(f"[Master] ⇪ состояние от {worker_id}: {struct_id}, {total} байт, "
+          f"sha {sha[:12]}…")
+    return {"status": "ok", "sha256": sha, "size": total}
+
+
 class TaskResult(BaseModel):
     worker_id: str
     session: str | None = None   # выдаётся при регистрации с подписью ключа
@@ -2291,31 +2415,46 @@ def _collect_peers(args) -> list[str]:
     return out
 
 
-def _fetch_blob(peer: str, sha: str) -> bytes | None:
-    """Скачивает файл состояния с лимитом размера.
+def _fetch_blob(peer: str, sha: str, n_atoms: int | None = None) -> str | None:
+    """
+    Скачивает файл состояния ПОТОКОМ в blobs/<sha>.wfn и возвращает путь.
 
-    sha обязан быть 64 hex: из него строится имя blobs/<sha>.wfn, иначе
-    "../../x" писал бы файл вне каталога элемента.
+    Раньше blob собирался в память целиком (`b"".join(chunks)`): на кластере
+    из 500 атомов это 0.6 ГБ на каждый приём блока. Теперь — .part и
+    переименование, как у блока. Лимит — от размера кластера, а не константа.
+
+    sha обязан быть 64 hex: из него строится имя файла, иначе "../../x"
+    писал бы вне каталога элемента.
     """
     import re as _re
     if not _re.fullmatch(r"[0-9a-f]{64}", str(sha or "")):
         return None
-    limit = max(1, int(CONFIG.get("restart_max_mb", 50))) * 1024 * 1024
+    limit = consensus.max_state_bytes(n_atoms or 2)
+    dst = os.path.join(chain_mod.blobs_dir(CONFIG["output_dir"]), f"{sha}.wfn")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    part = dst + ".part"
     try:
-        with requests.get(f"{peer}/chain/blob/{sha}", timeout=60, stream=True) as r:
+        with requests.get(f"{peer}/chain/blob/{sha}", timeout=120, stream=True) as r:
             if r.status_code != 200:
                 return None
             declared = r.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > limit:
                 return None
-            chunks, total = [], 0
-            for chunk in r.iter_content(1 << 20):
-                total += len(chunk)
-                if total > limit:
-                    return None
-                chunks.append(chunk)
-            return b"".join(chunks)
+            total = 0
+            with open(part, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    total += len(chunk)
+                    if total > limit:
+                        raise ValueError("blob больше лимита")
+                    f.write(chunk)
+        os.replace(part, dst)
+        return dst
     except Exception:  # noqa: BLE001
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+        except OSError:
+            pass
         return None
 
 
@@ -2386,21 +2525,13 @@ def _accept_peer_block(peer: str, seq: int, head: str,
         if any(b["seq"] == seq for b in chain_mod.list_blocks(element_dir)):
             return False, [f"блок с seq {seq} уже есть"]
 
-        blob = _fetch_blob(peer, sha)
-        if blob is None:
-            return False, [f"пир не отдал blob {sha[:12]}…"]
-
         blob_path = os.path.join(chain_mod.blobs_dir(element_dir), f"{sha}.wfn")
-        os.makedirs(os.path.dirname(blob_path), exist_ok=True)
         created_blob = False
         accepted = False
         try:
             if not os.path.exists(blob_path):
-                # .part + os.replace: никто не увидит недописанный файл
-                part = blob_path + ".part"
-                with open(part, "wb") as f:
-                    f.write(blob)
-                os.replace(part, blob_path)
+                if _fetch_blob(peer, sha, n_atoms) is None:
+                    return False, [f"пир не отдал blob {sha[:12]}…"]
                 created_blob = True
 
             v = chain_mod.verify_block(element_dir, path,

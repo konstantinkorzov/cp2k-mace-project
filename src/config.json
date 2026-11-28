@@ -5,7 +5,7 @@
       "composition": {
         "Cu": 1
       },
-      "atom_diameter": 2.0
+      "atom_diameter": 2.56
     },
     "help": "Что считаем: name — имя системы (каталог results/<name>, поле в header), composition — формульная единица, atom_diameter — диаметр атома (Å), от него min_dist = diameter, max_dist = 2*diameter. Примеры: {'name':'Cu','composition':{'Cu':1},'atom_diameter':2.0}; {'name':'Al2O3','composition':{'Al':2,'O':3},'atom_diameter':1.8}. Элементы должны быть в PSEUDOPOTENTIALS (src/cp2k_runner.py)."
   },

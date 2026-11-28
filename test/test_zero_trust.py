@@ -26,6 +26,7 @@ import json
 import time
 import types
 import base64
+import hashlib
 import shutil
 import logging
 import tempfile
@@ -157,9 +158,13 @@ def worker_tests():
         ok, data = worker.run_task(task, cfg, logger)
         check("задача выполнена", ok, data.get("message", ""))
         check("payload содержит геометрию нужного размера", ok and len(data["geometry"]) == 2)
-        check("payload содержит файл состояния (wfn_b64)",
-              ok and bool(data.get("wfn_b64")) and data.get("wfn_size", 0) > 1000,
-              f"size={data.get('wfn_size')}")
+        check("payload ссылается на файл состояния (путь + sha256)",
+              ok and bool(data.get("wfn_path")) and os.path.exists(data["wfn_path"])
+              and len(data.get("wfn_sha256") or "") == 64
+              and data.get("wfn_size", 0) > 1000,
+              f"size={data.get('wfn_size')} sha={str(data.get('wfn_sha256'))[:12]}")
+        check("base64 в payload нет (не тащим wfn через память)",
+              "wfn_b64" not in (data or {}))
         check("матрицы H/lam/C не шлются", "H" not in data and "C" not in data)
         check("E_iso и E_binding/atom посчитаны",
               data.get("e_isolated_atom_ev") == -1000.0
@@ -178,11 +183,12 @@ def worker_tests():
         check("все атомы внутри ячейки",
               float(np.abs(g - data["cell_size"] / 2.0).max()) <= data["cell_size"] / 2.0)
 
-        decoded = base64.b64decode(data["wfn_b64"])
-        check("состояние раскодируется и разбирается мастером",
+        with open(data["wfn_path"], "rb") as f:
+            state_bytes = f.read()
+        check("состояние читается и разбирается мастером",
               cp2k_runner.parse_wfn_header(
                   os.path.join(cfg["output_dir"], "fake-RESTART.wfn"))["ok"]
-              and len(decoded) == data["wfn_size"])
+              and len(state_bytes) == data["wfn_size"])
 
         # --- несходящийся расчёт: воркер обязан взять новую структуру ---
         bad = dict(
@@ -372,11 +378,12 @@ def restart_tests():
         check("предупреждение о несовместимом restart = отказ", not v4["valid"])
         STATE_CONTROL["warnings"] = []
 
-        # 8) лимит размера файла
-        cfg["restart_max_mb"] = 0.0001
+        # 8) лимит размера файла — бюджет зависит от n (consensus.max_state_bytes)
+        _budget = main.consensus.max_state_bytes
+        main.consensus.max_state_bytes = lambda n: 10
         v5 = main.verify_state_payload(cfg, task, payload)
+        main.consensus.max_state_bytes = _budget
         check("слишком большой файл отклонён", not v5["valid"], v5.get("reason", ""))
-        cfg["restart_max_mb"] = 50
 
         print("\n--- 16. Keep-best по геометрии (набор для MACE) ---")
         v = main.verify_state_payload(cfg, task, payload)
@@ -1477,10 +1484,10 @@ def money_int_tests():
         fee, _ = chain._check_txs([], {}, "t")
         check("_check_txs возвращает int", type(fee) is int, repr(fee))
 
-        # v6: эмиссия пропорциональна числу атомов, делится в coinbase 50/50
-        check("субсидия пропорциональна n",
-              chain.subsidy_for(2) == 50_000_000 and chain.subsidy_for(5) == 125_000_000,
-              (chain.subsidy_for(2), chain.subsidy_for(5)))
+        # v6: эмиссия фиксирована за блок и делится в coinbase 50/50
+        check("субсидия не зависит от n",
+              chain.subsidy_for(2) == 50_000_000 and chain.subsidy_for(55) == 50_000_000,
+              (chain.subsidy_for(2), chain.subsidy_for(55)))
         check("coinbase делится 50/50",
               chain.coinbase_split(2) == (25_000_000, 25_000_000),
               chain.coinbase_split(2))
@@ -1497,6 +1504,49 @@ def money_int_tests():
               all(type(v) is int for r in chain.balances(tmp, {addr}).values()
                   for v in r.values()))
     finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def state_storage_tests():
+    print("\n--- 35. Состояние: бюджет по n, сжатие blob, incoming ---")
+    tmp = tempfile.mkdtemp(prefix="state_")
+    saved = {k: main.CONFIG.get(k) for k in ("output_dir",)}
+    try:
+        b2 = chain.consensus.max_state_bytes(2)
+        b500 = chain.consensus.max_state_bytes(500)
+        check("бюджет состояния растёт с n",
+              b2 == 64 * 1024 * 1024 and b500 > b2, (b2, b500))
+
+        wfn = os.path.join(tmp, "s.wfn")
+        with open(wfn, "wb") as f:
+            f.write(b"CP2K-WFN" + b"\x00" * 200000)
+        sha, rel = chain.store_blob(tmp, wfn)
+        stored = chain.blob_path(tmp, rel)
+        check("blob сжат на диске",
+              os.path.getsize(stored) < os.path.getsize(wfn) * 0.5,
+              (os.path.getsize(stored), os.path.getsize(wfn)))
+        check("sha blob считается от несжатых байт",
+              chain.blob_sha256(tmp, rel) == sha)
+        out = os.path.join(tmp, "out.wfn")
+        chain.materialize_blob(tmp, rel, out)
+        with open(out, "rb") as a, open(wfn, "rb") as b:
+            check("materialize возвращает исходные байты", a.read() == b.read())
+
+        main.CONFIG.update({"output_dir": tmp})
+        incoming = main._incoming_dir()
+        dst = os.path.join(incoming, f"{sha}.wfn")
+        with open(dst, "wb") as f:
+            f.write(b"x")
+        check("incoming находит состояние по sha",
+              main._incoming_state_path(sha) == dst)
+        check("incoming не пускает не-sha",
+              main._incoming_state_path("../../etc/passwd") is None)
+        old = time.time() - 7 * 3600
+        os.utime(dst, (old, old))
+        main._incoming_sweep()
+        check("incoming чистит брошенные загрузки", not os.path.exists(dst))
+    finally:
+        main.CONFIG.update(saved)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1526,7 +1576,14 @@ def reward_format_tests():
                 return [addr]
 
         main.CONFIG["wallet"] = W()
-        payload = {"wfn_b64": wfn_b64, "geometry": issued["coords"],
+        # как после POST /submit-state: файл лежит в incoming, в payload — sha
+        with open(wfn, "rb") as f:
+            state_sha = hashlib.sha256(f.read()).hexdigest()
+        incoming = main._incoming_dir()
+        with open(os.path.join(incoming, f"{state_sha}.wfn"), "wb") as f:
+            with open(wfn, "rb") as src_f:
+                f.write(src_f.read())
+        payload = {"state_sha256": state_sha, "geometry": issued["coords"],
                    "species": issued["species"], "worker_id": "worker_x",
                    "seed": issued["seed"]}
         verdict = {"energy_ev": -1.0,
@@ -1951,6 +2008,7 @@ def _run_tests():
     master_geometry_tests()
     ready_binding_tests()
     money_int_tests()
+    state_storage_tests()
     reward_format_tests()
     build_tests()
     rfc8032_tests()

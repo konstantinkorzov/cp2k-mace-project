@@ -21,6 +21,7 @@ results/<system>/blobs/<sha256>.wfn, а в заголовке — ссылка.
 `confirmations` блоков (по умолчанию 1; меняется в master-cli).
 """
 
+import gzip
 import hashlib
 import io
 import json
@@ -87,19 +88,80 @@ def blobs_dir(element_dir: str) -> str:
     return os.path.join(element_dir, "blobs")
 
 
-def store_blob(element_dir: str, wfn_path: str) -> tuple[str, str]:
+def store_blob(element_dir: str, wfn_path: str, compress: bool = True) -> tuple[str, str]:
     """
     Кладёт файл состояния в blobs/<sha256>.wfn (дедупликация по содержимому).
 
-    :return: (sha256, относительный путь от каталога элемента)
+    Имя и `state_sha256` относятся к НЕсжатому файлу: так хэш проверяем у
+    любого, кто скачал blob. На диске файл может лежать gzip-ом (magic 1f 8b) —
+    сжатие берём, только если экономит хотя бы 5%: wfn это плотные float,
+    выигрыш невелик, и ради 3% усложнять не стоит.
+
+    :return: (sha256 несжатого файла, относительный путь от каталога элемента)
     """
     sha = sha256_file(wfn_path)
     rel = f"blobs/{sha}.wfn"
-    dst = os.path.join(element_dir, "blobs", f"{sha}.wfn")
+    dst = os.path.join(blobs_dir(element_dir), f"{sha}.wfn")
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    if not os.path.exists(dst):
-        shutil.copyfile(wfn_path, dst)
+    if os.path.exists(dst):
+        return sha, rel
+
+    if compress:
+        tmp = dst + f".{os.getpid()}.tmp"
+        try:
+            with open(wfn_path, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+            raw_size = os.path.getsize(wfn_path)
+            if os.path.getsize(tmp) < raw_size * 0.95:
+                os.replace(tmp, dst)
+                return sha, rel
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    shutil.copyfile(wfn_path, dst)
     return sha, rel
+
+
+def _is_gzip(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
+def blob_path(element_dir: str, rel: str) -> str:
+    return os.path.join(element_dir, str(rel))
+
+
+def blob_sha256(element_dir: str, rel: str) -> str:
+    """sha256 НЕсжатого содержимого blob (потоково, без загрузки в память)."""
+    path = blob_path(element_dir, rel)
+    h = hashlib.sha256()
+    opener = gzip.open if _is_gzip(path) else open
+    with opener(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def materialize_blob(element_dir: str, rel: str, dst_path: str) -> str:
+    """
+    Распаковывает blob в обычный файл `dst_path` (для CP2K, которому нужен
+    путь к несжатому -RESTART.wfn). Возвращает dst_path.
+    """
+    src = blob_path(element_dir, rel)
+    if not _is_gzip(src):
+        return src
+    with gzip.open(src, "rb") as fi, open(dst_path, "wb") as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+    return dst_path
 
 
 # ---------- транзакции ----------
@@ -973,11 +1035,15 @@ def _verify_block(element_dir: str, block_path: str,
     elif not SHA_RE.match(str(sha)) or not STATE_PATH_RE.match(str(rel)):
         problems.append("state_sha256/state_path имеют недопустимый формат")
     else:
-        blob = os.path.join(element_dir, str(rel))
+        blob = blob_path(element_dir, str(rel))
         if not os.path.exists(blob):
             problems.append(f"нет файла состояния {rel} (нужен blob с пира)")
-        elif sha256_file(blob) != sha:
-            problems.append("sha256 файла состояния не совпадает")
+        else:
+            try:
+                if blob_sha256(element_dir, str(rel)) != sha:
+                    problems.append("sha256 файла состояния не совпадает")
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"файл состояния не читается: {e}")
 
     if tx_root_of(txs) != header.get("tx_root"):
         problems.append("tx_root не совпадает с транзакциями блока")
@@ -1104,11 +1170,15 @@ def verify_chain(element_dir: str, system: str | None = None) -> dict:
         elif not SHA_RE.match(str(sha)) or not STATE_PATH_RE.match(str(rel)):
             problems.append(f"{b['name']}: state_sha256/state_path недопустимого формата")
         else:
-            blob = os.path.join(element_dir, str(rel))
+            blob = blob_path(element_dir, str(rel))
             if not os.path.exists(blob):
                 problems.append(f"{b['name']}: нет файла состояния {rel}")
-            elif sha256_file(blob) != sha:
-                problems.append(f"{b['name']}: sha256 файла состояния не совпадает")
+            else:
+                try:
+                    if blob_sha256(element_dir, str(rel)) != sha:
+                        problems.append(f"{b['name']}: sha256 файла состояния не совпадает")
+                except Exception as e:  # noqa: BLE001
+                    problems.append(f"{b['name']}: файл состояния не читается ({e})")
 
         coinbases = [t for t in txs if t.get("type") == "coinbase"]
         if len(coinbases) != 1:

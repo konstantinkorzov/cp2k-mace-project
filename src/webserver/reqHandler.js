@@ -5,6 +5,7 @@ const path = require('path');
 const http = require('http');
 const { execFile } = require('child_process');
 
+const presets = require('./presets');
 const procs = require('./procs');
 
 // ==================== helpers ====================
@@ -178,6 +179,11 @@ async function onOverview(req, res) {
 async function onMasterStart(req, res) {
     try {
         const body = req.body || {};
+        let element = null;
+        if (body.element) {
+            element = presets.applyElementPreset(
+                global.paths.CONFIG_PATH, String(body.element)).name;
+        }
         const rec = await procs.startMaster({
             port: body.port,
             dir: body.dir,
@@ -186,7 +192,7 @@ async function onMasterStart(req, res) {
             peers: Array.isArray(body.peers) ? body.peers : [],
             name: body.name,
         });
-        res.json({ ok: true, process: rec });
+        res.json({ ok: true, process: Object.assign({ element }, rec) });
     } catch (e) {
         bad(res, 400, e.message || String(e));
     }
