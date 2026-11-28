@@ -804,8 +804,13 @@ def chain_tests():
             main.MEMPOOL[tx["txid"]] = tx
             inc, mem_fee = main._drain_mempool(chain.utxo_set(tmp), 3, 1)
             check("мемпул включён в блок",
-                  len(inc) == 1 and abs(mem_fee - chain.DEFAULT_FEE) < 1e-9
-                  and not main.MEMPOOL, mem_fee)
+                  len(inc) == 1 and abs(mem_fee - chain.DEFAULT_FEE) < 1e-9,
+                  mem_fee)
+            check("D1: включённая tx остаётся в мемпуле до записи блока",
+                  tx["txid"] in main.MEMPOOL, sorted(main.MEMPOOL))
+            main._mempool_commit(inc)
+            check("D1: после коммита блока tx уходит из мемпула",
+                  tx["txid"] not in main.MEMPOOL, sorted(main.MEMPOOL))
         finally:
             main.CONFIG["output_dir"] = saved_out
             main.MEMPOOL.clear()
@@ -2238,6 +2243,113 @@ def worker_profile_tests():
           str(data.get("message"))[:90])
 
 
+def audit5_d_tests():
+    print("\n--- 43. D1/D3/D5: выходы по ходу, глубина форка, лимиты ---")
+    tmp = tempfile.mkdtemp(prefix="audit5d_")
+    saved_dir = main.CONFIG.get("output_dir")
+    try:
+        main.CONFIG["output_dir"] = tmp
+
+        # ---------- D1: транзакция тратит выход предыдущей в том же блоке ----------
+        seed = os.urandom(32)
+        pub = crypto.public_key_from_seed(seed)
+        addr = crypto.address_from_public(pub)
+        state = os.path.join(tmp, "state.wfn")
+        with open(state, "wb") as f:
+            f.write(b"d1-test" * 100)
+        sha, rel = chain.store_blob(tmp, state)
+        cb1 = chain.make_coinbase(1, addr, chain.COINBASE_VALUE)
+        hdr1 = {"prev_id": chain.ZERO_HASH, "nonce": 7, "n_atoms": 2,
+                "dim": chain.consensus.dim_for_height(0),
+                "atom_diameter": 2.56, "system": "Cu",
+                "composition": {"Cu": 1}}
+        chain.write_block(tmp, "Cu", 2, sha, rel, [cb1],
+                          dft={"energy_ev": -1.0,
+                               "forces_ev_ang": [[0.0, 0.0, 0.0]] * 2,
+                               "geometry": chain.expected_geometry(hdr1).tolist(),
+                               "species": ["Cu", "Cu"]},
+                          nonce=7, atom_diameter=2.56,
+                          composition={"Cu": 1},
+                          cp2k_version="x", cp2k_build="y",
+                          cp2k_params=dict(cp2k_runner.CP2K_PARAMS))
+
+        def signed(inputs, outputs):
+            tx = chain.make_transfer(inputs, outputs)
+            tid = chain.txid_of(tx)
+            for i in tx["inputs"]:
+                i["public_key"] = pub.hex()
+                i["signature"] = crypto.sign(seed, bytes.fromhex(tid)).hex()
+            tx["txid"] = chain.txid_of(tx)
+            return tx
+
+        parent = signed([{"txid": chain.txid_of(cb1), "vout": 0}],
+                        [{"value": 1_000, "address": addr}])
+        child = signed([{"txid": parent["txid"], "vout": 0}],
+                       [{"value": 900, "address": addr}])
+        cb2 = chain.make_coinbase(2, addr, chain.COINBASE_VALUE + 100)
+        utxo_before = chain.utxo_set(tmp)
+        fee, problems = chain._check_txs([cb2, parent, child], utxo_before,
+                                         "t", height=2, n_atoms=2)
+        check("D1: блок «родитель → ребёнок» проходит проверку",
+              not problems, problems[:2])
+        check("D1: комиссии обоих переводов учтены",
+              fee == (chain.COINBASE_VALUE - 1_000) + (1_000 - 900), fee)
+        check("D1: чужой UTXO-снимок не испорчен",
+              utxo_before == chain.utxo_set(tmp))
+        _, bad = chain._check_txs([parent, child], utxo_before, "t",
+                                  height=2, n_atoms=2)
+        check("D1: без coinbase блок по-прежнему невалиден",
+              any("coinbase" in p for p in bad), bad[:2])
+
+        # ---------- D3: глубина поиска предка ----------
+        calls = {"n": 0}
+        real_fetch = main._fetch_block
+        main._fetch_block = lambda peer, seq: (calls.__setitem__("n", calls["n"] + 1)
+                                                or b"garbage")
+        old_depth = main.FORK_SEARCH_MAX_DEPTH
+        try:
+            main.FORK_SEARCH_MAX_DEPTH = 3
+            anc = main._find_fork_ancestor("http://fake:8000", 100)
+            check("D3: поиск предка ограничен глубиной", anc is None and calls["n"] <= 3,
+                  f"anc={anc}, вызовов {calls['n']}")
+        finally:
+            main._fetch_block = real_fetch
+            main.FORK_SEARCH_MAX_DEPTH = old_depth
+
+        # ---------- D5: лимиты ----------
+        check("D5: /submit-state не буферизуется", not main._needs_body_guard("/submit-state"))
+        check("D5: /tx/submit буферизуется с лимитом", main._needs_body_guard("/tx/submit"))
+        check("D5: неизвестный путь не буферизуется", not main._needs_body_guard("/nope"))
+
+        main._reset_ip_rate()
+        check("D5: первый запрос с IP проходит",
+              main._ip_rate_ok("t", "10.0.0.1", 1))
+        check("D5: второй сразу — отказ",
+              not main._ip_rate_ok("t", "10.0.0.1", 1))
+        check("D5: другой IP не задет", main._ip_rate_ok("t", "10.0.0.2", 1))
+        check("D5: лимит 0 выключает проверку",
+              main._ip_rate_ok("t", "10.0.0.1", 0) and main._ip_rate_ok("t", "10.0.0.1", 0))
+        main._reset_ip_rate()
+
+        check("D5: мусорная tx отбивается формой, а не цепочкой",
+              main._tx_shape_problem({"type": "transfer", "inputs": [
+                  {"txid": "zz", "vout": 0}], "outputs": []}) is not None)
+        check("D5: правильная по форме tx проходит",
+              main._tx_shape_problem({"type": "transfer",
+                                      "inputs": [{"txid": "0" * 64, "vout": 0}],
+                                      "outputs": [{"value": 1, "address": "1" * 64}]})
+              is None)
+        check("D5: дробная сумма отвергается формой",
+              main._tx_shape_problem({"type": "transfer",
+                                      "inputs": [{"txid": "0" * 64, "vout": 0}],
+                                      "outputs": [{"value": 1.5,
+                                                   "address": "1" * 64}]}) is not None)
+    finally:
+        main.CONFIG["output_dir"] = saved_dir
+        main._reset_ip_rate()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def elements_catalog_tests():
     print("\n--- 36. Справочник элементов (src/elements.json) ---")
     el = cp2k_runner.ELEMENTS.get("elements") or {}
@@ -2515,6 +2627,9 @@ def mempool_policy_tests():
         check("в блок попала самая дорогая tx", len(included) == 1
               and included[0]["txid"] == t400["txid"],
               f"включено {len(included)}")
+        check("D1: отбор в блок не удаляет tx из мемпула",
+              len(main.MEMPOOL) == 3, f"осталось {len(main.MEMPOOL)}")
+        main._mempool_commit(included)
         check("остальные остались в мемпуле для следующего блока",
               len(main.MEMPOOL) == 2, f"осталось {len(main.MEMPOOL)}")
         check("комиссия блока посчитана", fee == 400_000, fee)
@@ -2769,6 +2884,7 @@ def _run_tests():
     audit5_tests()
     transport_ticket_tests()
     worker_profile_tests()
+    audit5_d_tests()
     elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()

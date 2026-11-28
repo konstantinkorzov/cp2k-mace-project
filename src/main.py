@@ -135,6 +135,12 @@ MAX_TASK_ATTEMPTS = 5      # сколько раз задача возвраща
 MIN_ATOM_DISTANCE_ANG = consensus.MIN_ATOM_DISTANCE_ANG
 MIN_DIST_TOLERANCE = 0.9   # только для проверки шаблона при старте (генерация)
 
+# Поиск общего предка при форке: сколько блоков/байт/секунд мастер готов на
+# это потратить. Значения — политика узла, не консенсус (пиру они не видны).
+FORK_SEARCH_MAX_DEPTH = 64
+FORK_SEARCH_MAX_BYTES = 64 * 1024 * 1024
+FORK_SEARCH_MAX_SEC = 120.0
+
 # Потолок размера задачи для приёмки: n_atoms приходит из запроса, поэтому
 # всё, что больше, отбивается ДО аллокаций numpy и запуска CP2K. Живёт в
 # consensus.py вместе с потолком расписания — иначе расписание выдавало бы
@@ -958,6 +964,17 @@ def verify_state_payload(cfg, task: dict, payload: dict, issued: dict | None = N
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _mempool_commit(txs: list[dict]) -> None:
+    """Убирает из мемпула транзакции, попавшие в ЗАПИСАННЫЙ блок."""
+    ids = [t.get("txid") for t in txs if isinstance(t, dict) and t.get("txid")]
+    if not ids:
+        return
+    with MEMPOOL_LOCK:
+        for tid in ids:
+            MEMPOOL.pop(tid, None)
+    _save_mempool()
+
+
 def _drain_mempool(utxo: dict, height: int, confirmations: int):
     """
     Отбирает транзакции для блока: по убыванию комиссии (как в Bitcoin),
@@ -979,17 +996,20 @@ def _drain_mempool(utxo: dict, height: int, confirmations: int):
         ok, _problems = chain_mod.validate_tx(
             tx, CONFIG["output_dir"], height, confirmations, utxo=utxo)
         if not ok:
-            drop.append(tid)
+            drop.append(tid)          # мусор: его и так нельзя включить
             continue
         total_in = 0
         for i in tx["inputs"]:
             total_in += int(utxo.pop((i["txid"], int(i["vout"])))["value"])
         for vout, o in enumerate(tx["outputs"]):
             utxo[(tid, vout)] = {"value": int(o["value"]),
-                                 "address": o["address"], "height": height}
+                                 "address": o["address"], "height": height,
+                                 "coinbase": False}
         fee_total += total_in - sum(int(o["value"]) for o in tx["outputs"])
+        # Включённые НЕ удаляем: блок может не собраться (нет wfn, провал
+        # проверки, реорг), и тогда работа из мемпула просто исчезла бы.
+        # Удаляет _mempool_commit() — только после успешной записи блока.
         included.append(tx)
-        drop.append(tid)
     if drop:
         with MEMPOOL_LOCK:
             for tid in drop:
@@ -1187,6 +1207,8 @@ def _write_chain_block_inner(task_data: dict, payload: dict, verdict: dict,
              if worker_address else "")
           + ")")
     if mem_txs:
+        # Коммит мемпула — только здесь: блок уже проверен и лежит на диске.
+        _mempool_commit(mem_txs)
         print(f"[Master] 📦 в блок включено транзакций из мемпула: {len(mem_txs)} "
               f"(комиссия {mem_fee:g})")
     if not worker_address:
@@ -1428,6 +1450,48 @@ def state_ticket(worker_id: str, session: str | None = None,
     return {"ticket": _issue_state_ticket(worker_id), "ttl": STATE_TICKET_TTL}
 
 
+# ---------- лимиты публичных маршрутов (по IP) ----------
+# /tx/submit, /chain/block, /chain/blob, /peers — без аутентификации: любой
+# хост в сети мог дёргать их скриптом, а каждый вызов стоил O(высоты) по
+# диску (аудит 5, H3). Токен-бакет на IP: дешёво и не мешает честному пиру.
+TX_SUBMIT_PER_MIN = 60
+CHAIN_READ_PER_MIN = 120
+PEERS_PER_MIN = 30
+
+_IP_RATE_LOCK = threading.Lock()
+_IP_RATE: dict[tuple[str, str], tuple[float, float]] = {}
+
+
+def _client_ip(request) -> str:
+    return str(getattr(getattr(request, "client", None), "host", "") or "?")
+
+
+def _ip_rate_ok(kind: str, ip: str, per_min: int, burst: int | None = None) -> bool:
+    """Токен-бакет (kind, ip). per_min <= 0 — лимит выключен."""
+    if int(per_min) <= 0:
+        return True
+    burst = int(burst or per_min)
+    rate = float(per_min) / 60.0
+    now = time.time()
+    with _IP_RATE_LOCK:
+        tokens, ts = _IP_RATE.get((kind, ip), (float(burst), now))
+        tokens = min(float(burst), tokens + (now - ts) * rate)
+        if tokens < 1.0:
+            _IP_RATE[(kind, ip)] = (tokens, now)
+            return False
+        _IP_RATE[(kind, ip)] = (tokens - 1.0, now)
+        if len(_IP_RATE) > 4096:       # не даём словарю расти бесконечно
+            for k, (_t, when) in list(_IP_RATE.items()):
+                if now - when > 600:
+                    _IP_RATE.pop(k, None)
+        return True
+
+
+def _reset_ip_rate() -> None:
+    with _IP_RATE_LOCK:
+        _IP_RATE.clear()
+
+
 def _body_limit_bytes(path: str | None = None) -> int:
     """Лимит тела = base64 от максимально допустимого wfn + запас.
 
@@ -1447,12 +1511,27 @@ def _body_limit_bytes(path: str | None = None) -> int:
     return JSON_BODY_MAX_BYTES
 
 
+# Пути, где тело действительно разбирается: только для них включается
+# буферизация с лимитом. Неизвестный путь (404) и GET тело не читают —
+# раньше 8 МБ буферизовались ДО любой проверки, то есть память тратилась
+# по запросу к произвольному URL (аудит 5, I4).
+BODY_GUARD_PATHS = ("/register-worker", "/state-ticket", "/submit-result",
+                    "/tx/submit", "/chain/announce", "/admin")
+
+
+def _needs_body_guard(path: str) -> bool:
+    p = str(path or "").rstrip("/") or "/"
+    return any(p == x or p.startswith(x + "/") or p.startswith(x)
+               for x in BODY_GUARD_PATHS)
+
+
 @app.middleware("http")
 async def _body_guard(request, call_next):
     # /submit-state принимает бинарный wfn потоком: буферизовать его в теле
     # запроса — ровно та ошибка, от которой мы уходим.
     try:
-        if (request.url.path or "").rstrip("/").endswith("/submit-state"):
+        path = request.url.path or ""
+        if path.rstrip("/").endswith("/submit-state") or not _needs_body_guard(path):
             return await call_next(request)
     except Exception:  # noqa: BLE001
         pass
@@ -3007,14 +3086,30 @@ def _accept_peer_block(peer: str, seq: int, head: str,
 
 def _find_fork_ancestor(peer: str, local_height: int) -> int | None:
     """
-    Ищет высоту общего предка с пиром, спускаясь от local_height вниз:
-    скачивает блок пира с этим seq и сравнивает sha256 с нашим.
+    Ищет высоту общего предка с пиром, спускаясь от local_height вниз.
+
+    Поиск ОГРАНИЧЕН: глубина FORK_SEARCH_MAX_DEPTH блоков, суммарный объём
+    скачанного и время. Без предела пир, который на каждой высоте отдаёт
+    блок с чужим prev_id, заставлял мастера качать всю историю (десятки ГБ) и
+    держал BUSY часами — то есть выключал узел из работы (аудит 5, H4).
     """
     mine = {b["seq"]: b["block_id"] for b in chain_mod.list_blocks(CONFIG["output_dir"])}
-    for seq in range(local_height, 0, -1):
+    stop = max(0, int(local_height) - int(FORK_SEARCH_MAX_DEPTH))
+    fetched_bytes = 0
+    started = time.time()
+    for seq in range(local_height, stop, -1):
+        if time.time() - started > FORK_SEARCH_MAX_SEC:
+            print(f"[Fork] поиск предка с {peer} прерван по времени "
+                  f"(>{FORK_SEARCH_MAX_SEC:.0f} с, высота {seq})")
+            break
         data = _fetch_block(peer, seq)
         if data is None:
             continue
+        fetched_bytes += len(data)
+        if fetched_bytes > FORK_SEARCH_MAX_BYTES:
+            print(f"[Fork] поиск предка с {peer} прерван по объёму "
+                  f"({fetched_bytes} байт)")
+            break
         try:
             header, _dft, _txs, _names = chain_mod.read_block_bytes(data)
         except Exception:  # noqa: BLE001
@@ -3161,6 +3256,11 @@ def sync_from_peer(peer: str) -> dict:
                     accepted += res.get("accepted", 0)
                     errors.extend(res.get("errors", []))
                     break
+                # Общего предка не нашли в пределах бюджета: это не «другая
+                # ветка», а пир, который кормит несовместимыми блоками.
+                _bad_peer(peer, "не нашёл общего предка за бюджет поиска")
+                print(f"[Fork] {peer}: общего предка нет за "
+                      f"{FORK_SEARCH_MAX_DEPTH} блоков — пир в карантине")
             errors.append(f"блок {seq}: {text}")
             break
         accepted += 1
@@ -3297,11 +3397,59 @@ class TxSubmit(BaseModel):
     tx: dict
 
 
+def _tx_shape_problem(tx: dict) -> str | None:
+    """Дешёвая проверка ФОРМЫ транзакции до чтения цепочки.
+
+    validate_tx() требует UTXO, а его построение — самая дорогая часть
+    /tx/submit. Мусор (не тот тип, нет входов, сумма строкой) отбивается
+    здесь, не доходя до диска.
+    """
+    if not isinstance(tx, dict):
+        return "tx — не объект"
+    if tx.get("type") != "transfer":
+        return "транзакция не transfer"
+    inputs = tx.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        return "нет входов"
+    if len(inputs) > chain_mod.MAX_TXS_PER_BLOCK * 4:
+        return f"входов больше разумного ({len(inputs)})"
+    for i in inputs:
+        if not isinstance(i, dict):
+            return "вход — не объект"
+        tid = i.get("txid")
+        if not isinstance(tid, str) or not re.fullmatch(r"[0-9a-f]{64}", tid):
+            return "txid входа — не 64 hex"
+        if type(i.get("vout")) is not int or i["vout"] < 0:
+            return "vout входа — не целое >= 0"
+    outputs = tx.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        return "нет выходов"
+    if len(outputs) > 1000:
+        return f"выходов больше разумного ({len(outputs)})"
+    for o in outputs:
+        if not isinstance(o, dict):
+            return "выход — не объект"
+        if type(o.get("value")) is not int:
+            return "сумма выхода — не целое"
+        addr = o.get("address")
+        if not isinstance(addr, str) or not re.fullmatch(r"[0-9a-f]{64}", addr):
+            return "адрес выхода — не 64 hex"
+    return None
+
+
 @app.post("/tx/submit")
-def tx_submit(req: TxSubmit):
+def tx_submit(req: TxSubmit, request: Request = None):
+    if request is not None and not _ip_rate_ok(
+            "tx", _client_ip(request), TX_SUBMIT_PER_MIN):
+        raise HTTPException(status_code=429,
+                            detail=f"слишком много транзакций: не больше "
+                                   f"{TX_SUBMIT_PER_MIN} в минуту с одного IP")
     if BUSY.is_set():
         return {"status": "busy", "reason": "master is syncing"}
     tx = dict(req.tx or {})
+    shape = _tx_shape_problem(tx)
+    if shape:
+        return {"status": "rejected", "reason": shape}
     conf = int(CONFIG.get("coinbase_confirmations", chain_mod.DEFAULT_CONFIRMATIONS))
     utxo = chain_mod.utxo_set(CONFIG["output_dir"])
     ok, problems = chain_mod.validate_tx(tx, CONFIG["output_dir"],
@@ -3368,7 +3516,12 @@ def tx_submit(req: TxSubmit):
 
 
 @app.get("/tx/mempool")
-def tx_mempool():
+def tx_mempool(request: Request = None):
+    if request is not None and not _ip_rate_ok(
+            "mempool", _client_ip(request), CHAIN_READ_PER_MIN):
+        raise HTTPException(status_code=429,
+                            detail=f"слишком много запросов: не больше "
+                                   f"{CHAIN_READ_PER_MIN} в минуту")
     """Транзакции в мемпуле. `txs` — полные тела, чтобы кошелёк мог их показать."""
     with MEMPOOL_LOCK:
         txs = [dict(tx) for tx in MEMPOOL.values()]
@@ -3396,11 +3549,16 @@ def work_height(element: str):
 
 
 @app.get("/peers")
-def peers_public():
+def peers_public(request: Request = None):
     """
     Публичный список адресов мастеров — то, что нужно воркерам для gossip.
     Секрета нет: ровно эти URL мастер и так сообщает воркерам.
     """
+    if request is not None and not _ip_rate_ok(
+            "peers", _client_ip(request), PEERS_PER_MIN):
+        raise HTTPException(status_code=429,
+                            detail=f"слишком много запросов: не больше "
+                                   f"{PEERS_PER_MIN} в минуту")
     height, _sha = _local_head()
     peers = [str(p) for p in (CONFIG.get("peers") or []) if str(p).strip()]
     return {"element": CONFIG["element"], "height": height, "peers": peers}
@@ -3413,7 +3571,12 @@ def chain_height():
 
 
 @app.get("/chain/block/{seq}")
-def chain_block(seq: int):
+def chain_block(seq: int, request: Request = None):
+    if request is not None and not _ip_rate_ok(
+            "chain", _client_ip(request), CHAIN_READ_PER_MIN):
+        raise HTTPException(status_code=429,
+                            detail=f"слишком много запросов: не больше "
+                                   f"{CHAIN_READ_PER_MIN} в минуту")
     from fastapi.responses import FileResponse
     for b in chain_mod.list_blocks(CONFIG["output_dir"]):
         if b["seq"] == seq:
@@ -3422,7 +3585,12 @@ def chain_block(seq: int):
 
 
 @app.get("/chain/blob/{sha}")
-def chain_blob(sha: str):
+def chain_blob(sha: str, request: Request = None):
+    if request is not None and not _ip_rate_ok(
+            "blob", _client_ip(request), CHAIN_READ_PER_MIN):
+        raise HTTPException(status_code=429,
+                            detail=f"слишком много запросов: не больше "
+                                   f"{CHAIN_READ_PER_MIN} в минуту")
     from fastapi.responses import FileResponse
     if not re.fullmatch(r"[0-9a-f]{64}", sha):
         raise HTTPException(status_code=400, detail="bad sha256")

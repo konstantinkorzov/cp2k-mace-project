@@ -989,6 +989,18 @@ def read_block(path: str) -> tuple[dict, dict, list[dict], set]:
         return read_block_bytes(f.read())
 
 
+def _utxo_apply(utxo: dict, tx: dict, tid: str, height: int | None) -> None:
+    """Добавляет выходы транзакции в UTXO (мусорную сумму считаем нулём)."""
+    for vout, out in enumerate(tx.get("outputs") or []):
+        if not isinstance(out, dict):
+            continue
+        utxo[(tid, vout)] = {
+            "value": out["value"] if type(out.get("value")) is int else 0,
+            "address": out.get("address") if isinstance(out.get("address"), str) else "",
+            "height": int(height or 0),
+            "coinbase": tx.get("type") == "coinbase"}
+
+
 def _check_txs(txs: list[dict], utxo: dict, label: str,
                add_outputs: bool = False,
                height: int | None = None,
@@ -1001,6 +1013,16 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
     if len(transfers) > MAX_TXS_PER_BLOCK:
         problems.append(f"{label}: {len(transfers)} переводов > {MAX_TXS_PER_BLOCK}")
 
+    # Выходы применяются ПО ХОДУ цикла: транзакция может тратить выход
+    # предыдущей транзакции ЭТОГО же блока (в Bitcoin это норма). Раньше они
+    # добавлялись после цикла, поэтому такой блок не проходил собственную
+    # проверку и уезжал в .bad, хотя мемпул его собирал.
+    #
+    # Чужой словарь не портим: вызывающий передаёт свой UTXO-снимок
+    # (utxo_before), и он должен остаться неизменным. add_outputs=True —
+    # режим построения UTXO (utxo_set), там мутация и нужна.
+    work = utxo if add_outputs else dict(utxo)
+
     block_fee = 0
     for tx in txs:
         tid = tx.get("txid") or txid_of(tx)
@@ -1008,15 +1030,16 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
             problems.append(f"{label}: txid транзакции не совпадает с содержимым")
         problems.extend(f"{label}: {p}" for p in invalid_outputs(tx))
         if tx.get("type") == "coinbase":
+            _utxo_apply(work, tx, tid, height)
             continue
 
         total_in = 0
         for i in tx.get("inputs", []):
             key = (i.get("txid"), int(i.get("vout", -1)))
-            if key not in utxo:
+            if key not in work:
                 problems.append(f"{label}: вход {key} ссылается на неизвестный/потраченный выход")
                 continue
-            info = utxo.pop(key)
+            info = work.pop(key)
             total_in += info["value"]
             if (height is not None and info.get("coinbase")
                     and height - int(info.get("height") or 0) < COINBASE_MATURITY):
@@ -1042,6 +1065,7 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
         if total_in < total_out:
             problems.append(f"{label}: сумма входов {total_in} < суммы выходов {total_out}")
         block_fee += max(0, total_in - total_out)
+        _utxo_apply(work, tx, tid, height)
 
     if coinbases and height is not None:
         # coinbase.height обязан совпадать с высотой блока: иначе два блока
@@ -1064,14 +1088,6 @@ def _check_txs(txs: list[dict], utxo: dict, label: str,
                 f"{label}: coinbase {cb_value} > субсидии {cap} "
                 f"(n={n_atoms}, комиссии {block_fee})")
 
-    if add_outputs:
-        for tx in txs:
-            tid = tx.get("txid") or txid_of(tx)
-            for vout, out in enumerate(tx.get("outputs", [])):
-                utxo[(tid, vout)] = {"value": out["value"] if type(out.get("value")) is int else 0,
-                                     "address": out["address"],
-                                     "height": height or 0,
-                                     "coinbase": tx.get("type") == "coinbase"}
     return block_fee, problems
 
 
