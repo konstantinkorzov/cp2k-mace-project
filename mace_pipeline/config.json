@@ -2,8 +2,8 @@
   "element": "Cu",
   "results_dir": "../results",
   "output_dir": "../mace_output",
-
-  "foundation_model": "small",
+  "_foundation_model": "Путь к предобученной модели (в образе). Имя вроде 'small' заставляет MACE скачивать модель и 10k структур Materials Project — без интернета не работает.",
+  "foundation_model": "/opt/mace-models/mace-mp-0-small.model",
   "device": "cpu",
   "seed": 42,
   "max_num_epochs": 50,
@@ -13,7 +13,6 @@
   "eval_interval": 5,
   "energy_weight": 1.0,
   "forces_weight": 10.0,
-
   "search": {
     "n_atoms": 2,
     "dim": 3,
@@ -23,6 +22,6 @@
     "fmax": 0.05,
     "steps": 200
   },
-
-  "html_name": "structures.html"
+  "html_name": "structures.html",
+  "E0s": "average"
 }

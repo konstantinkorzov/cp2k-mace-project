@@ -87,6 +87,7 @@ exports.handle = function (app) {
     app.get('/', onMain);
 
     // старые эндпоинты панели main.py (оставлены для совместимости)
+    app.get('/api/elements', onGetElements);
     app.get('/api/config', onGetConfig);
     app.post('/api/config', onSaveConfig);
     app.get('/api/status', onStatus);
@@ -513,6 +514,17 @@ function onMaceRun(req, res) {
 }
 
 // ==================== старые обработчики ====================
+
+function onGetElements(req, res) {
+    // Справочник элементов для выпадающих списков (мастер, MACE, кошелёк).
+    // Секретов тут нет: символ, имя, диаметр, псевдопотенциал, валентность.
+    try {
+        res.json({ ok: true, basis: presets.BASIS, elements: presets.ELEMENT_LIST });
+    } catch (e) {
+        bad(res, 500, String(e));
+    }
+}
+
 
 function onGetConfig(req, res) {
     try {

@@ -31,6 +31,8 @@ import tempfile
 import hashlib
 import subprocess
 
+import json
+
 import numpy as np
 
 import consensus
@@ -39,6 +41,9 @@ import consensus
 # Словарь псевдопотенциалов для элементов (qN = число валентных электронов)
 # Словарь псевдопотенциалов (GTH-PBE-qN = N валентных электронов).
 # Добавить элемент — одна строка; база DZVP-MOLOPT-SR-GTH есть для H–Kr и части тяжёлых.
+# Полная таблица нужна для составных систем (Al2O3: O, NaCl: Na/Cl).
+# Для элементов из src/elements.json значения берутся из справочника: там же
+# диаметр, валентность и базис, и панель строит из него списки.
 PSEUDOPOTENTIALS = {
     "H": "GTH-PBE-q1", "He": "GTH-PBE-q2",
     "Li": "GTH-PBE-q3", "Be": "GTH-PBE-q4", "B": "GTH-PBE-q3",
@@ -55,6 +60,22 @@ PSEUDOPOTENTIALS = {
     "Ag": "GTH-PBE-q11", "Cd": "GTH-PBE-q12", "I": "GTH-PBE-q7",
     "Au": "GTH-PBE-q11",
 }
+
+ELEMENTS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elements.json")
+
+
+def load_elements() -> dict:
+    """Справочник элементов (панель + CP2K). Пустой файл — ошибка конфигурации."""
+    with open(ELEMENTS_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+ELEMENTS = load_elements()
+ELEMENT_DEFAULTS = ELEMENTS.get("elements") or {}
+DEFAULT_BASIS = ELEMENTS.get("basis") or "DZVP-MOLOPT-SR-GTH"
+# Справочник главнее таблицы: одна правка — и CP2K, и панель видят одно и то же
+PSEUDOPOTENTIALS.update({sym: data["pseudopotential"]
+                         for sym, data in ELEMENT_DEFAULTS.items()})
 
 
 # ---------- Шаблон CP2K (общий для воркера и мастера) ----------
@@ -279,7 +300,7 @@ def build_kinds_block(species: list[str]) -> str:
         seen.append(sym)
         blocks.append(
             f"    &KIND {sym}\n"
-            f"      BASIS_SET DZVP-MOLOPT-SR-GTH\n"
+            f"      BASIS_SET {DEFAULT_BASIS}\n"
             f"      POTENTIAL {get_potential(sym)}\n"
             f"    &END KIND"
         )

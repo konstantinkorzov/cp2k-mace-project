@@ -102,6 +102,8 @@ def prepare_env():
 
     # реальный config.json проекта (формат {"value":..., "help":...})
     shutil.copy(os.path.join(SRC, "config.json"), os.path.join(ENV, "config.json"))
+    # справочник элементов: cp2k_runner читает его при импорте
+    shutil.copy(os.path.join(SRC, "elements.json"), os.path.join(ENV, "elements.json"))
 
     # заглушки тяжёлых зависимостей
     for fname, content in STUB_FILES.items():
@@ -1507,6 +1509,29 @@ def money_int_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def elements_catalog_tests():
+    print("\n--- 36. Справочник элементов (src/elements.json) ---")
+    el = cp2k_runner.ELEMENTS.get("elements") or {}
+    check("в справочнике Au, Ag, Cu, Fe, Al",
+          set(el) >= {"Au", "Ag", "Cu", "Fe", "Al"}, sorted(el))
+    for sym, d in el.items():
+        check(f"{sym}: потенциал справочника = потенциал CP2K",
+              cp2k_runner.PSEUDOPOTENTIALS.get(sym) == d.get("pseudopotential"),
+              (cp2k_runner.PSEUDOPOTENTIALS.get(sym), d.get("pseudopotential")))
+        check(f"{sym}: валентность из имени потенциала",
+              cp2k_runner.valence_electrons(d.get("pseudopotential", ""))
+              == d.get("valence"),
+              (cp2k_runner.valence_electrons(d.get("pseudopotential", "")),
+               d.get("valence")))
+        dt = float(d.get("atom_diameter") or 0)
+        check(f"{sym}: диаметр в физическом диапазоне 1..4 Å", 1.0 <= dt <= 4.0, dt)
+    check("базис справочника уходит в CP2K",
+          cp2k_runner.DEFAULT_BASIS == (cp2k_runner.ELEMENTS.get("basis") or ""),
+          cp2k_runner.DEFAULT_BASIS)
+    check("составные элементы не потеряны (O для Al2O3)",
+          "O" in cp2k_runner.PSEUDOPOTENTIALS)
+
+
 def state_storage_tests():
     print("\n--- 35. Состояние: бюджет по n, сжатие blob, incoming ---")
     tmp = tempfile.mkdtemp(prefix="state_")
@@ -2008,6 +2033,7 @@ def _run_tests():
     master_geometry_tests()
     ready_binding_tests()
     money_int_tests()
+    elements_catalog_tests()
     state_storage_tests()
     reward_format_tests()
     build_tests()

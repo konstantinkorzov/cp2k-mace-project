@@ -1,29 +1,37 @@
 'use strict';
 /**
- * Готовые элементы для панели: простые системы в один клик.
- *
- * Диаметр — металлическая длина связи (Cu 2.56, Ag 2.89, Au 2.88, Fe 2.48,
- * Al 2.86 Å). Для генератора это min_dist; max_dist = 2 × диаметр. Значения
- * попали в config.json → system.atom_diameter и попадают в заголовок блока,
- * поэтому смена диаметра = другой датасет (для одной системы диаметр должен
- * быть одинаковым у всех мастеров).
- *
- * Псевдопотенциалы и базисы всех пяти элементов есть в образе CP2K:
- *   GTH-PBE-q11 (Cu, Ag, Au), GTH-PBE-q16 (Fe), GTH-PBE-q3 (Al),
- *   DZVP-MOLOPT-SR-GTH.
- *
- * Составные системы (Al2O3, NaCl) — не пресеты: их задают в config.json
- * вручную (composition + atom_diameter).
+ * Элементы для панели. Источник правды — src/elements.json: там символ,
+ * русское имя, диаметр атома (металлическая длина связи), псевдопотенциал
+ * GTH и валентность. Этот же файл читает cp2k_runner (потенциалы и базис),
+ * поэтому панель и CP2K не могут разойтись.
  */
 const fs = require('fs');
+const path = require('path');
 
-const ELEMENT_PRESETS = {
-    Cu: { name: 'Cu', composition: { Cu: 1 }, atom_diameter: 2.56 },
-    Ag: { name: 'Ag', composition: { Ag: 1 }, atom_diameter: 2.89 },
-    Au: { name: 'Au', composition: { Au: 1 }, atom_diameter: 2.88 },
-    Fe: { name: 'Fe', composition: { Fe: 1 }, atom_diameter: 2.48 },
-    Al: { name: 'Al', composition: { Al: 1 }, atom_diameter: 2.86 },
-};
+const ELEMENTS_PATH = path.join(__dirname, '..', 'elements.json');
+
+function loadElements() {
+    const raw = JSON.parse(fs.readFileSync(ELEMENTS_PATH, 'utf8'));
+    const list = [];
+    const presets = {};
+    for (const [symbol, d] of Object.entries(raw.elements || {})) {
+        list.push({
+            symbol,
+            name_ru: d.name_ru || symbol,
+            atom_diameter: d.atom_diameter,
+            pseudopotential: d.pseudopotential,
+            valence: d.valence,
+        });
+        presets[symbol] = {
+            name: symbol,
+            composition: { [symbol]: 1 },
+            atom_diameter: d.atom_diameter,
+        };
+    }
+    return { basis: raw.basis || '', list, presets };
+}
+
+const { basis: BASIS, list: ELEMENT_LIST, presets: ELEMENT_PRESETS } = loadElements();
 
 function applyElementPreset(configPath, element) {
     const preset = ELEMENT_PRESETS[element];
@@ -41,4 +49,4 @@ function applyElementPreset(configPath, element) {
     return preset;
 }
 
-module.exports = { ELEMENT_PRESETS, applyElementPreset };
+module.exports = { ELEMENTS_PATH, BASIS, ELEMENT_LIST, ELEMENT_PRESETS, applyElementPreset };

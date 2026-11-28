@@ -242,9 +242,10 @@ function startMace(opts = {}) {
     }
     if (opts.resultsDir) args.push('--results-dir', resolveDir(opts.resultsDir));
     if (opts.outputDir) args.push('--output-dir', resolveDir(opts.outputDir));
+    // Модель: если указана — обучение пропускается (run_mace это понимает);
+    // если нет, обучение идёт от foundation_model из mace_pipeline/config.json
+    // (по умолчанию — предобученная MACE-MP-0 из образа).
     if (opts.model) args.push('--model', String(opts.model));
-    if (opts.skipTrain) args.push('--skip-train');
-    if (opts.skipSearch) args.push('--skip-search');
 
     const rec = addRecord('mace', 'MACE ' + (opts.element || ''));
     rec.args = args.slice(1);

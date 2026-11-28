@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Справочник элементов — единственный источник правды для панели и CP2K.",
+    "atom_diameter: металлическая длина связи (Å). Для генератора это min_dist,",
+    "  max_dist = 2 x диаметр. Попадает в config.json -> system.atom_diameter и",
+    "  в заголовок блока, поэтому у всех мастеров одной системы он обязан совпадать.",
+    "pseudopotential: имя потенциала из GTH_POTENTIALS (CP2K).",
+    "valence: число валентных электронов в псевдопотенциале (q-число).",
+    "basis: имя базиса в BASIS_MOLOPT (общее для всех перечисленных).",
+    "Составные системы (Al2O3, NaCl) сюда не входят: их задают в src/config.json",
+    "  вручную (composition), потенциалы берутся из таблицы cp2k_runner."
+  ],
+  "basis": "DZVP-MOLOPT-SR-GTH",
+  "elements": {
+    "Cu": { "name_ru": "Медь", "atom_diameter": 2.56, "pseudopotential": "GTH-PBE-q11", "valence": 11 },
+    "Ag": { "name_ru": "Серебро", "atom_diameter": 2.89, "pseudopotential": "GTH-PBE-q11", "valence": 11 },
+    "Au": { "name_ru": "Золото", "atom_diameter": 2.88, "pseudopotential": "GTH-PBE-q11", "valence": 11 },
+    "Fe": { "name_ru": "Железо", "atom_diameter": 2.48, "pseudopotential": "GTH-PBE-q16", "valence": 16 },
+    "Al": { "name_ru": "Алюминий", "atom_diameter": 2.86, "pseudopotential": "GTH-PBE-q3", "valence": 3 }
+  }
+}

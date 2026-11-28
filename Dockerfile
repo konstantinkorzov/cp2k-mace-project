@@ -38,6 +38,16 @@ RUN apt-get update && apt-get install -y curl ca-certificates gnupg \
 RUN apt-get update && apt-get install -y mc git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Предобученная MACE-MP-0 (small) — универсальная модель на все элементы
+# (Materials Project, ~89 элементов), 32.6 МБ. Нужна офлайн: без неё MACE при
+# первом запуске лезет в интернет и падает. Путь по умолчанию —
+# mace_pipeline/config.json → foundation_model.
+ENV MACE_MODEL=/opt/mace-models/mace-mp-0-small.model
+RUN mkdir -p /opt/mace-models \
+    && curl -fsSL --retry 3 --max-time 600 -o "$MACE_MODEL" \
+       "https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0/2023-12-10-mace-128-L0_energy_epoch-249.model" \
+    && python3 -c "import os; print(\"MACE model:\", os.path.getsize(os.environ['MACE_MODEL']), \"bytes\")"
+
 # Создаем рабочую директорию
 WORKDIR /workspace
 

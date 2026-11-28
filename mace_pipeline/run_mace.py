@@ -69,6 +69,13 @@ def read_blocks(element: str, results_dir: str) -> list[dict]:
 
 
 def write_dataset(frames: list[dict], element: str, path: str):
+    """
+    extxyz в формате MACE: энергия и силы под именами REF_energy/REF_forces.
+
+    MACE по умолчанию ищет именно эти ключи; с голыми energy/forces
+    `mace_run_train` падает с «None of REF_energy, REF_forces found».
+    Энергия — в eV, силы — в eV/Å (как в dft.json), так что пересчёт не нужен.
+    """
     import numpy as np
     from ase import Atoms
     from ase.io import write
@@ -76,9 +83,12 @@ def write_dataset(frames: list[dict], element: str, path: str):
     for fr in frames:
         atoms = Atoms(symbols=[element] * len(fr["geometry"]),
                       positions=np.asarray(fr["geometry"], dtype=float))
-        atoms.info["energy"] = fr["energy"]
+        atoms.info["REF_energy"] = float(fr["energy"])
+        atoms.info["energy"] = float(fr["energy"])      # для чтения глазами
         if fr.get("forces") and len(fr["forces"]) == len(fr["geometry"]):
-            atoms.arrays["forces"] = np.asarray(fr["forces"], dtype=float)
+            f = np.asarray(fr["forces"], dtype=float)
+            atoms.arrays["REF_forces"] = f
+            atoms.arrays["forces"] = f
         atoms_list.append(atoms)
     write(path, atoms_list, format="extxyz")
 
@@ -108,8 +118,15 @@ def train_model(cfg: dict, dataset: str, output_dir: str) -> str | None:
     foundation = str(cfg.get("foundation_model") or "").strip()
     if foundation:
         cmd += ["--foundation_model", foundation]
+        # Путь к .model (а не имя вроде "small") MACE трактует как multiheads
+        # finetuning и требует атомные энергии. "average" считает их методом
+        # наименьших квадратов по нашему датасету — этого достаточно.
+        # Имя-строка ("small") скачивает модель И 10k структур MP для replay,
+        # то есть без интернета не работает — поэтому по умолчанию путь.
+        e0s = str(cfg.get("E0s") or "").strip()
+        if e0s:
+            cmd += ["--E0s", e0s]
     else:
-        # без foundation-весов MACE требует атомные энергии E0s
         cmd += ["--E0s", str(cfg.get("E0s", "average"))]
         print("  (foundation_model пуст — обучение с нуля, E0s=average)")
     print("  $ " + " ".join(cmd))

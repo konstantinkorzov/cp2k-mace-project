@@ -322,7 +322,7 @@
         <div class="row">
           <div>
             <label>Элемент</label>
-            <input type="text" id="mace-element" placeholder="Cu" />
+            <select id="mace-element"></select>
           </div>
           <div>
             <label>Каталог результатов</label>
@@ -330,22 +330,20 @@
           </div>
         </div>
         <div class="row" style="margin-top:10px">
-          <div>
+          <div class="wide">
             <label>Готовая модель (.model, необязательно)</label>
-            <input type="text" id="mace-model" placeholder="/workspace/mace_pipeline/out/model.model" />
+            <input type="text" id="mace-model" placeholder="/opt/mace-models/mace-mp-0-small.model" />
+            <div class="muted" style="margin-top:4px">
+              Пусто — обучение идёт от предобученной <b>MACE-MP-0</b> (универсальная
+              модель на все элементы, уже лежит в образе). Если указать файл
+              <code>.model</code>, обучение пропускается и поиск минимума идёт на
+              этой модели. Поиск минимума выполняется всегда.
+            </div>
           </div>
           <div>
             <label>Каталог вывода (необязательно)</label>
             <input type="text" id="mace-out" placeholder="mace_pipeline/out" />
           </div>
-        </div>
-        <div class="actions">
-          <label style="display:flex;gap:6px;align-items:center;margin:0">
-            <input type="checkbox" id="mace-skip-train" /> пропустить обучение
-          </label>
-          <label style="display:flex;gap:6px;align-items:center;margin:0">
-            <input type="checkbox" id="mace-skip-search" /> пропустить поиск минимума
-          </label>
         </div>
         <div class="actions">
           <button class="btn" id="btn-mace-start">Запустить MACE</button>
@@ -792,12 +790,10 @@ $('#btn-mace-start').addEventListener('click', async () => {
   btn.disabled = true;
   $('#mace-msg').textContent = 'запускаю…';
   const r = await api('/api/mace/run', {
-    element: $('#mace-element').value.trim() || null,
+    element: $('#mace-element').value || null,
     resultsDir: $('#mace-dir').value || null,
     outputDir: $('#mace-out').value.trim() || null,
     model: $('#mace-model').value.trim() || null,
-    skipTrain: $('#mace-skip-train').checked,
-    skipSearch: $('#mace-skip-search').checked,
   });
   btn.disabled = false;
   if (r.ok) {
@@ -1233,12 +1229,24 @@ async function refreshChains() {
 }
 
 function applyChains(chains, current) {
+  // Тот же список, что у мастера, плюс уже существующие цепочки (включая
+  // составные системы из config.json).
   const sel = document.getElementById('wal-chain');
   if (!sel) return;
   const keep = sel.value || current || '';
-  sel.innerHTML = (chains || []).map((c) =>
-    `<option value="${esc(c.name)}">${esc(c.name)} — ${c.height} ${blocksWord(c.height)}</option>`)
-    .join('') || '<option value="">нет цепочек</option>';
+  const byName = new Map((chains || []).map((c) => [c.name, c]));
+  const rows = [];
+  for (const el of ELEMENT_LIST) {
+    const c = byName.get(el.symbol);
+    const label = `${el.name_ru} (${el.symbol})`;
+    rows.push(`<option value="${esc(el.symbol)}">${esc(label)}`
+      + (c ? ` — ${c.height} ${blocksWord(c.height)}` : ' — цепочки ещё нет') + '</option>');
+    byName.delete(el.symbol);
+  }
+  for (const c of byName.values()) {
+    rows.push(`<option value="${esc(c.name)}">${esc(c.name)} — ${c.height} ${blocksWord(c.height)}</option>`);
+  }
+  sel.innerHTML = rows.join('') || '<option value="">нет цепочек</option>';
   if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
 }
 
@@ -1275,7 +1283,8 @@ function fillWalletRoots(dirs) {
 // мастером (порт, подтверждения), либо это тонкая настройка под конкретное
 // железо и конкретную систему — её место в src/config.json, а не в панели.
 const HIDDEN_IN_MASTER = ['port', 'coinbase_confirmations', 'charge',
-  'multiplicity', 'restart_max_mb', 'cp2k_timeout_sec', 'task_timeout_sec'];
+  'multiplicity', 'restart_max_mb', 'cp2k_timeout_sec', 'task_timeout_sec',
+  'system'];   // элемент выбирается списком выше, а составные — в config.json
 
 function configField(key, entry) {
   const wrapped = entry && typeof entry === 'object' && 'value' in entry;
@@ -1378,7 +1387,34 @@ refreshOverview().then(() => {
   $('#wal-root').value = overview.dirs[0] || '';
   refreshChains();
   refreshWalletNames(['wal-name'], $('#wal-root').value || null);
+  loadElements();
 });
+
+// Справочник элементов: один источник для мастера, MACE и кошелька.
+let ELEMENT_LIST = [];
+async function loadElements() {
+  const d = await api('/api/elements');
+  if (!d.ok) return;
+  ELEMENT_LIST = d.elements || [];
+  const master = $('#m-element');
+  if (master) {
+    master.innerHTML = ELEMENT_LIST.map((el) =>
+      `<option value="${esc(el.symbol)}">${esc(el.name_ru)} (${esc(el.symbol)})</option>`).join('')
+      + '<option value="__config__">Config.json — свой состав</option>';
+    master.value = ELEMENT_LIST.some((el) => el.symbol === 'Cu') ? 'Cu' : (ELEMENT_LIST[0] || {}).symbol;
+  }
+  const mace = $('#mace-element');
+  if (mace) {
+    mace.innerHTML = ELEMENT_LIST.map((el) =>
+      `<option value="${esc(el.symbol)}">${esc(el.name_ru)} (${esc(el.symbol)})</option>`).join('');
+  }
+  if (walletState && walletState.chains) {
+    applyChains(walletState.chains, walletState.element);
+  } else {
+    // до открытия кошелька показываем тот же список, что у мастера
+    applyChains([], null);
+  }
+}
 
 // подсказываем порт мастера из настроек (config.json → port)
 api('/api/config').then((d) => {
